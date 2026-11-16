@@ -1,0 +1,1816 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Running… · QuantLens engine tests</title>
+  <meta name="color-scheme" content="light dark">
+  <meta name="robots" content="noindex">
+  <link rel="stylesheet" href="../styles/tokens.css">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 1.5rem 1rem 3rem;
+      background: var(--page);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 0.875rem;
+      line-height: 1.5;
+    }
+    main, header { max-width: 980px; margin: 0 auto; }
+    h1 { margin: 0; font-size: 1.375rem; letter-spacing: -0.01em; }
+    .lede { margin: 0.25rem 0 1rem; color: var(--text-secondary); }
+    a { color: var(--accent-text); }
+    code, pre { font-family: var(--font-mono); font-size: 0.8125rem; }
+
+    .summary {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 1rem;
+      margin-bottom: 1rem;
+      padding: 0.75rem 1rem;
+      border: 1px solid var(--border);
+      border-left-width: 4px;
+      border-radius: 8px;
+      background: var(--surface-1);
+    }
+    .summary[data-result="pass"] { border-left-color: var(--status-good); }
+    .summary[data-result="fail"] { border-left-color: var(--status-critical); }
+    .summary__headline { font-size: 1rem; font-weight: 600; }
+    .summary__meta { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    .summary__controls { display: flex; align-items: center; gap: 0.75rem; margin-left: auto; }
+    .summary label { display: inline-flex; align-items: center; gap: 0.375rem; cursor: pointer; }
+    button {
+      min-height: 32px;
+      padding: 0 0.75rem;
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      background: var(--surface-1);
+      color: inherit;
+      font: inherit;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    button:hover { background: var(--surface-2); }
+    :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+    .suite {
+      margin-bottom: 0.5rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-1);
+    }
+    .suite > summary {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.625rem 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .suite__count { margin-left: auto; color: var(--text-muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+    .suite ul { margin: 0; padding: 0 0.875rem 0.5rem; list-style: none; }
+    .case {
+      display: grid;
+      grid-template-columns: 14px minmax(0, 1fr) auto;
+      align-items: baseline;
+      column-gap: 0.5rem;
+      padding: 0.3rem 0;
+      border-top: 1px solid var(--hairline);
+    }
+    .case__time { color: var(--text-muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; }
+    .case__detail {
+      grid-column: 2 / -1;
+      margin: 0.25rem 0 0.25rem;
+      padding: 0.5rem 0.75rem;
+      border-radius: 6px;
+      background: var(--status-critical-wash);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .case--skip .case__detail { background: var(--status-neutral-wash); }
+    body[data-hide-passed="true"] .case--pass { display: none; }
+
+    /* Status marks: shape plus colour, never colour alone. */
+    .mark { display: inline-block; width: 9px; height: 9px; align-self: center; }
+    .mark--pass { border-radius: 50%; background: var(--status-good); }
+    .mark--fail { width: 8px; height: 8px; background: var(--status-critical); transform: rotate(45deg); }
+    .mark--skip { border-radius: 50%; border: 2px solid var(--status-neutral); }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+      overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+    }
+  </style>
+</head>
+<body data-hide-passed="false">
+  <header>
+    <h1>QuantLens engine tests</h1>
+    <p class="lede">
+      Zero-dependency, runs in the browser. Every formula is checked against a value worked out by hand,
+      a published worked example or a closed-form result, then every engine is run over the real market snapshot.
+      <a href="../index.html">Back to the workstation</a>
+    </p>
+    <div class="summary" id="summary" role="status" aria-live="polite" data-result="running">
+      <span class="summary__headline" id="headline">Running tests…</span>
+      <span class="summary__meta" id="meta"></span>
+      <span class="summary__controls">
+        <label><input type="checkbox" id="hide-passed"> Show failures only</label>
+        <button type="button" id="rerun">Run again</button>
+      </span>
+    </div>
+  </header>
+  <main id="results" aria-label="Test results"></main>
+
+  <script>
+    if (location.protocol === 'file:') {
+      document.getElementById('headline').textContent = 'Open this page through a web server';
+      document.getElementById('meta').textContent = 'Run "python -m http.server 8000" in the project folder, then open http://localhost:8000/tests/engines.test.html';
+    }
+  </script>
+
+  <script type="module">
+    import * as pm from '../src/core/precisionMath.js';
+    import * as tracer from '../src/core/derivationTracer.js';
+    import * as storeModule from '../src/core/store.js';
+    import * as snapshotService from '../src/services/snapshotService.js';
+    import * as liveFeed from '../src/services/liveFeedService.js';
+    import * as glossary from '../src/services/glossaryService.js';
+    import * as technical from '../src/engines/technicalEngine.js';
+    import * as fundamental from '../src/engines/fundamentalEngine.js';
+    import * as correlation from '../src/engines/correlationEngine.js';
+    import * as advisor from '../src/engines/advisorEngine.js';
+    import * as sizer from '../src/engines/positionSizerEngine.js';
+    import * as monteCarlo from '../src/engines/monteCarloEngine.js';
+
+    /* ================================================================== */
+    /* A minimal test harness: suite(), test(), expect(), skip()           */
+    /* ================================================================== */
+
+    const suites = [];
+    let currentSuite = null;
+
+    class SkipSignal extends Error {}
+
+    function suite(name, define) {
+      currentSuite = { name, tests: [] };
+      suites.push(currentSuite);
+      define();
+      currentSuite = null;
+    }
+
+    function test(name, run) {
+      currentSuite.tests.push({ name, run });
+    }
+
+    function skip(reason) {
+      throw new SkipSignal(reason);
+    }
+
+    function show(value) {
+      if (typeof value === 'number' || value === undefined) return String(value);
+      try {
+        return JSON.stringify(value);
+      } catch (error) {
+        return String(value);
+      }
+    }
+
+    function fail(message) {
+      throw new Error(message);
+    }
+
+    function expect(actual) {
+      return {
+        toBe(expected) {
+          if (!Object.is(actual, expected)) fail(`expected ${show(expected)}\n     got ${show(actual)}`);
+        },
+        toEqual(expected) {
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) fail(`expected ${show(expected)}\n     got ${show(actual)}`);
+        },
+        toBeCloseTo(expected, tolerance = 1e-9) {
+          if (typeof actual !== 'number' || !Number.isFinite(actual) || Math.abs(actual - expected) > tolerance) {
+            fail(`expected ${show(expected)} ± ${tolerance}\n     got ${show(actual)}`);
+          }
+        },
+        toBeNull() {
+          if (actual !== null) fail(`expected null\n     got ${show(actual)}`);
+        },
+        toBeTrue() {
+          if (actual !== true) fail(`expected true\n     got ${show(actual)}`);
+        },
+        toBeFalse() {
+          if (actual !== false) fail(`expected false\n     got ${show(actual)}`);
+        },
+        toBeGreaterThan(limit) {
+          if (!(actual > limit)) fail(`expected a value greater than ${show(limit)}\n     got ${show(actual)}`);
+        },
+        toBeAtMost(limit) {
+          if (!(actual <= limit)) fail(`expected a value of at most ${show(limit)}\n     got ${show(actual)}`);
+        },
+        toBeAtLeast(limit) {
+          if (!(actual >= limit)) fail(`expected a value of at least ${show(limit)}\n     got ${show(actual)}`);
+        },
+        toMatch(pattern) {
+          if (typeof actual !== 'string' || !pattern.test(actual)) fail(`expected text matching ${pattern}\n     got ${show(actual)}`);
+        },
+        toContain(item) {
+          if (!actual || !actual.includes(item)) fail(`expected ${show(actual)} to contain ${show(item)}`);
+        },
+      };
+    }
+
+    async function expectRejects(promise, check) {
+      let error = null;
+      try {
+        await promise;
+      } catch (caught) {
+        error = caught;
+      }
+      if (!error) fail('expected the promise to reject, but it resolved');
+      if (check) check(error);
+    }
+
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    /* ================================================================== */
+    /* Fixtures                                                            */
+    /* ================================================================== */
+
+    function isoDates(count, start = '2025-01-01') {
+      const first = Date.parse(`${start}T00:00:00Z`);
+      return Array.from({ length: count }, (_, index) => new Date(first + index * 86400000).toISOString().slice(0, 10));
+    }
+
+    const EMPTY_FUNDAMENTALS = Object.fromEntries(snapshotService.FUNDAMENTAL_KEYS.map((key) => [key, null]));
+
+    /** A normalised asset, shaped exactly like snapshotService output. */
+    function makeAsset({ ticker = 'TEST', closes, highs, lows, dates, fundamentals = {}, ...overrides } = {}) {
+      const close = closes ?? Array.from({ length: 260 }, (_, index) => 100 + index);
+      const series = {
+        dates: dates ?? isoDates(close.length),
+        open: close.slice(),
+        high: highs ?? close.map((price) => price + 1),
+        low: lows ?? close.map((price) => price - 1),
+        close,
+        volume: close.map(() => 1000),
+      };
+      return {
+        ticker,
+        name: `${ticker} Test Asset`,
+        assetClass: 'equity',
+        market: 'US',
+        currency: 'USD',
+        financialCurrency: 'USD',
+        sector: 'Technology',
+        industry: 'Testing',
+        scoringProfile: 'CORPORATE',
+        lotSize: 1,
+        binanceSymbol: null,
+        status: 'fresh',
+        statusNote: null,
+        fundamentalsPeriod: 'TTM',
+        quote: { lastClose: close[close.length - 1], previousClose: close[close.length - 2], asOf: series.dates[series.dates.length - 1] },
+        fundamentals: { ...EMPTY_FUNDAMENTALS, ...fundamentals },
+        series,
+        candleCount: close.length,
+        ...overrides,
+      };
+    }
+
+    /** Deterministic geometric random walk with a known daily volatility. */
+    function randomWalk(count, { seed = 7, sigma = 0.02, start = 100 } = {}) {
+      const normal = monteCarlo.createNormalSampler(monteCarlo.mulberry32(seed));
+      const prices = [start];
+      for (let i = 1; i < count; i += 1) prices.push(prices[i - 1] * Math.exp(sigma * normal()));
+      return prices;
+    }
+
+    // A plain corporate whose every ratio lands on a round number (see the fundamental tests).
+    const CORPORATE = Object.freeze({
+      marketCap: 1000, enterpriseValue: 1200, ebit: 90, ebitda: 100, operatingIncome: 80,
+      totalRevenue: 400, netIncome: 60, freeCashFlow: 50, totalDebt: 200, totalCash: 0,
+      totalEquity: 400, totalAssets: 800, trailingPE: 12, forwardPE: 20, priceToBook: 1.5,
+      returnOnEquity: 0.15, dividendYieldTTM: 0.05,
+    });
+
+    const ACCOUNT = Object.freeze({ equity: 10000, riskPct: 1, atrMultiple: 2, maxPositionPct: 25 });
+
+    function size(overrides = {}) {
+      const { asset: assetOverrides, account: accountOverrides, ...rest } = overrides;
+      return sizer.sizePosition({
+        asset: makeAsset(assetOverrides),
+        entryPrice: 100,
+        atr: 2.5,
+        verdict: 'BUY',
+        account: { ...ACCOUNT, ...accountOverrides },
+        accountCurrency: 'USD',
+        fxRate: 1.25,
+        comparedCount: 1,
+        meanCorrelation: null,
+        ...rest,
+      });
+    }
+
+    /** Hand-built technical and fundamental results, so the advisor's rules can be tested in isolation. */
+    function advisorInputs({ tech, fund = null, close = 100, sma200 = 90, macdLine = 1, macdSignal = 0.5, rsi = 55, techCoverage = 1, fundCoverage = 1, assetClass = 'equity' }) {
+      const metric = (id, value, meta = {}) => tracer.traced({
+        id, label: id, value, unit: 'score', meta, formula: 'fixture',
+        steps: [tracer.step('fixture', 'fixture', value)], interpretation: tracer.interpretation('fixture'),
+      });
+      const fundamentalScore = fund === null
+        ? tracer.notAvailable({ id: 'fundamentalScore', label: 'Fundamental score', unit: 'score', reason: 'fixture: no fundamentals', meta: { coverage: 0 } })
+        : metric('fundamentalScore', fund, { coverage: fundCoverage });
+      return {
+        asset: makeAsset({ closes: [close - 1, close], assetClass }),
+        technical: {
+          metrics: {
+            technicalScore: metric('technicalScore', tech, { coverage: techCoverage }),
+            sma200: metric('sma200', sma200),
+            macd: metric('macd', macdLine - macdSignal, { line: macdLine, signal: macdSignal }),
+            rsi14: metric('rsi14', rsi),
+          },
+        },
+        fundamental: { metrics: { fundamentalScore } },
+      };
+    }
+
+    function findNonFinite(node, path = 'root', seen = new Set(), found = []) {
+      if (typeof node === 'number' && !Number.isFinite(node)) found.push(path);
+      if (!node || typeof node !== 'object' || seen.has(node) || ArrayBuffer.isView(node)) return found;
+      seen.add(node);
+      for (const [key, value] of Object.entries(node)) findNonFinite(value, `${path}.${key}`, seen, found);
+      return found;
+    }
+
+    let rawSnapshotPromise = null;
+    function rawSnapshot() {
+      if (!rawSnapshotPromise) {
+        rawSnapshotPromise = fetch('../data/market_snapshot.json', { cache: 'no-store' }).then((response) => {
+          if (!response.ok) throw new Error(`snapshot returned HTTP ${response.status}`);
+          return response.json();
+        });
+      }
+      return rawSnapshotPromise;
+    }
+
+    /* ================================================================== */
+    /* 1. precisionMath: nothing may ever produce NaN or Infinity           */
+    /* ================================================================== */
+
+    suite('precisionMath: guarded arithmetic', () => {
+      test('division by zero, NaN and Infinity all return null', () => {
+        expect(pm.safeDiv(1, 0)).toBeNull();
+        expect(pm.safeDiv(0, 0)).toBeNull();
+        expect(pm.safeDiv(NaN, 2)).toBeNull();
+        expect(pm.safeDiv(1, Infinity)).toBeNull();
+        expect(pm.safeDiv('6', 3)).toBeNull();
+        expect(pm.safeDiv(6, 3)).toBe(2);
+      });
+      test('a denominator below 1e-12 is treated as zero', () => {
+        expect(pm.safeDiv(1, 1e-13)).toBeNull();
+        expect(pm.safeDiv(1, 1e-11)).toBeCloseTo(1e11, 1);
+      });
+      test('add, subtract and multiply propagate missing values as null', () => {
+        expect(pm.safeAdd(1, 2, 3)).toBe(6);
+        expect(pm.safeAdd(1, null)).toBeNull();
+        expect(pm.safeSub(5, undefined)).toBeNull();
+        expect(pm.safeMul(2, 3, 4)).toBe(24);
+        expect(pm.safeMul(1e200, 1e200)).toBeNull();
+      });
+      test('square root and logarithm reject values outside their domain', () => {
+        expect(pm.safeSqrt(-1)).toBeNull();
+        expect(pm.safeSqrt(9)).toBe(3);
+        expect(pm.safeLn(0)).toBeNull();
+        expect(pm.safeLn(-5)).toBeNull();
+        expect(pm.safeLn(Math.E)).toBeCloseTo(1, 1e-12);
+        expect(pm.safeExp(1000)).toBeNull();
+      });
+      test('rounding is free of binary drift (1.005 rounds to 1.01)', () => {
+        expect(pm.roundTo(1.005, 2)).toBe(1.01);
+        expect(pm.roundTo(2.675, 2)).toBe(2.68);
+        expect(pm.roundTo(-1.005, 2)).toBe(-1.01);
+        expect(pm.roundTo(NaN, 2)).toBeNull();
+      });
+      test('floorToStep rounds DOWN to a tradable lot', () => {
+        expect(pm.floorToStep(257.9, 100)).toBe(200);
+        expect(pm.floorToStep(99.99, 100)).toBe(0);
+        expect(pm.floorToStep(0.3, 0.1)).toBe(0.3);
+        expect(pm.floorToStep(0.12345678, 0.000001)).toBe(0.123456);
+        expect(pm.floorToStep(-5, 1)).toBe(0);
+        expect(pm.floorToStep(5, 0)).toBeNull();
+      });
+      test('clamp keeps a value inside its bounds', () => {
+        expect(pm.clamp(5, 0, 3)).toBe(3);
+        expect(pm.clamp(-1, 0, 3)).toBe(0);
+        expect(pm.clamp(NaN, 0, 3)).toBeNull();
+      });
+    });
+
+    suite('precisionMath: statistics', () => {
+      test('mean and sample standard deviation match a hand calculation', () => {
+        const values = [2, 4, 4, 4, 5, 5, 7, 9]; // mean 5, sum of squares 32
+        expect(pm.mean(values)).toBe(5);
+        expect(pm.variance(values)).toBeCloseTo(32 / 7, 1e-12);
+        expect(pm.stdev(values)).toBeCloseTo(Math.sqrt(32 / 7), 1e-12);
+      });
+      test('statistics on empty or contaminated arrays return null', () => {
+        expect(pm.mean([])).toBeNull();
+        expect(pm.mean([1, NaN, 3])).toBeNull();
+        expect(pm.stdev([5])).toBeNull();
+        expect(pm.minOf([1, null])).toBeNull();
+      });
+      test('log returns are ln(Cₜ ÷ Cₜ₋₁), and reject non-positive prices', () => {
+        const returns = pm.logReturns([100, 110, 99]);
+        expect(returns.length).toBe(2);
+        expect(returns[0]).toBeCloseTo(Math.log(1.1), 1e-12);
+        expect(returns[1]).toBeCloseTo(Math.log(0.9), 1e-12);
+        expect(pm.logReturns([100, 0, 50])).toBeNull();
+      });
+      test('Pearson correlation: +1, −1 and a hand-computed value', () => {
+        expect(pm.pearson([1, 2, 3, 4], [2, 4, 6, 8]).r).toBeCloseTo(1, 1e-12);
+        expect(pm.pearson([1, 2, 3, 4], [8, 6, 4, 2]).r).toBeCloseTo(-1, 1e-12);
+        // x = 1,2,3,4,5 and y = 2,1,4,3,5: covariance 2, both variances 2.5, so r = 0.8.
+        expect(pm.pearson([1, 2, 3, 4, 5], [2, 1, 4, 3, 5]).r).toBeCloseTo(0.8, 1e-12);
+      });
+      test('Pearson correlation is undefined when a series never moves', () => {
+        expect(pm.pearson([1, 1, 1, 1], [2, 4, 6, 8])).toBeNull();
+        expect(pm.pearson([1, 2], [1, 2])).toBeNull();
+      });
+      test('percentile interpolates linearly between ranks', () => {
+        const sorted = [10, 20, 30, 40, 50];
+        expect(pm.percentile(sorted, 0)).toBe(10);
+        expect(pm.percentile(sorted, 0.5)).toBe(30);
+        expect(pm.percentile(sorted, 0.9)).toBeCloseTo(46, 1e-12);
+        expect(pm.percentile(sorted, 1.2)).toBeNull();
+      });
+    });
+
+    suite('precisionMath: scoring, currency and formatting', () => {
+      test('anchor interpolation is linear between anchors and clamped outside', () => {
+        const anchors = [[8, 100], [15, 60], [25, 25], [40, 0]];
+        expect(pm.interpolateAnchors(8, anchors).score).toBe(100);
+        expect(pm.interpolateAnchors(11.5, anchors).score).toBeCloseTo(80, 1e-12);
+        expect(pm.interpolateAnchors(20, anchors).score).toBeCloseTo(42.5, 1e-12);
+        expect(pm.interpolateAnchors(3, anchors).score).toBe(100);
+        expect(pm.interpolateAnchors(99, anchors).score).toBe(0);
+        expect(pm.interpolateAnchors(null, anchors)).toBeNull();
+      });
+      test('anchors that are not strictly ascending are rejected', () => {
+        expect(pm.interpolateAnchors(5, [[10, 0], [5, 100]])).toBeNull();
+      });
+      test('weighted score renormalises the weights of missing components', () => {
+        const result = pm.weightedScore([
+          { id: 'a', label: 'A', weight: 60, score: 80 },
+          { id: 'b', label: 'B', weight: 20, score: 40 },
+          { id: 'c', label: 'C', weight: 20, score: null },
+        ]);
+        expect(result.coverage).toBeCloseTo(0.8, 1e-12);
+        expect(result.score).toBeCloseTo((80 * 60 + 40 * 20) / 80, 1e-12); // 70
+        expect(result.missing).toEqual(['c']);
+      });
+      test('weighted score is null below 50% coverage and valid at exactly 50%', () => {
+        const below = pm.weightedScore([{ id: 'a', label: 'A', weight: 49, score: 80 }, { id: 'b', label: 'B', weight: 51, score: null }]);
+        const exact = pm.weightedScore([{ id: 'a', label: 'A', weight: 50, score: 80 }, { id: 'b', label: 'B', weight: 50, score: null }]);
+        expect(below.score).toBeNull();
+        expect(exact.score).toBe(80);
+      });
+      test('currency conversion supports USD and SGD only', () => {
+        expect(pm.convertCurrency(100, 'USD', 'SGD', 1.25)).toBe(125);
+        expect(pm.convertCurrency(125, 'SGD', 'USD', 1.25)).toBe(100);
+        expect(pm.convertCurrency(100, 'USD', 'USD', null)).toBe(100);
+        expect(pm.convertCurrency(100, 'USD', 'EUR', 1.25)).toBeNull();
+        expect(pm.convertCurrency(100, 'USD', 'SGD', 0)).toBeNull();
+      });
+      test('formatters print "N/A" instead of NaN, Infinity or null', () => {
+        expect(pm.formatNumber(NaN)).toBe('N/A');
+        expect(pm.formatPercent(null)).toBe('N/A');
+        expect(pm.formatCompact(Infinity)).toBe('N/A');
+        expect(pm.formatCurrency(undefined, 'USD')).toBe('N/A');
+        expect(pm.formatPercent(0.171, 1)).toBe('17.1%');
+        expect(pm.formatCompact(5177380175872, 2)).toBe('5.18T');
+      });
+    });
+
+    /* ================================================================== */
+    /* 2. Derivation tracer                                                */
+    /* ================================================================== */
+
+    suite('derivationTracer: the trace contract', () => {
+      const build = (value) => tracer.traced({
+        id: 'demo', label: 'Demo', value, unit: 'ratio', tone: 'healthy', formula: 'a ÷ b',
+        rawInputs: [tracer.input('a', 6, 'USD', 'fixture', '2026-01-02'), tracer.input('b', 3, 'USD', 'fixture')],
+        steps: [tracer.step('Divide a by b', '6 ÷ 3', 2), tracer.step('Report', 'result', 2)],
+        interpretation: tracer.interpretation('Two.', [tracer.threshold('> 1', 'Good', 'healthy')], 'A caveat.'),
+        dependsOn: ['a', 'a', 'b'],
+      });
+      test('a traced metric carries formula, raw inputs, numbered steps and interpretation', () => {
+        const metric = build(2);
+        expect(metric.status).toBe('ok');
+        expect(metric.naReason).toBeNull();
+        expect(metric.trace.steps.map((item) => item.n)).toEqual([1, 2]);
+        expect(metric.trace.rawInputs.length).toBe(2);
+        expect(metric.trace.dependsOn).toEqual(['a', 'b']); // de-duplicated
+        expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('a non-finite value can never reach the screen: it becomes an N/A metric', () => {
+        for (const bad of [NaN, Infinity, -Infinity, null, undefined]) {
+          const metric = build(bad);
+          expect(metric.status).toBe('na');
+          expect(metric.value).toBeNull();
+          expect(typeof metric.naReason).toBe('string');
+          expect(tracer.validateTrace(metric)).toEqual([]);
+        }
+      });
+      test('notAvailable() records a plain-English reason', () => {
+        const metric = tracer.notAvailable({ id: 'x', label: 'X', unit: 'pct', reason: 'Not reported.' });
+        expect(metric.naReason).toBe('Not reported.');
+        expect(metric.trace.interpretation.summary).toBe('Not reported.');
+        expect(tracer.valueOf(metric)).toBeNull();
+      });
+      test('the validator catches a broken contract', () => {
+        const broken = build(2);
+        broken.trace.steps[1].n = 7;
+        broken.unit = 'bananas';
+        const errors = tracer.validateTrace(broken);
+        expect(errors.length).toBe(2);
+      });
+      test('the dependency tree follows dependsOn and survives a cycle', () => {
+        const node = (id, dependsOn) => tracer.traced({
+          id, label: id, value: 1, unit: 'score', formula: 'f', steps: [tracer.step('s', 'e', 1)],
+          interpretation: tracer.interpretation('ok'), dependsOn,
+        });
+        const index = tracer.buildTraceIndex({ a: node('a', ['b', 'missing']), b: node('b', ['c']), c: node('c', ['a']) });
+        const tree = tracer.dependencyTree(index, 'a');
+        expect(tree.metric.id).toBe('a');
+        expect(tree.missing).toEqual(['missing']);
+        expect(tree.children[0].metric.id).toBe('b');
+        expect(tree.children[0].children[0].metric.id).toBe('c');
+        expect(tree.children[0].children[0].children.length).toBe(0); // the cycle back to "a" is cut
+      });
+    });
+
+    /* ================================================================== */
+    /* 3. Technical engine                                                 */
+    /* ================================================================== */
+
+    suite('technicalEngine: indicator formulas', () => {
+      test('SMA is the mean of the last n closes, null until n closes exist', () => {
+        const sma = technical.smaSeries([1, 2, 3, 4, 5], 3);
+        expect(sma).toEqual([null, null, 2, 3, 4]);
+      });
+      test('EMA: k = 2 ÷ (n + 1), seeded with the SMA of the first n closes', () => {
+        // n = 3, so k = 0.5. Seed = (1 + 2 + 3) ÷ 3 = 2. Then 4·0.5 + 2·0.5 = 3 and 5·0.5 + 3·0.5 = 4.
+        expect(technical.emaSeries([1, 2, 3, 4, 5], 3)).toEqual([null, null, 2, 3, 4]);
+      });
+      test('EMA of a straight line lags it by (n − 1) ÷ 2', () => {
+        const ramp = Array.from({ length: 300 }, (_, index) => 100 + index);
+        const ema = technical.emaSeries(ramp, 20);
+        expect(ramp[299] - ema[299]).toBeCloseTo(9.5, 1e-6);
+      });
+      test('MACD: line = EMA12 − EMA26, signal = EMA9 of the line, histogram = line − signal', () => {
+        const closes = randomWalk(120, { seed: 11 });
+        const macd = technical.macdSeries(closes, 12, 26, 9);
+        const last = closes.length - 1;
+        expect(macd.line[last]).toBeCloseTo(macd.emaFast[last] - macd.emaSlow[last], 1e-12);
+        expect(macd.histogram[last]).toBeCloseTo(macd.line[last] - macd.signal[last], 1e-12);
+        const signalAgain = technical.emaSeries(macd.line, 9);
+        expect(macd.signal[last]).toBeCloseTo(signalAgain[last], 1e-12);
+        expect(macd.line[24]).toBeNull(); // the slow EMA needs 26 closes
+        expect(macd.signal[32]).toBeNull(); // and the signal needs 9 MACD values after that
+        expect(typeof macd.signal[33]).toBe('number');
+      });
+      test('MACD of a flat price is exactly zero', () => {
+        const macd = technical.macdSeries(Array.from({ length: 60 }, () => 5));
+        expect(macd.line[59]).toBe(0);
+        expect(macd.histogram[59]).toBe(0);
+      });
+      test('RSI by hand (period 2): 100, then 50, then 75', () => {
+        // Changes +1, +1, −1, +1. First averages: gain 1, loss 0 -> 100.
+        // Next: gain (1 + 0) ÷ 2 = 0.5, loss (0 + 1) ÷ 2 = 0.5 -> 50.
+        // Next: gain (0.5 + 1) ÷ 2 = 0.75, loss 0.25 -> RS 3 -> 75.
+        const { rsi } = technical.rsiSeries([1, 2, 3, 2, 3], 2);
+        expect(rsi[1]).toBeNull();
+        expect(rsi[2]).toBe(100);
+        expect(rsi[3]).toBeCloseTo(50, 1e-12);
+        expect(rsi[4]).toBeCloseTo(75, 1e-12);
+      });
+      test('RSI (14) reproduces the widely published Wilder worked example', () => {
+        // The 14-period example used in most RSI tutorials: 70.53, 66.32, 66.55, 69.41.
+        const closes = [44.3389, 44.0902, 44.1497, 43.6124, 44.3278, 44.8264, 45.0955, 45.4245, 45.8433, 46.0826,
+          45.8931, 46.0328, 45.6140, 46.2820, 46.2820, 46.0028, 46.0328, 46.4116];
+        const { rsi } = technical.rsiSeries(closes, 14);
+        expect(rsi[14]).toBeCloseTo(70.53, 0.01);
+        expect(rsi[15]).toBeCloseTo(66.32, 0.01);
+        expect(rsi[16]).toBeCloseTo(66.55, 0.01);
+        expect(rsi[17]).toBeCloseTo(69.41, 0.01);
+      });
+      test('RSI edge cases: no losses gives 100, no movement gives 50', () => {
+        expect(technical.rsiFromAverages(1.2, 0)).toBe(100);
+        expect(technical.rsiFromAverages(0, 0)).toBe(50);
+        expect(technical.rsiFromAverages(-1, 1)).toBeNull();
+      });
+      test('ATR by hand (period 2): true ranges 1.5, 1.5, 2.5 give ATR 1.5 then 2.0', () => {
+        const close = [10, 11, 10, 12];
+        const high = [10.5, 11.5, 11, 12.5];
+        const low = [9.5, 10, 9.5, 10.5];
+        const { atr, trueRange } = technical.atrSeries(high, low, close, 2);
+        expect(trueRange).toEqual([null, 1.5, 1.5, 2.5]); // the last one is a gap: |12.5 − 10|
+        expect(atr[2]).toBeCloseTo(1.5, 1e-12);
+        expect(atr[3]).toBeCloseTo((1.5 * 1 + 2.5) / 2, 1e-12);
+      });
+    });
+
+    suite('technicalEngine: scores and traces', () => {
+      const ramp = makeAsset(); // closes 100..359, high = close + 1, low = close − 1
+      const analysis = technical.analyzeTechnicals(ramp);
+      const m = analysis.metrics;
+
+      test('the four weights add up to 100', () => {
+        const { trend, macd, rsi, range } = technical.TECH_CONFIG.weights;
+        expect(trend + macd + rsi + range).toBe(100);
+        const points = technical.TECH_CONFIG.trendPoints;
+        expect(points.aboveSma200 + points.emaCross + points.aboveEma50).toBe(100);
+        const macdPoints = technical.TECH_CONFIG.macdPoints;
+        expect(macdPoints.aboveSignal + macdPoints.aboveZero + macdPoints.rising).toBe(100);
+      });
+      test('a steady uptrend: SMA values, full trend score, RSI 100', () => {
+        expect(m.sma50.value).toBeCloseTo(334.5, 1e-9); // mean of 310..359
+        expect(m.sma200.value).toBeCloseTo(259.5, 1e-9); // mean of 160..359
+        expect(m.trendScore.value).toBe(100);
+        expect(m.rsi14.value).toBe(100);
+        expect(m.rsiScore.value).toBe(10); // RSI 100 is the last anchor: overheated
+      });
+      test('ATR is the constant daily range, and ATR % divides it by the close', () => {
+        expect(m.atr14.value).toBeCloseTo(2, 1e-9);
+        expect(m.atrPct.value).toBeCloseTo(2 / 359, 1e-12);
+      });
+      test('52-week position = (close − low) ÷ (high − low)', () => {
+        expect(m.range52w.value).toBeCloseTo((359 - 99) / (360 - 99), 1e-12);
+        expect(m.rangeScore.value).toBeCloseTo(100 * (359 - 99) / (360 - 99), 1e-9);
+      });
+      test('the Technical score is the weighted sum of its four parts', () => {
+        const expected = 0.40 * m.trendScore.value + 0.25 * m.macdScore.value + 0.20 * m.rsiScore.value + 0.15 * m.rangeScore.value;
+        expect(m.technicalScore.value).toBeCloseTo(expected, 1e-9);
+        expect(m.technicalScore.trace.dependsOn).toEqual(['trendScore', 'macdScore', 'rsiScore', 'rangeScore']);
+      });
+      test('RSI score follows its anchors: 30 at RSI 0, 80 at 60, 60 at 70, 30 at 80', () => {
+        const anchors = technical.TECH_CONFIG.rsiAnchors;
+        expect(pm.interpolateAnchors(60, anchors).score).toBe(80);
+        expect(pm.interpolateAnchors(65, anchors).score).toBeCloseTo(70, 1e-12);
+        expect(pm.interpolateAnchors(75, anchors).score).toBeCloseTo(45, 1e-12);
+        expect(pm.interpolateAnchors(40, anchors).score).toBeCloseTo(50, 1e-12);
+      });
+      test('annualised volatility = stdev of daily log returns × √252 (√365 for crypto)', () => {
+        // Returns alternate +a and −a, so the mean is 0 and the sample variance is a² · n ÷ (n − 1).
+        const a = Math.log(1.01);
+        const closes = [100];
+        for (let i = 1; i <= 200; i += 1) closes.push(closes[i - 1] * (i % 2 ? 1.01 : 1 / 1.01));
+        const daily = a * Math.sqrt(200 / 199);
+        const equity = technical.analyzeTechnicals(makeAsset({ closes })).metrics.volatility.value;
+        const crypto = technical.analyzeTechnicals(makeAsset({ closes, assetClass: 'crypto' })).metrics.volatility.value;
+        expect(equity).toBeCloseTo(daily * Math.sqrt(252), 1e-9);
+        expect(crypto).toBeCloseTo(daily * Math.sqrt(365), 1e-9);
+      });
+      test('too little history gives N/A with a reason, never a guess', () => {
+        const short = technical.analyzeTechnicals(makeAsset({ closes: Array.from({ length: 30 }, (_, i) => 50 + i) })).metrics;
+        expect(short.sma200.status).toBe('na');
+        expect(short.sma200.naReason).toMatch(/200/);
+        expect(short.macd.status).toBe('na');
+        expect(short.rsi14.status).toBe('ok');
+        expect(short.technicalScore.status).toBe('na'); // only RSI and range are available: 35% coverage
+        expect(short.technicalScore.meta.coverage).toBeCloseTo(0.35, 1e-12);
+      });
+      test('every technical metric satisfies the trace contract', () => {
+        for (const metric of Object.values(m)) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(findNonFinite(analysis)).toEqual([]);
+      });
+    });
+
+    /* ================================================================== */
+    /* 4. Fundamental engine: sector-aware scoring                          */
+    /* ================================================================== */
+
+    suite('fundamentalEngine: sector-aware scoring', () => {
+      const analyse = (overrides = {}, assetOverrides = {}, options = {}) => fundamental.analyzeFundamentals(
+        makeAsset({ fundamentals: { ...CORPORATE, ...overrides }, ...assetOverrides }), options,
+      ).metrics;
+
+      test('every profile\'s weights add up to 100', () => {
+        for (const key of ['CORPORATE', 'FINANCIAL', 'REIT']) {
+          const total = fundamental.PROFILES[key].scoring.reduce((sum, rule) => sum + rule.weight, 0);
+          expect(total).toBe(100);
+        }
+        expect(fundamental.PROFILES.CRYPTO.scoring.length).toBe(0);
+      });
+      test('derived ratios match hand arithmetic', () => {
+        const m = analyse();
+        expect(m.evEbitda.value).toBeCloseTo(12, 1e-12); // 1200 ÷ 100
+        expect(m.operatingMargin.value).toBeCloseTo(0.2, 1e-12); // 80 ÷ 400
+        expect(m.netMargin.value).toBeCloseTo(0.15, 1e-12); // 60 ÷ 400
+        expect(m.fcfYield.value).toBeCloseTo(0.05, 1e-12); // 50 ÷ 1000
+        expect(m.debtToEquity.value).toBeCloseTo(0.5, 1e-12); // 200 ÷ 400
+        expect(m.gearing.value).toBeCloseTo(0.25, 1e-12); // 200 ÷ 800
+      });
+      test('CORPORATE: sub-scores and the weighted total match a hand calculation', () => {
+        const m = analyse();
+        expect(m.evEbitda.meta.subScore).toBeCloseTo(100 - (4 / 7) * 40, 1e-9); // 77.142857
+        expect(m.operatingMargin.meta.subScore).toBeCloseTo(75, 1e-9);
+        expect(m.fcfYield.meta.subScore).toBeCloseTo(80, 1e-9);
+        expect(m.debtToEquity.meta.subScore).toBeCloseTo(100 - (0.2 / 0.7) * 40, 1e-9); // 88.571429
+        expect(m.roe.meta.subScore).toBeCloseTo(50 + (0.05 / 0.15) * 50, 1e-9); // 66.666667
+        expect(m.forwardPE.meta.subScore).toBeCloseTo(60, 1e-9);
+        // 0.25·77.142857 + 0.20·75 + 0.20·80 + 0.15·88.571429 + 0.10·66.666667 + 0.10·60
+        expect(m.fundamentalScore.value).toBeCloseTo(76.238095, 1e-5);
+        expect(m.fundamentalScore.meta.coverage).toBe(1);
+      });
+      test('a missing metric is dropped and the remaining weights renormalised', () => {
+        const m = analyse({ forwardPE: null });
+        expect(m.forwardPE.status).toBe('na');
+        expect(m.fundamentalScore.meta.coverage).toBeCloseTo(0.9, 1e-12);
+        expect(m.fundamentalScore.value).toBeCloseTo(70.238095 / 0.9, 1e-5); // 78.042328
+        expect(m.fundamentalScore.meta.missing).toEqual(['forwardPE']);
+      });
+      test('below 50% coverage the score is N/A, not a number built on scraps', () => {
+        const m = analyse({ ebitda: null, operatingIncome: null, freeCashFlow: null }); // 35% left
+        expect(m.fundamentalScore.status).toBe('na');
+        expect(m.fundamentalScore.naReason).toMatch(/35%/);
+      });
+      test('a zero or negative denominator gives N/A with a reason, never a score', () => {
+        const negativeEbitda = analyse({ ebitda: -50 });
+        expect(negativeEbitda.evEbitda.status).toBe('na');
+        expect(negativeEbitda.evEbitda.naReason).toMatch(/zero or negative/);
+        const negativeEquity = analyse({ totalEquity: -10 });
+        expect(negativeEquity.debtToEquity.status).toBe('na');
+        expect(negativeEquity.roe.status).toBe('na');
+        expect(analyse({ totalRevenue: 0 }).operatingMargin.status).toBe('na');
+        expect(analyse({ trailingPE: -8 }).trailingPE.status).toBe('na');
+        expect(analyse({ enterpriseValue: -5 }).evEbitda.status).toBe('na');
+      });
+      test('negative profits are scored, not hidden: a negative margin earns zero', () => {
+        const m = analyse({ operatingIncome: -40, freeCashFlow: -20 });
+        expect(m.operatingMargin.value).toBeCloseTo(-0.1, 1e-12);
+        expect(m.operatingMargin.meta.subScore).toBe(0);
+        expect(m.fcfYield.meta.subScore).toBe(0);
+      });
+      test('FINANCIAL (banks): scored on ROE, P/B, net margin and P/E', () => {
+        const m = analyse({}, { scoringProfile: 'FINANCIAL', sector: 'Financial Services' });
+        expect(m.roe.meta.subScore).toBeCloseTo(50 + (0.05 / 0.06) * 50, 1e-9); // 91.666667
+        expect(m.priceToBook.meta.subScore).toBeCloseTo(60, 1e-9);
+        expect(m.netMargin.meta.subScore).toBeCloseTo(25, 1e-9);
+        expect(m.trailingPE.meta.subScore).toBeCloseTo(70, 1e-9);
+        // 0.35·91.666667 + 0.30·60 + 0.20·25 + 0.15·70
+        expect(m.fundamentalScore.value).toBeCloseTo(65.583333, 1e-5);
+      });
+      test('FINANCIAL (banks): EBITDA-based and debt-based metrics are N/A with an explanation', () => {
+        const m = analyse({}, { scoringProfile: 'FINANCIAL' });
+        for (const id of ['evEbitda', 'operatingMargin', 'fcfYield', 'debtToEquity', 'gearing', 'ebitda', 'freeCashFlow']) {
+          expect(m[id].status).toBe('na');
+          expect(m[id].naReason).toMatch(/bank/i);
+        }
+      });
+      test('REIT: scored on P/B, dividend yield, gearing and operating margin', () => {
+        const m = analyse({ priceToBook: 0.9 }, { scoringProfile: 'REIT', sector: 'Real Estate' });
+        expect(m.priceToBook.meta.subScore).toBeCloseTo(85, 1e-9);
+        expect(m.dividendYield.meta.subScore).toBeCloseTo(75, 1e-9);
+        expect(m.gearing.meta.subScore).toBe(100); // 25% is below the 30% anchor
+        expect(m.operatingMargin.meta.subScore).toBe(0); // 20% is below the 30% anchor
+        // 0.35·85 + 0.30·75 + 0.25·100 + 0.10·0
+        expect(m.fundamentalScore.value).toBeCloseTo(77.25, 1e-9);
+      });
+      test('REIT gearing at the 50% regulatory cap scores zero', () => {
+        const m = analyse({ totalDebt: 400 }, { scoringProfile: 'REIT' });
+        expect(m.gearing.value).toBeCloseTo(0.5, 1e-12);
+        expect(m.gearing.meta.subScore).toBe(0);
+      });
+      test('the same metric is scored differently by profile (P/B 1.5: bank 60, REIT 10, corporate unscored)', () => {
+        const bank = analyse({}, { scoringProfile: 'FINANCIAL' }).priceToBook.meta.subScore;
+        const reit = analyse({}, { scoringProfile: 'REIT' }).priceToBook.meta.subScore;
+        const corporate = analyse().priceToBook.meta;
+        expect(bank).toBeCloseTo(60, 1e-9);
+        expect(reit).toBeCloseTo(30 - (0.2 / 0.3) * 30, 1e-9); // between 1.3 -> 30 and 1.6 -> 0
+        expect(corporate.scored).toBeFalse(); // shown for context only
+      });
+      test('CRYPTO: no fundamentals, no score, market cap still shown', () => {
+        const m = fundamental.analyzeFundamentals(makeAsset({
+          assetClass: 'crypto', market: 'CRYPTO', scoringProfile: 'CRYPTO', sector: null, fundamentals: { marketCap: 1e12 },
+        })).metrics;
+        expect(m.fundamentalScore.status).toBe('na');
+        expect(m.evEbitda.naReason).toMatch(/crypto/i);
+        expect(m.marketCap.value).toBe(1e12);
+      });
+      test('ROE falls back to net income ÷ equity when the provider reports none', () => {
+        const m = analyse({ returnOnEquity: null });
+        expect(m.roe.value).toBeCloseTo(0.15, 1e-12); // 60 ÷ 400
+        expect(m.roe.meta.origin).toBe('computed');
+      });
+      test('trading and reporting currencies are reconciled before a ratio is formed', () => {
+        // Market values in USD, statements in SGD, 1 USD = 1.25 SGD.
+        const m = analyse({}, { currency: 'USD', financialCurrency: 'SGD' }, { fxRate: 1.25 });
+        expect(m.evEbitda.value).toBeCloseTo(15, 1e-12); // (1200 × 1.25) ÷ 100
+        expect(m.fcfYield.value).toBeCloseTo(0.04, 1e-12); // (50 ÷ 1.25) ÷ 1000
+        expect(m.operatingMargin.value).toBeCloseTo(0.2, 1e-12); // both sides are statement figures
+      });
+      test('an unsupported currency pair gives N/A instead of a silently wrong ratio', () => {
+        const m = analyse({}, { currency: 'USD', financialCurrency: 'JPY' }, { fxRate: 1.25 });
+        expect(m.evEbitda.status).toBe('na');
+        expect(m.evEbitda.naReason).toMatch(/USD\/SGD/);
+        expect(m.fcfYield.status).toBe('na');
+      });
+      test('every fundamental metric satisfies the trace contract, in every profile', () => {
+        for (const profile of ['CORPORATE', 'FINANCIAL', 'REIT', 'CRYPTO']) {
+          const metrics = analyse({}, { scoringProfile: profile, assetClass: profile === 'CRYPTO' ? 'crypto' : 'equity' });
+          for (const metric of Object.values(metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+          expect(findNonFinite(metrics)).toEqual([]);
+        }
+      });
+    });
+
+    /* ================================================================== */
+    /* 5. Correlation engine                                               */
+    /* ================================================================== */
+
+    suite('correlationEngine: overlap between assets', () => {
+      const base = randomWalk(160, { seed: 3 });
+      const assetA = makeAsset({ ticker: 'AAA', closes: base });
+      const double = makeAsset({ ticker: 'BBB', closes: base.map((price) => price * 2) });
+      const inverse = makeAsset({ ticker: 'INV', closes: base.map((price) => 10000 / price) });
+      const independent = makeAsset({ ticker: 'IND', closes: randomWalk(160, { seed: 99 }) });
+
+      test('an asset that is a multiple of another has correlation +1', () => {
+        const metric = correlation.correlatePair(assetA, double);
+        expect(metric.value).toBeCloseTo(1, 1e-9);
+        expect(metric.meta.level).toBe('danger');
+        expect(metric.tone).toBe('risky');
+      });
+      test('an asset that moves inversely has correlation −1 and is not called "one bet"', () => {
+        const metric = correlation.correlatePair(assetA, inverse);
+        expect(metric.value).toBeCloseTo(-1, 1e-9);
+        expect(metric.trace.interpretation.summary).toMatch(/opposite/);
+      });
+      test('returns are computed only on dates both assets traded', () => {
+        // BBB misses every third day (as if it had extra holidays).
+        const keep = assetA.series.dates.map((_, index) => index % 3 !== 0);
+        const sparse = makeAsset({
+          ticker: 'SPR',
+          closes: double.series.close.filter((_, index) => keep[index]),
+          dates: assetA.series.dates.filter((_, index) => keep[index]),
+        });
+        const aligned = correlation.alignedReturns(assetA.series, sparse.series);
+        expect(aligned.commonDates).toBe(sparse.series.dates.length);
+        expect(aligned.a.length).toBe(sparse.series.dates.length - 1);
+        expect(correlation.correlatePair(assetA, sparse).value).toBeCloseTo(1, 1e-9);
+      });
+      test('fewer than 60 overlapping returns gives N/A', () => {
+        const short = makeAsset({ ticker: 'SHT', closes: base.slice(0, 50), dates: assetA.series.dates.slice(0, 50) });
+        const metric = correlation.correlatePair(assetA, short);
+        expect(metric.status).toBe('na');
+        expect(metric.naReason).toMatch(/49/);
+      });
+      test('an asset that never moves has an undefined correlation', () => {
+        const flat = makeAsset({ ticker: 'FLT', closes: base.map(() => 10) });
+        expect(correlation.correlatePair(assetA, flat).status).toBe('na');
+      });
+      test('alert levels: 0.80 and above is danger, 0.60 to 0.80 elevated', () => {
+        expect(correlation.correlationLevel(0.8)).toBe('danger');
+        expect(correlation.correlationLevel(0.79)).toBe('elevated');
+        expect(correlation.correlationLevel(0.6)).toBe('elevated');
+        expect(correlation.correlationLevel(0.59)).toBe('ok');
+        expect(correlation.correlationLevel(-0.85)).toBe('danger');
+        expect(correlation.correlationLevel(null)).toBe('unknown');
+      });
+      test('the 3×3 matrix is symmetric with a unit diagonal, and the overlap raises an alert', () => {
+        const result = correlation.analyzeCorrelation([assetA, double, independent]);
+        expect(result.matrix[0][0]).toBe(1);
+        expect(result.matrix[0][1]).toBe(result.matrix[1][0]);
+        expect(result.matrix[0][2]).toBe(result.matrix[2][0]);
+        expect(result.overall.level).toBe('danger');
+        expect(result.alerts[0].pairId).toBe(correlation.pairId('AAA', 'BBB'));
+        expect(result.pairsByTicker.AAA.length).toBe(2);
+      });
+      test('mean correlation per asset is the average of its row, excluding itself', () => {
+        const result = correlation.analyzeCorrelation([assetA, double, independent]);
+        expect(result.meanByTicker.AAA).toBeCloseTo((result.matrix[0][1] + result.matrix[0][2]) / 2, 1e-12);
+        expect(correlation.analyzeCorrelation([assetA]).meanByTicker.AAA).toBeNull();
+      });
+    });
+
+    /* ================================================================== */
+    /* 6. Advisor engine                                                   */
+    /* ================================================================== */
+
+    suite('advisorEngine: verdict, guardrails and confidence', () => {
+      test('verdict bands: 65 and above BUY, 45 to below 65 HOLD, below 45 SELL', () => {
+        expect(advisor.verdictForScore(65)).toBe('BUY');
+        expect(advisor.verdictForScore(64.99)).toBe('HOLD');
+        expect(advisor.verdictForScore(45)).toBe('HOLD');
+        expect(advisor.verdictForScore(44.99)).toBe('SELL');
+        expect(advisor.verdictForScore(null)).toBeNull();
+      });
+      test('composite = 0.5 × Technical + 0.5 × Fundamental', () => {
+        const result = advisor.advise(advisorInputs({ tech: 80, fund: 60 }));
+        expect(result.metrics.compositeScore.value).toBeCloseTo(70, 1e-12);
+        expect(result.verdict).toBe('BUY');
+        expect(result.metrics.verdict.meta.capped).toBeFalse();
+      });
+      test('crypto, or a stock with no Fundamental score, uses the Technical score alone', () => {
+        const result = advisor.advise(advisorInputs({ tech: 72, fund: null, assetClass: 'crypto' }));
+        expect(result.metrics.compositeScore.value).toBe(72);
+        expect(result.metrics.compositeScore.meta.technicalOnly).toBeTrue();
+        expect(result.metrics.confidence.value).toBe('Low');
+      });
+      test('downtrend guard: close below SMA200 with MACD below signal caps a BUY at HOLD', () => {
+        const result = advisor.advise(advisorInputs({ tech: 75, fund: 75, close: 80, sma200: 90, macdLine: -1, macdSignal: -0.5 }));
+        expect(result.metrics.verdict.meta.rawVerdict).toBe('BUY');
+        expect(result.verdict).toBe('HOLD');
+        expect(result.metrics.verdict.meta.triggered).toEqual(['downtrend']);
+      });
+      test('downtrend guard needs BOTH conditions', () => {
+        const belowAverageOnly = advisor.advise(advisorInputs({ tech: 75, fund: 75, close: 80, sma200: 90, macdLine: 1, macdSignal: 0.5 }));
+        const weakMacdOnly = advisor.advise(advisorInputs({ tech: 75, fund: 75, close: 100, sma200: 90, macdLine: -1, macdSignal: -0.5 }));
+        expect(belowAverageOnly.verdict).toBe('BUY');
+        expect(weakMacdOnly.verdict).toBe('BUY');
+      });
+      test('overheated guard: RSI above 80 caps a BUY at HOLD (80 exactly does not)', () => {
+        expect(advisor.advise(advisorInputs({ tech: 90, fund: 70, rsi: 80.1 })).verdict).toBe('HOLD');
+        expect(advisor.advise(advisorInputs({ tech: 90, fund: 70, rsi: 80 })).verdict).toBe('BUY');
+      });
+      test('guardrails never upgrade or downgrade a HOLD or a SELL', () => {
+        const sell = advisor.advise(advisorInputs({ tech: 20, fund: 40, close: 80, sma200: 90, macdLine: -1, macdSignal: 0, rsi: 85 }));
+        expect(sell.verdict).toBe('SELL');
+        expect(sell.metrics.verdict.meta.capped).toBeFalse();
+      });
+      test('weak-business guard: with 50/50 weights a Fundamental score below 30 can never reach BUY', () => {
+        // The best case is Technical 100 with Fundamental just under 30: composite just under 65.
+        const best = advisor.advise(advisorInputs({ tech: 100, fund: 29.99 }));
+        expect(best.metrics.compositeScore.value).toBeCloseTo(64.995, 1e-9);
+        expect(best.verdict).toBe('HOLD');
+        expect(best.guardrails.find((guard) => guard.id === 'weakFundamentals').triggered).toBeTrue();
+        // The guard is therefore a safety net for any future change of weights, and is documented as such.
+      });
+      test('confidence: High needs a gap of at most 20 and coverage of at least 80%', () => {
+        const confidence = (inputs) => advisor.advise(advisorInputs(inputs)).metrics.confidence.value;
+        expect(confidence({ tech: 80, fund: 60 })).toBe('High'); // gap exactly 20
+        expect(confidence({ tech: 80, fund: 59 })).toBe('Medium'); // gap 21
+        expect(confidence({ tech: 85, fund: 50 })).toBe('Medium'); // gap exactly 35
+        expect(confidence({ tech: 86, fund: 50 })).toBe('Low'); // gap 36
+        expect(confidence({ tech: 70, fund: 65, fundCoverage: 0.75 })).toBe('Medium'); // agree, but data incomplete
+      });
+      test('no Technical score means no verdict at all', () => {
+        const inputs = advisorInputs({ tech: 50, fund: 50 });
+        inputs.technical.metrics.technicalScore = tracer.notAvailable({ id: 'technicalScore', label: 'Technical score', unit: 'score', reason: 'fixture', meta: { coverage: 0 } });
+        const result = advisor.advise(inputs);
+        expect(result.verdict).toBeNull();
+        expect(result.metrics.verdict.status).toBe('na');
+        expect(result.metrics.confidence.status).toBe('na');
+      });
+      test('verdict, composite and confidence all satisfy the trace contract', () => {
+        const result = advisor.advise(advisorInputs({ tech: 75, fund: 75, close: 80, sma200: 90, macdLine: -1, macdSignal: -0.5 }));
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(result.metrics.verdict.trace.dependsOn).toContain('compositeScore');
+      });
+    });
+
+    /* ================================================================== */
+    /* 7. Position sizer: stake size and profit and loss at the exits       */
+    /* ================================================================== */
+
+    suite('positionSizerEngine: stake size and profit and loss', () => {
+      test('worked example: 10,000 account, 1% risk, entry 100, ATR 2.5, 2 × ATR stop', () => {
+        const s = size().summary;
+        expect(s.stop).toBe(95); // 100 − 2 × 2.5
+        expect(s.riskPerUnit).toBe(5);
+        expect(s.units).toBe(20); // risk budget 100 ÷ 5
+        expect(s.positionValue).toBe(2000);
+        expect(s.pctOfAccount).toBeCloseTo(0.2, 1e-12);
+        expect(s.amountAtRisk).toBe(100);
+        expect(s.riskPctActual).toBeCloseTo(0.01, 1e-12);
+        expect(s.target).toBe(110); // entry + 2R
+        expect(s.capBinding).toBeFalse();
+      });
+      test('profit and loss at the exits: the stop loses 1R, the target gains exactly 2R', () => {
+        const s = size().summary;
+        const lossAtStop = s.units * (s.stop - s.entryPrice);
+        const gainAtTarget = s.units * (s.target - s.entryPrice);
+        expect(lossAtStop).toBe(-s.amountAtRisk);
+        expect(gainAtTarget).toBe(2 * s.amountAtRisk);
+        expect(gainAtTarget / -lossAtStop).toBe(sizer.SIZER_CONFIG.targetMultiple);
+      });
+      test('verdict multiplier: BUY full size, HOLD half, SELL nothing', () => {
+        expect(size({ verdict: 'BUY' }).summary.units).toBe(20);
+        expect(size({ verdict: 'HOLD' }).summary.units).toBe(10);
+        const sell = size({ verdict: 'SELL' }).summary;
+        expect(sell.units).toBe(0);
+        expect(sell.zeroReason).toMatch(/SELL/);
+        expect(size({ verdict: null }).summary.zeroReason).toMatch(/no verdict/i);
+      });
+      test('correlation haircut = 1 ÷ √(1 + (n − 1) × max(0, ρ̄))', () => {
+        expect(sizer.correlationHaircut(3, 0.8).factor).toBeCloseTo(1 / Math.sqrt(2.6), 1e-12); // 0.6202
+        expect(sizer.correlationHaircut(3, 0).factor).toBe(1);
+        expect(sizer.correlationHaircut(2, 1).factor).toBeCloseTo(1 / Math.sqrt(2), 1e-12);
+        expect(sizer.correlationHaircut(1, 0.9).factor).toBe(1); // nothing to overlap with
+        expect(sizer.correlationHaircut(3, -0.5).factor).toBe(1); // a hedge never increases size
+        expect(sizer.correlationHaircut(3, null).factor).toBe(1);
+      });
+      test('the haircut restores the combined risk of n positions to that of independent ones', () => {
+        // n equal positions with pairwise correlation ρ have variance n + n(n − 1)ρ. Scaled by the haircut it is n.
+        for (const [n, rho] of [[2, 0.5], [3, 0.8], [3, 0.3]]) {
+          const { factor } = sizer.correlationHaircut(n, rho);
+          expect(factor * factor * (n + n * (n - 1) * rho)).toBeCloseTo(n, 1e-12);
+        }
+      });
+      test('the haircut reduces the stake: three assets at ρ̄ = 0.8 give 12 units instead of 20', () => {
+        const s = size({ comparedCount: 3, meanCorrelation: 0.8 }).summary;
+        expect(s.units).toBe(12); // 20 × 0.6202 = 12.4, rounded down
+        expect(s.amountAtRisk).toBe(60);
+      });
+      test('the position cap binds when the stop is tight', () => {
+        const s = size({ account: { maxPositionPct: 10 } }).summary;
+        expect(s.units).toBe(10); // 10% of 10,000 ÷ 100
+        expect(s.capBinding).toBeTrue();
+        expect(s.pctOfAccount).toBeCloseTo(0.1, 1e-12);
+      });
+      test('SGX board lots: a 10,000 account cannot buy one lot within a 25% cap', () => {
+        const s = size({ asset: { lotSize: 100, market: 'SG', currency: 'SGD' }, accountCurrency: 'SGD', entryPrice: 69.3, atr: 1.2 }).summary;
+        expect(s.units).toBe(0);
+        expect(s.zeroReason).toMatch(/One lot of 100/);
+      });
+      test('SGX board lots: a 100,000 account is rounded down to lots, then capped', () => {
+        const s = size({
+          asset: { lotSize: 100, market: 'SG', currency: 'SGD' }, accountCurrency: 'SGD', entryPrice: 69.3, atr: 1.2,
+          account: { equity: 100000 },
+        }).summary;
+        // Budget 1,000 ÷ risk per unit 2.4 = 416.7 -> 400 by lot. Cap 25,000 ÷ 69.3 = 360.7 -> 300 by lot.
+        expect(s.units).toBe(300);
+        expect(s.capBinding).toBeTrue();
+        expect(s.positionValue).toBeCloseTo(20790, 1e-9);
+        expect(s.amountAtRisk).toBeCloseTo(720, 1e-9);
+      });
+      test('a risk budget smaller than one lot gives zero with the reason', () => {
+        const s = size({ asset: { lotSize: 100 }, account: { maxPositionPct: 100 } }).summary; // raw 20 units < 1 lot
+        expect(s.units).toBe(0);
+        expect(s.zeroReason).toMatch(/less than one tradable lot/);
+      });
+      test('account in SGD, asset in USD: the budget is converted at the USD/SGD rate', () => {
+        const s = size({ accountCurrency: 'SGD', fxRate: 1.25 }).summary;
+        expect(s.units).toBe(16); // 10,000 SGD = 8,000 USD; 1% = 80 USD; ÷ 5
+        expect(s.positionValueAsset).toBe(1600);
+        expect(s.positionValue).toBe(2000); // back in SGD
+        expect(s.amountAtRisk).toBe(100);
+        expect(s.riskPctActual).toBeCloseTo(0.01, 1e-12);
+      });
+      test('fractional crypto sizing rounds down to six decimals and stays within budget', () => {
+        const s = size({ asset: { lotSize: 0.000001, assetClass: 'crypto' }, entryPrice: 64000, atr: 2600 }).summary;
+        expect(s.units).toBe(0.01923); // 100 ÷ 5,200 = 0.0192307...
+        expect(s.unitName).toBe('coins');
+        expect(s.amountAtRisk).toBeAtMost(100);
+        expect(s.amountAtRisk).toBeGreaterThan(99.99);
+      });
+      test('invalid inputs give N/A with a reason: no ATR, stop at or below zero, no FX rate', () => {
+        expect(size({ atr: null }).ok).toBeFalse();
+        expect(size({ atr: null }).metrics.positionSize.naReason).toMatch(/ATR/);
+        expect(size({ entryPrice: 10, atr: 6 }).metrics.stopLoss.naReason).toMatch(/at or below zero/);
+        expect(size({ accountCurrency: 'SGD', fxRate: null }).metrics.positionSize.naReason).toMatch(/exchange rate/);
+        expect(size({ account: { equity: 0 } }).ok).toBeFalse();
+      });
+      test('the amount at risk never exceeds the risk budget, across a grid of inputs', () => {
+        for (const equity of [1000, 10000, 250000]) {
+          for (const riskPct of [0.25, 1, 2, 5]) {
+            for (const atr of [0.4, 2.5, 9]) {
+              for (const lotSize of [1, 100, 0.000001]) {
+                const result = size({ account: { equity, riskPct }, atr, asset: { lotSize }, comparedCount: 3, meanCorrelation: 0.4 });
+                const s = result.summary;
+                expect(s.amountAtRisk).toBeAtMost(equity * riskPct / 100 + 1e-9);
+                expect(s.pctOfAccount).toBeAtMost(0.25 + 1e-9);
+                expect(Math.abs(s.units / lotSize - Math.round(s.units / lotSize))).toBeAtMost(1e-6);
+              }
+            }
+          }
+        }
+      });
+      test('portfolio heat is the total at risk divided by the account', () => {
+        const sizings = [size(), size({ verdict: 'HOLD' }), size({ verdict: 'SELL' })]; // 100 + 50 + 0
+        const heat = sizer.portfolioHeat(sizings, ACCOUNT, 'USD');
+        expect(heat.value).toBeCloseTo(0.015, 1e-12);
+        expect(heat.meta.total).toBe(150);
+        expect(sizer.portfolioHeat([], ACCOUNT, 'USD').status).toBe('na');
+      });
+      test('every sizing metric satisfies the trace contract and names its inputs', () => {
+        const result = size({ comparedCount: 3, meanCorrelation: 0.8, correlationIds: ['corr:A|B'] });
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(result.metrics.positionSize.trace.steps.length).toBe(9);
+        expect(result.metrics.positionSize.trace.dependsOn).toContain('correlationHaircut');
+        expect(result.metrics.correlationHaircut.trace.dependsOn).toEqual(['corr:A|B']);
+      });
+    });
+
+    /* ================================================================== */
+    /* 8. Monte Carlo engine                                               */
+    /* ================================================================== */
+
+    suite('monteCarloEngine: simulation against closed-form results', () => {
+      const asset = makeAsset({ ticker: 'SIM', closes: randomWalk(300, { seed: 5, sigma: 0.02 }) });
+      const start = asset.quote.lastClose;
+      // Identical inputs give identical output (tested below), so each distinct run is computed once.
+      const memo = new Map();
+      const run = (overrides = {}) => {
+        const key = JSON.stringify(overrides);
+        if (!memo.has(key)) memo.set(key, monteCarlo.runMonteCarlo({ asset, startPrice: start, paths: 5000, ...overrides }));
+        return memo.get(key);
+      };
+
+      test('the random generator is deterministic and stays inside [0, 1)', () => {
+        const a = monteCarlo.mulberry32(42);
+        const b = monteCarlo.mulberry32(42);
+        const c = monteCarlo.mulberry32(43);
+        const first = a();
+        expect(first).toBe(b());
+        expect(first === c()).toBeFalse();
+        for (let i = 0; i < 2000; i += 1) {
+          const value = a();
+          if (!(value >= 0 && value < 1)) fail(`out of range: ${value}`);
+        }
+        expect(monteCarlo.seedFromString('AAPL|2026-11-13')).toBe(monteCarlo.seedFromString('AAPL|2026-11-13'));
+      });
+      test('the normal sampler has mean 0 and variance 1', () => {
+        const normal = monteCarlo.createNormalSampler(monteCarlo.mulberry32(1));
+        const draws = Array.from({ length: 40000 }, () => normal());
+        expect(pm.mean(draws)).toBeCloseTo(0, 0.02);
+        expect(pm.variance(draws)).toBeCloseTo(1, 0.03);
+      });
+      test('daily volatility is estimated from log returns', () => {
+        const params = monteCarlo.estimateDailyParams(asset.series.close);
+        expect(params.observations).toBe(299);
+        expect(params.sigma).toBeCloseTo(0.02, 0.003); // the walk was generated with σ = 0.02
+        expect(monteCarlo.estimateDailyParams([1, 2, 3])).toBeNull();
+      });
+      test('the same inputs always produce the same simulation', () => {
+        const fresh = (seed) => monteCarlo.runMonteCarlo({ asset, startPrice: start, paths: 1000, seed });
+        expect(fresh(undefined).horizons).toEqual(fresh(undefined).horizons);
+        expect(fresh(1).fan.p50).toEqual(fresh(1).fan.p50);
+        expect(JSON.stringify(fresh(1).horizons) === JSON.stringify(fresh(2).horizons)).toBeFalse();
+      });
+      test('zero drift means a log drift of −σ² ÷ 2, so the expected price does not move', () => {
+        const result = run();
+        expect(result.params.drift).toBeCloseTo(-(result.params.sigmaDaily ** 2) / 2, 1e-15);
+        expect(result.params.driftMode).toBe('zero');
+        const historical = run({ useHistoricalDrift: true });
+        expect(historical.params.drift).toBe(historical.params.meanLogReturn);
+      });
+      test('simulated percentiles match the exact lognormal formula S·exp(d·T ± 1.645·σ·√T)', () => {
+        for (const row of run().horizons) {
+          expect(Math.abs(row.p50 / row.theoryP50 - 1)).toBeAtMost(0.02);
+          expect(Math.abs(row.p05 / row.theoryP05 - 1)).toBeAtMost(0.03);
+          expect(Math.abs(row.p95 / row.theoryP95 - 1)).toBeAtMost(0.03);
+        }
+      });
+      test('the fan starts at today\'s price and its bands never cross', () => {
+        const { fan } = run({ paths: 1000 });
+        expect(fan.days.length).toBe(127);
+        expect(fan.p05[0]).toBe(start);
+        expect(fan.p95[0]).toBe(start);
+        for (let day = 1; day < fan.days.length; day += 1) {
+          const ordered = fan.p05[day] <= fan.p25[day] && fan.p25[day] <= fan.p50[day] && fan.p50[day] <= fan.p75[day] && fan.p75[day] <= fan.p95[day];
+          if (!ordered) fail(`bands cross on day ${day}`);
+        }
+        expect(fan.p95[126] - fan.p05[126]).toBeGreaterThan(fan.p95[21] - fan.p05[21]); // uncertainty widens with time
+      });
+      test('stop and target outcomes add up to the number of paths', () => {
+        const { outcomes } = run({ stop: start * 0.96, target: start * 1.08 });
+        expect(outcomes.stopFirst + outcomes.targetFirst + outcomes.neither).toBe(5000);
+      });
+      test('with no drift, a target twice as far as the stop is reached about one time in three', () => {
+        // A driftless price is a martingale, so P(target first) = distance to stop ÷ distance between the levels = 1/3.
+        const { outcomes } = run({ stop: start * 0.96, target: start * 1.08 });
+        const decided = outcomes.stopFirst + outcomes.targetFirst;
+        expect(outcomes.targetFirst / decided).toBeCloseTo(1 / 3, 0.04);
+      });
+      test('without valid levels the stop probability is N/A; without a price there is no simulation', () => {
+        expect(run({ stop: start * 1.1, target: start * 1.2 }).metrics.probStopFirst.status).toBe('na');
+        expect(run().outcomes).toBeNull();
+        expect(monteCarlo.runMonteCarlo({ asset, startPrice: 0 }).ok).toBeFalse();
+        expect(monteCarlo.runMonteCarlo({ asset: makeAsset({ closes: [1, 2, 3] }), startPrice: 3 }).ok).toBeFalse();
+      });
+      test('simulation metrics satisfy the trace contract and contain no non-finite numbers', () => {
+        const result = run({ paths: 1000, stop: start * 0.96, target: start * 1.08 });
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(findNonFinite({ metrics: result.metrics, horizons: result.horizons, params: result.params })).toEqual([]);
+      });
+    });
+
+    /* ================================================================== */
+    /* 9. Store: stateless view state and URL routing                       */
+    /* ================================================================== */
+
+    suite('store: URL state and reducer rules', () => {
+      const { actions, reduce, createInitialState, parseUrlState, serializeUrlState } = storeModule;
+      const fakeSnapshot = {
+        assets: ['AAPL', 'NVDA', 'MSFT', 'D05.SI', 'BTC-USD'].map((ticker) => ({ ticker })),
+        byTicker: Object.fromEntries(['AAPL', 'NVDA', 'MSFT', 'D05.SI', 'BTC-USD'].map((ticker) => [ticker, { ticker, currency: 'USD', quote: { lastClose: 10, asOf: '2026-01-02' } }])),
+        sectors: ['Technology', 'Financial Services'],
+        fx: { rate: 1.29, asOf: '2026-01-02' },
+      };
+
+      test('the default view has an empty query string', () => {
+        expect(serializeUrlState(parseUrlState(''))).toBe('');
+      });
+      test('a full view round-trips through the URL unchanged', () => {
+        const query = '?t=NVDA,JPM,ETH-USD&ccy=SGD&mode=pro&class=equity&mkt=SG&sector=Financial+Services&verdict=buy';
+        const view = parseUrlState(query);
+        expect(view.selected).toEqual(['NVDA', 'JPM', 'ETH-USD']);
+        expect(view.filters.sector).toBe('Financial Services');
+        expect(serializeUrlState(view)).toBe(query);
+      });
+      test('parsing is forgiving: case, duplicates, a fourth ticker and garbage are all handled', () => {
+        const view = parseUrlState('?t=nvda,NVDA,%3Cscript%3E,jpm,eth-usd,aapl&ccy=xyz&mode=PRO&mkt=sg&verdict=maybe');
+        expect(view.selected).toEqual(['NVDA', 'JPM', 'ETH-USD']); // de-duplicated, sanitised, capped at three
+        expect(view.currency).toBe('USD');
+        expect(view.mode).toBe('pro');
+        expect(view.filters.market).toBe('SG');
+        expect(view.filters.verdict).toBe('all');
+      });
+      test('"t" absent means the default trio; "t=" means nothing selected', () => {
+        expect(parseUrlState('').selected).toEqual([...storeModule.DEFAULT_SELECTED]);
+        expect(parseUrlState('?t=').selected).toEqual([]);
+        expect(serializeUrlState(parseUrlState('?t='))).toBe('?t=');
+      });
+      test('account size and risk settings are never serialised', () => {
+        let state = createInitialState('');
+        state = reduce(state, actions.setAccount('equity', 987654));
+        state = reduce(state, actions.setAccount('riskPct', 1.75));
+        const query = serializeUrlState(state);
+        expect(query).toBe('');
+        expect(/987654|1\.75|equity|risk/.test(JSON.stringify(parseUrlState(query)))).toBeFalse();
+      });
+      test('at most three assets can be selected; a fourth raises a notice instead', () => {
+        let state = reduce(createInitialState(''), actions.snapshotLoaded(fakeSnapshot));
+        expect(state.selected.length).toBe(3);
+        state = reduce(state, actions.toggleTicker('NVDA'));
+        expect(state.selected.length).toBe(3);
+        expect(state.notice.text).toMatch(/up to 3/);
+        state = reduce(state, actions.toggleTicker('AAPL')); // deselect
+        state = reduce(state, actions.toggleTicker('NVDA'));
+        expect(state.selected).toEqual(['D05.SI', 'BTC-USD', 'NVDA']);
+      });
+      test('tickers that are not in the snapshot are dropped when it loads', () => {
+        const state = reduce(createInitialState('?t=AAPL,FAKE,NVDA&sector=Mining'), actions.snapshotLoaded(fakeSnapshot));
+        expect(state.selected).toEqual(['AAPL', 'NVDA']);
+        expect(state.filters.sector).toBe('all');
+        expect(state.notice.text).toMatch(/FAKE/);
+      });
+      test('risk per trade is capped at 2% in Guided and 5% in Pro, and re-capped on switching back', () => {
+        let state = createInitialState('');
+        state = reduce(state, actions.setAccount('riskPct', 9));
+        expect(state.account.riskPct).toBe(2);
+        state = reduce(state, actions.setMode('pro'));
+        state = reduce(state, actions.setAccount('riskPct', 9));
+        expect(state.account.riskPct).toBe(5);
+        state = reduce(state, actions.setMode('guided'));
+        expect(state.account.riskPct).toBe(2);
+        expect(reduce(state, actions.setAccount('equity', 'abc')).account.equity).toBe(10000);
+      });
+      test('live ticks are validated before they enter the state', () => {
+        const state = createInitialState('');
+        expect(reduce(state, actions.livePrice('BTC-USD', NaN, 1, 'ws'))).toBe(state);
+        expect(reduce(state, actions.livePrice('BTC-USD', -5, 1, 'ws'))).toBe(state);
+        expect(reduce(state, actions.liveFx({ rate: 0 }))).toBe(state);
+        expect(reduce(state, actions.livePrice('BTC-USD', 64000, 1, 'ws')).live.prices['BTC-USD'].price).toBe(64000);
+      });
+      test('the drawer trail supports drill-down, back and breadcrumb jumps', () => {
+        let state = reduce(createInitialState(''), actions.openTrace('AAPL', 'verdict'));
+        state = reduce(state, actions.drillTrace('compositeScore'));
+        state = reduce(state, actions.drillTrace('technicalScore'));
+        state = reduce(state, actions.drillTrace('rsi14'));
+        expect(state.drawer.trail).toEqual(['verdict', 'compositeScore', 'technicalScore', 'rsi14']);
+        state = reduce(state, actions.backTrace());
+        expect(state.drawer.traceId).toBe('technicalScore');
+        state = reduce(state, actions.jumpTrace(0));
+        expect(state.drawer.trail).toEqual(['verdict']);
+        expect(reduce(state, actions.closeTrace()).drawer.open).toBeFalse();
+      });
+      test('the reducer returns the same object when nothing changes', () => {
+        const state = createInitialState('');
+        expect(reduce(state, actions.setCurrency('USD'))).toBe(state);
+        expect(reduce(state, actions.setMode('guided'))).toBe(state);
+        expect(reduce(state, actions.setFilter('market', 'all'))).toBe(state);
+        expect(reduce(state, { type: 'UNKNOWN' })).toBe(state);
+      });
+      test('subscribers with a selector fire only when their slice changes', () => {
+        const store = storeModule.createStore(createInitialState(''), { syncUrl: false });
+        let calls = 0;
+        store.subscribe(() => { calls += 1; }, (state) => state.currency);
+        store.dispatch(actions.setMode('pro'));
+        store.dispatch(actions.livePrice('BTC-USD', 1, 1, 'ws'));
+        expect(calls).toBe(0);
+        store.dispatch(actions.setCurrency('SGD'));
+        expect(calls).toBe(1);
+      });
+      test('the live price replaces the snapshot close, and the live rate replaces the snapshot rate', () => {
+        let state = reduce(createInitialState(''), actions.snapshotLoaded(fakeSnapshot));
+        expect(storeModule.selectPrice(state, 'BTC-USD').live).toBeFalse();
+        expect(storeModule.selectFx(state).source).toBe('snapshot');
+        state = reduce(state, actions.livePrice('BTC-USD', 64000, 1, 'binance-ws'));
+        state = reduce(state, actions.liveFx({ rate: 1.3, asOf: '2026-01-03', source: 'frankfurter.dev', live: true }));
+        expect(storeModule.selectPrice(state, 'BTC-USD').price).toBe(64000);
+        expect(storeModule.selectFx(state).rate).toBe(1.3);
+      });
+      test('filters combine asset class, market, sector and verdict', () => {
+        const assets = [
+          { ticker: 'A', assetClass: 'equity', market: 'US', sector: 'Technology' },
+          { ticker: 'B', assetClass: 'equity', market: 'SG', sector: 'Financial Services' },
+          { ticker: 'C', assetClass: 'crypto', market: 'CRYPTO', sector: null },
+        ];
+        const verdicts = { A: 'BUY', B: 'HOLD', C: 'SELL' };
+        const pick = (filters) => storeModule.filterAssets(assets, { ...storeModule.DEFAULT_FILTERS, ...filters }, verdicts).map((asset) => asset.ticker);
+        expect(pick({})).toEqual(['A', 'B', 'C']);
+        expect(pick({ assetClass: 'equity', market: 'SG' })).toEqual(['B']);
+        expect(pick({ verdict: 'sell' })).toEqual(['C']);
+        expect(pick({ sector: 'Technology', verdict: 'hold' })).toEqual([]);
+      });
+      test('this test page stored nothing in the browser', () => {
+        expect(window.localStorage.length).toBe(0);
+        expect(window.sessionStorage.length).toBe(0);
+      });
+    });
+
+    /* ================================================================== */
+    /* 10. Snapshot service                                                */
+    /* ================================================================== */
+
+    suite('snapshotService: validation and loading', () => {
+      const respond = (body, { ok = true, status = 200 } = {}) => async () => ({ ok, status, statusText: '', json: async () => body });
+
+      test('the committed snapshot passes validation with no warnings about its shape', async () => {
+        const raw = await rawSnapshot();
+        const { fatal, assetErrors } = snapshotService.validateSnapshot(raw);
+        expect(fatal).toEqual([]);
+        expect(assetErrors).toEqual({});
+      });
+      test('normalising converts candle rows into parallel series', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const asset = snapshot.assets[0];
+        expect(asset.series.close.length).toBe(raw.assets[0].candles.length);
+        expect(asset.series.close[asset.series.close.length - 1]).toBe(asset.quote.lastClose);
+        expect(snapshot.byTicker[asset.ticker]).toBe(asset);
+        expect(snapshot.freshness).toBe('fresh');
+      });
+      test('an asset with a broken candle is dropped with a warning; the rest still load', async () => {
+        const copy = structuredClone(await rawSnapshot());
+        copy.assets[0].candles[5][2] = 0.0001; // high below open and close
+        const snapshot = snapshotService.normaliseSnapshot(copy, new Date(copy.generatedAt));
+        expect(snapshot.assets.length).toBe(copy.assets.length - 1);
+        expect(snapshot.warnings.length).toBe(1);
+        expect(snapshot.warnings[0]).toMatch(new RegExp(copy.assets[0].ticker.replace('.', '\\.')));
+      });
+      test('NaN, strings and missing keys in fundamentals are rejected', async () => {
+        const raw = await rawSnapshot();
+        const withString = structuredClone(raw.assets[0]);
+        withString.fundamentals.ebitda = 'NaN';
+        expect(snapshotService.validateAsset(withString).length).toBe(1);
+        const withMissing = structuredClone(raw.assets[0]);
+        delete withMissing.fundamentals.marketCap;
+        expect(snapshotService.validateAsset(withMissing)[0]).toMatch(/marketCap/);
+      });
+      test('candles must be ascending, positive and at least 200 long', async () => {
+        const raw = await rawSnapshot();
+        const unordered = structuredClone(raw.assets[0]);
+        [unordered.candles[10], unordered.candles[11]] = [unordered.candles[11], unordered.candles[10]];
+        expect(snapshotService.validateAsset(unordered)[0]).toMatch(/ascending/);
+        const negative = structuredClone(raw.assets[0]);
+        negative.candles[3][4] = -1;
+        expect(snapshotService.validateAsset(negative)[0]).toMatch(/non-positive/);
+        const tooShort = structuredClone(raw.assets[0]);
+        tooShort.candles = tooShort.candles.slice(0, 150);
+        expect(snapshotService.validateAsset(tooShort)[0]).toMatch(/at least 200/);
+      });
+      test('an unsupported schema version or an implausible FX rate is fatal', async () => {
+        const raw = await rawSnapshot();
+        let caught = null;
+        try {
+          snapshotService.normaliseSnapshot({ ...raw, schemaVersion: 2 });
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught.name).toBe('SnapshotError');
+        expect(caught.code).toBe('INVALID_SNAPSHOT');
+        expect(snapshotService.validateSnapshot({ ...raw, fx: { ...raw.fx, rate: 130 } }).fatal.length).toBe(1);
+        expect(snapshotService.validateSnapshot(null).fatal.length).toBe(1);
+      });
+      test('snapshot age: fresh up to 36 hours, aging up to 4 days, stale beyond', () => {
+        const generated = '2026-01-10T00:00:00Z';
+        const after = (hours) => new Date(Date.parse(generated) + hours * 3600000);
+        expect(snapshotService.describeAge(generated, after(36)).freshness).toBe('fresh');
+        expect(snapshotService.describeAge(generated, after(37)).freshness).toBe('aging');
+        expect(snapshotService.describeAge(generated, after(96)).freshness).toBe('aging');
+        expect(snapshotService.describeAge(generated, after(97)).freshness).toBe('stale');
+      });
+      test('loading: HTTP errors, invalid JSON and timeouts each give a clear, typed error', async () => {
+        await expectRejects(snapshotService.loadSnapshot({ fetchImpl: respond(null, { ok: false, status: 404 }) }), (error) => expect(error.code).toBe('HTTP'));
+        const badJson = async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token'); } });
+        await expectRejects(snapshotService.loadSnapshot({ fetchImpl: badJson }), (error) => expect(error.code).toBe('PARSE'));
+        const hangs = (url, { signal }) => new Promise((resolve, reject) => {
+          signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+        });
+        await expectRejects(snapshotService.loadSnapshot({ fetchImpl: hangs, timeoutMs: 30 }), (error) => expect(error.code).toBe('TIMEOUT'));
+        await expectRejects(snapshotService.loadSnapshot({ fetchImpl: async () => { throw new TypeError('Failed to fetch'); } }), (error) => expect(error.code).toBe('NETWORK'));
+      });
+      test('loading: a valid response is returned normalised', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = await snapshotService.loadSnapshot({ fetchImpl: respond(raw), now: new Date(raw.generatedAt) });
+        expect(snapshot.assets.length).toBe(raw.assets.length);
+      });
+    });
+
+    /* ================================================================== */
+    /* 11. Live feeds: every fallback, with fake network                    */
+    /* ================================================================== */
+
+    suite('liveFeedService: fallback chains (no real network)', () => {
+      const ok = (body) => ({ ok: true, status: 200, json: async () => body });
+      const symbols = [{ ticker: 'BTC-USD', binanceSymbol: 'BTCUSDT' }, { ticker: 'ETH-USD', binanceSymbol: 'ETHUSDT' }];
+      const fastConfig = { backoffBaseMs: 5, backoffMaxMs: 10, wsMaxAttempts: 2, pollIntervalMs: 60, requestTimeoutMs: 200 };
+      class DeadSocket {
+        constructor() { setTimeout(() => this.onclose && this.onclose(), 2); }
+        close() {}
+      }
+
+      test('USD/SGD: the first host that answers is used', async () => {
+        const calls = [];
+        const fetchImpl = async (url) => { calls.push(url); return ok({ date: '2026-01-02', rates: { SGD: 1.2881 } }); };
+        const result = await liveFeed.fetchUsdSgd({ fetchImpl });
+        expect(result.rate).toBe(1.2881);
+        expect(result.source).toBe(liveFeed.FX_ENDPOINTS[0].id);
+        expect(result.live).toBeTrue();
+        expect(calls.length).toBe(1);
+      });
+      test('USD/SGD: when the first host fails the second is tried', async () => {
+        const fetchImpl = async (url) => {
+          if (url === liveFeed.FX_ENDPOINTS[0].url) throw new TypeError('blocked');
+          return ok({ date: '2026-01-02', rates: { SGD: 1.3 } });
+        };
+        const result = await liveFeed.fetchUsdSgd({ fetchImpl });
+        expect(result.source).toBe(liveFeed.FX_ENDPOINTS[1].id);
+        expect(result.errors.length).toBe(1);
+      });
+      test('USD/SGD: when every host fails the snapshot rate is used and marked as not live', async () => {
+        const fetchImpl = async () => { throw new TypeError('offline'); };
+        const result = await liveFeed.fetchUsdSgd({ fetchImpl, fallback: { rate: 1.28868, asOf: '2026-01-01' } });
+        expect(result.rate).toBe(1.28868);
+        expect(result.source).toBe('snapshot');
+        expect(result.live).toBeFalse();
+        expect((await liveFeed.fetchUsdSgd({ fetchImpl })).rate).toBeNull();
+      });
+      test('USD/SGD: an implausible rate or a non-200 response is rejected', async () => {
+        const absurd = await liveFeed.fetchUsdSgd({ fetchImpl: async () => ok({ rates: { SGD: 130 } }), fallback: { rate: 1.29, asOf: null } });
+        expect(absurd.source).toBe('snapshot');
+        const serverError = await liveFeed.fetchUsdSgd({ fetchImpl: async () => ({ ok: false, status: 503, json: async () => ({}) }), fallback: { rate: 1.29, asOf: null } });
+        expect(serverError.source).toBe('snapshot');
+      });
+      test('Binance REST: prices are parsed, invalid rows ignored, hosts tried in order', async () => {
+        const fetchImpl = async (url) => {
+          if (url.startsWith(liveFeed.BINANCE_REST_HOSTS[0])) throw new TypeError('geo-blocked');
+          return ok([{ symbol: 'BTCUSDT', price: '64120.73' }, { symbol: 'ETHUSDT', price: 'oops' }, { symbol: 'XRPUSDT', price: '-1' }]);
+        };
+        const prices = await liveFeed.fetchBinancePrices(['BTCUSDT', 'ETHUSDT'], { fetchImpl });
+        expect(prices).toEqual({ BTCUSDT: 64120.73 });
+        await expectRejects(liveFeed.fetchBinancePrices(['BTCUSDT'], { fetchImpl: async () => { throw new TypeError('down'); } }));
+      });
+      test('crypto feed: WebSocket ticks arrive with status "live"', async () => {
+        if (document.hidden) skip('the feed pauses in a background tab');
+        class LiveSocket {
+          constructor() {
+            setTimeout(() => this.onmessage && this.onmessage({
+              data: JSON.stringify({ stream: 'btcusdt@miniTicker', data: { e: '24hrMiniTicker', E: Date.now(), s: 'BTCUSDT', c: '65000.10' } }),
+            }), 5);
+          }
+          close() {}
+        }
+        const ticks = [];
+        const statuses = [];
+        const feed = liveFeed.createCryptoFeed({
+          symbols, onTick: (tick) => ticks.push(tick), onStatus: (status) => statuses.push(status),
+          WebSocketImpl: LiveSocket, fetchImpl: async () => { throw new TypeError('REST down'); }, config: fastConfig,
+        });
+        feed.start();
+        await wait(80);
+        feed.stop();
+        expect(statuses).toContain('live');
+        expect(ticks[0].ticker).toBe('BTC-USD');
+        expect(ticks[0].price).toBe(65000.1);
+        expect(ticks[0].source).toBe('binance-ws');
+        expect(statuses[statuses.length - 1]).toBe('stopped');
+      });
+      test('crypto feed: a dead WebSocket degrades to REST polling', async () => {
+        if (document.hidden) skip('the feed pauses in a background tab');
+        const ticks = [];
+        const statuses = [];
+        const feed = liveFeed.createCryptoFeed({
+          symbols, onTick: (tick) => ticks.push(tick), onStatus: (status) => statuses.push(status),
+          WebSocketImpl: DeadSocket, fetchImpl: async () => ok([{ symbol: 'BTCUSDT', price: '64000' }, { symbol: 'ETHUSDT', price: '1800' }]), config: fastConfig,
+        });
+        feed.start();
+        await wait(250);
+        feed.stop();
+        expect(statuses).toContain('polling');
+        expect(ticks.every((tick) => tick.source === 'binance-rest')).toBeTrue();
+        expect(ticks.map((tick) => tick.ticker).sort()).toEqual(['BTC-USD', 'ETH-USD']);
+      });
+      test('crypto feed: with WebSocket and REST both down the status is "offline" and nothing is emitted', async () => {
+        if (document.hidden) skip('the feed pauses in a background tab');
+        const ticks = [];
+        const statuses = [];
+        const feed = liveFeed.createCryptoFeed({
+          symbols, onTick: (tick) => ticks.push(tick), onStatus: (status) => statuses.push(status),
+          WebSocketImpl: DeadSocket, fetchImpl: async () => { throw new TypeError('down'); }, config: fastConfig,
+        });
+        feed.start();
+        await wait(250);
+        feed.stop();
+        expect(statuses).toContain('offline');
+        expect(ticks.length).toBe(0);
+      });
+      test('crypto feed: malformed messages and non-positive prices are ignored', async () => {
+        if (document.hidden) skip('the feed pauses in a background tab');
+        class NoisySocket {
+          constructor() {
+            setTimeout(() => {
+              if (!this.onmessage) return;
+              this.onmessage({ data: 'not json' });
+              this.onmessage({ data: JSON.stringify({ data: { s: 'BTCUSDT', c: '-5' } }) });
+              this.onmessage({ data: JSON.stringify({ data: { s: 'DOGEUSDT', c: '0.1' } }) });
+            }, 5);
+          }
+          close() {}
+        }
+        const ticks = [];
+        const feed = liveFeed.createCryptoFeed({
+          symbols, onTick: (tick) => ticks.push(tick), WebSocketImpl: NoisySocket,
+          fetchImpl: async () => { throw new TypeError('down'); }, config: fastConfig,
+        });
+        feed.start();
+        await wait(60);
+        feed.stop();
+        expect(ticks.length).toBe(0);
+      });
+    });
+
+    /* ================================================================== */
+    /* 12. Glossary                                                        */
+    /* ================================================================== */
+
+    suite('glossaryService: Guided-mode explainers', () => {
+      test('every explainer says what it measures, why it matters, and what healthy and risky look like', () => {
+        for (const entry of glossary.listGlossary()) {
+          for (const field of ['term', 'what', 'why', 'healthy', 'risky']) {
+            if (typeof entry[field] !== 'string' || entry[field].length < 2) fail(`${entry.id} has no "${field}" text`);
+          }
+        }
+      });
+      test('profile notes change with the kind of company', () => {
+        expect(glossary.getExplainer('debtToEquity', 'FINANCIAL').note).toMatch(/bank/i);
+        expect(glossary.getExplainer('debtToEquity', 'CORPORATE').note).toBeNull();
+        expect(glossary.getExplainer('gearing', 'REIT').note).toBeNull();
+        expect(glossary.getExplainer('priceToBook', 'REIT').note).toMatch(/NAV/);
+      });
+      test('correlation pair ids resolve to the correlation explainer; unknown ids degrade gracefully', () => {
+        expect(glossary.getExplainer('corr:AAPL|NVDA').term).toBe('Correlation');
+        expect(glossary.hasExplainer('no-such-metric')).toBeFalse();
+        expect(glossary.getExplainer('no-such-metric').term).toBe('Metric');
+      });
+    });
+
+    /* ================================================================== */
+    /* 13. End to end over the real snapshot                                */
+    /* ================================================================== */
+
+    suite('integration: every engine over the committed market snapshot', () => {
+      let cache = null;
+      async function analysed() {
+        if (cache) return cache;
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const byTicker = {};
+        for (const asset of snapshot.assets) {
+          const tech = technical.analyzeTechnicals(asset);
+          const fund = fundamental.analyzeFundamentals(asset, { fxRate: snapshot.fx.rate });
+          byTicker[asset.ticker] = { asset, tech, fund, advice: advisor.advise({ asset, technical: tech, fundamental: fund }) };
+        }
+        cache = { snapshot, byTicker };
+        return cache;
+      }
+
+      test('every metric of every asset satisfies the trace contract', async () => {
+        const { byTicker } = await analysed();
+        let count = 0;
+        for (const [ticker, { tech, fund, advice }] of Object.entries(byTicker)) {
+          for (const metrics of [tech.metrics, fund.metrics, advice.metrics]) {
+            for (const [id, metric] of Object.entries(metrics)) {
+              const errors = tracer.validateTrace(metric);
+              if (errors.length) fail(`${ticker}.${id}: ${errors.join('; ')}`);
+              if (metric.id !== id) fail(`${ticker}.${id} carries the id "${metric.id}"`);
+              count += 1;
+            }
+          }
+        }
+        expect(count).toBeGreaterThan(0);
+      });
+      test('no NaN or Infinity exists anywhere in the analysis', async () => {
+        const { byTicker } = await analysed();
+        for (const [ticker, result] of Object.entries(byTicker)) {
+          const found = findNonFinite({ metrics: [result.tech.metrics, result.fund.metrics, result.advice.metrics], series: result.tech.series });
+          if (found.length) fail(`${ticker}: non-finite number at ${found[0]}`);
+        }
+      });
+      test('every metric shown in the app has a Guided-mode explainer', async () => {
+        const { byTicker } = await analysed();
+        const ids = new Set(['price', 'correlation', 'portfolioHeat', 'monteCarlo', 'probStopFirst']);
+        for (const { tech, fund, advice } of Object.values(byTicker)) {
+          for (const metrics of [tech.metrics, fund.metrics, advice.metrics]) Object.keys(metrics).forEach((id) => ids.add(id));
+        }
+        Object.keys(size().metrics).forEach((id) => ids.add(id));
+        for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
+      });
+      test('each asset is scored with the profile that matches its sector', async () => {
+        const { byTicker } = await analysed();
+        for (const { asset, fund } of Object.values(byTicker)) {
+          let expected = 'CORPORATE';
+          if (asset.assetClass === 'crypto') expected = 'CRYPTO';
+          else if (asset.sector === 'Financial Services') expected = 'FINANCIAL';
+          else if (asset.sector === 'Real Estate') expected = 'REIT';
+          expect(fund.profile).toBe(expected);
+        }
+      });
+      test('banks never receive an EBITDA-based score; crypto never receives a fundamental score', async () => {
+        const { byTicker } = await analysed();
+        for (const { asset, fund, advice } of Object.values(byTicker)) {
+          if (fund.profile === 'FINANCIAL') {
+            expect(fund.metrics.evEbitda.status).toBe('na');
+            expect(fund.scoredIds).toEqual(['roe', 'priceToBook', 'netMargin', 'trailingPE']);
+          }
+          if (asset.assetClass === 'crypto') {
+            expect(fund.metrics.fundamentalScore.status).toBe('na');
+            expect(advice.metrics.confidence.value).toBe('Low');
+          }
+        }
+      });
+      test('indicators recomputed independently from raw candles match the engine', async () => {
+        const { byTicker } = await analysed();
+        for (const { asset, tech } of Object.values(byTicker)) {
+          const close = asset.series.close;
+          const count = close.length;
+          const sma50 = close.slice(count - 50).reduce((total, price) => total + price, 0) / 50;
+          let ema12 = close.slice(0, 12).reduce((total, price) => total + price, 0) / 12;
+          for (let i = 12; i < count; i += 1) ema12 = close[i] * (2 / 13) + ema12 * (11 / 13);
+          let ema26 = close.slice(0, 26).reduce((total, price) => total + price, 0) / 26;
+          for (let i = 26; i < count; i += 1) ema26 = close[i] * (2 / 27) + ema26 * (25 / 27);
+          const scale = close[count - 1];
+          expect(tech.metrics.sma50.value).toBeCloseTo(sma50, scale * 1e-9);
+          expect(tech.metrics.ema12.value).toBeCloseTo(ema12, scale * 1e-9);
+          expect(tech.metrics.macd.meta.line).toBeCloseTo(ema12 - ema26, scale * 1e-9);
+        }
+      });
+      test('correlation, sizing and total risk hold their invariants for real assets', async () => {
+        const { snapshot, byTicker } = await analysed();
+        const assets = snapshot.assets.slice(0, 3);
+        const result = correlation.analyzeCorrelation(assets);
+        for (const metric of Object.values(result.pairs)) expect(tracer.validateTrace(metric)).toEqual([]);
+        for (const currency of ['USD', 'SGD']) {
+          const sizings = assets.map((asset) => sizer.sizePosition({
+            asset,
+            entryPrice: asset.quote.lastClose,
+            atr: tracer.valueOf(byTicker[asset.ticker].tech.metrics.atr14),
+            verdict: byTicker[asset.ticker].advice.verdict,
+            account: ACCOUNT,
+            accountCurrency: currency,
+            fxRate: snapshot.fx.rate,
+            comparedCount: assets.length,
+            meanCorrelation: result.meanByTicker[asset.ticker],
+          }));
+          for (const sizing of sizings) {
+            for (const metric of Object.values(sizing.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+            if (!sizing.ok) continue;
+            expect(sizing.summary.amountAtRisk).toBeAtMost(ACCOUNT.equity * 0.01 + 1e-6);
+            expect(sizing.summary.pctOfAccount).toBeAtMost(0.25 + 1e-9);
+          }
+          expect(tracer.validateTrace(sizer.portfolioHeat(sizings, ACCOUNT, currency))).toEqual([]);
+        }
+      });
+      test('a simulation of a real asset agrees with the closed-form distribution', async () => {
+        const { snapshot } = await analysed();
+        const asset = snapshot.assets[0];
+        const result = monteCarlo.runMonteCarlo({ asset, startPrice: asset.quote.lastClose, paths: 4000 });
+        expect(result.ok).toBeTrue();
+        const longest = result.horizons[result.horizons.length - 1];
+        expect(Math.abs(longest.p50 / longest.theoryP50 - 1)).toBeAtMost(0.03);
+        expect(Math.abs(longest.p05 / longest.theoryP05 - 1)).toBeAtMost(0.05);
+        expect(Math.abs(longest.p95 / longest.theoryP95 - 1)).toBeAtMost(0.05);
+      });
+    });
+
+    /* ================================================================== */
+    /* Runner and report                                                   */
+    /* ================================================================== */
+
+    const resultsRoot = document.getElementById('results');
+    const summary = document.getElementById('summary');
+    const headline = document.getElementById('headline');
+    const meta = document.getElementById('meta');
+    const MARK_WORDS = { pass: 'Passed', fail: 'Failed', skip: 'Skipped' };
+
+    function element(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function renderSuite(record) {
+      const details = element('details', 'suite');
+      details.open = record.failed > 0;
+      const head = element('summary');
+      const mark = element('span', `mark mark--${record.failed ? 'fail' : 'pass'}`);
+      mark.setAttribute('aria-hidden', 'true');
+      head.append(mark, element('span', '', record.name));
+      const parts = [`${record.passed} passed`];
+      if (record.failed) parts.push(`${record.failed} failed`);
+      if (record.skipped) parts.push(`${record.skipped} skipped`);
+      head.append(element('span', 'suite__count', parts.join(' · ')));
+      details.append(head);
+      const list = element('ul');
+      for (const item of record.cases) {
+        const row = element('li', `case case--${item.status}`);
+        const caseMark = element('span', `mark mark--${item.status}`);
+        caseMark.setAttribute('aria-hidden', 'true');
+        const label = element('span', '', item.name);
+        label.prepend(element('span', 'sr-only', `${MARK_WORDS[item.status]}: `));
+        row.append(caseMark, label, element('span', 'case__time', `${item.ms.toFixed(1)} ms`));
+        if (item.detail) row.append(element('pre', 'case__detail', item.detail));
+        list.append(row);
+      }
+      details.append(list);
+      resultsRoot.append(details);
+    }
+
+    async function runAll() {
+      resultsRoot.replaceChildren();
+      summary.dataset.result = 'running';
+      headline.textContent = 'Running tests…';
+      meta.textContent = '';
+      const started = performance.now();
+      const totals = { total: 0, passed: 0, failed: 0, skipped: 0, failures: [] };
+
+      for (const group of suites) {
+        const record = { name: group.name, passed: 0, failed: 0, skipped: 0, cases: [] };
+        for (const item of group.tests) {
+          const begin = performance.now();
+          let status = 'pass';
+          let detail = '';
+          try {
+            await item.run();
+          } catch (error) {
+            if (error instanceof SkipSignal) {
+              status = 'skip';
+              detail = `Skipped: ${error.message}`;
+            } else {
+              status = 'fail';
+              detail = error && error.message ? error.message : String(error);
+              totals.failures.push({ suite: group.name, test: item.name, message: detail });
+            }
+          }
+          record.cases.push({ name: item.name, status, detail, ms: performance.now() - begin });
+          totals.total += 1;
+          if (status === 'pass') { record.passed += 1; totals.passed += 1; }
+          if (status === 'fail') { record.failed += 1; totals.failed += 1; }
+          if (status === 'skip') { record.skipped += 1; totals.skipped += 1; }
+        }
+        renderSuite(record);
+      }
+
+      totals.durationMs = Math.round(performance.now() - started);
+      const passedAll = totals.failed === 0;
+      summary.dataset.result = passedAll ? 'pass' : 'fail';
+      headline.textContent = passedAll
+        ? `All ${totals.passed} tests passed`
+        : `${totals.failed} of ${totals.total} tests failed`;
+      meta.textContent = `${suites.length} suites · ${totals.total} tests · ${totals.skipped ? `${totals.skipped} skipped · ` : ''}${totals.durationMs} ms`;
+      document.title = `${passedAll ? '✓' : '✗'} ${passedAll ? totals.passed : totals.failed} ${passedAll ? 'passed' : 'failed'} · QuantLens engine tests`;
+      // For automation: read this object from the console or a headless browser.
+      window.__QUANTLENS_TESTS__ = Object.freeze(totals);
+      return totals;
+    }
+
+    document.getElementById('hide-passed').addEventListener('change', (event) => {
+      document.body.dataset.hidePassed = String(event.target.checked);
+      if (event.target.checked) for (const details of resultsRoot.querySelectorAll('.suite')) details.open = Boolean(details.querySelector('.case--fail'));
+    });
+    document.getElementById('rerun').addEventListener('click', () => runAll());
+
+    runAll();
+  </script>
+</body>
+</html>

@@ -1,0 +1,185 @@
+/*
+ * tokens.css: every colour, size and timing used by the interface.
+ *
+ * Components are written against roles (--surface-1, --text-secondary,
+ * --status-good) and never against raw hex, so light and dark mode swap in
+ * exactly one place. The theme follows the operating system: the app keeps no
+ * preferences, so there is no theme toggle to remember.
+ *
+ * Chart colours follow a validated data-visualisation palette:
+ *   --series-1         the single series hue (blue), checked for contrast on both surfaces
+ *   --diverge-*        blue <-> red poles with a neutral grey midpoint (correlation heatmap)
+ *   --status-*         reserved for meaning (good / warning / critical); always paired
+ *                      with a shape or a label, never colour alone
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces */
+  --page: #f4f3ef;
+  --surface-1: #fcfcfb;
+  --surface-2: #f3f2ee;
+  --surface-3: #e9e8e2;
+  --overlay: rgba(11, 11, 11, 0.42);
+
+  /* Ink */
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #6b6963;
+  --text-on-accent: #ffffff;
+
+  /* Lines */
+  --hairline: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.12);
+  --border-strong: rgba(11, 11, 11, 0.26);
+
+  /* Accent (interactive) */
+  --accent: #2a78d6;
+  --accent-strong: #1c5cab;
+  --accent-text: #1c5cab;
+  --accent-wash: rgba(42, 120, 214, 0.10);
+  --accent-wash-strong: rgba(42, 120, 214, 0.18);
+  --focus-ring: #1c5cab;
+
+  /* Status (meaning, never identity) */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+  --status-neutral: #898781;
+  --status-good-wash: rgba(12, 163, 12, 0.12);
+  --status-warning-wash: rgba(250, 178, 25, 0.20);
+  --status-critical-wash: rgba(208, 59, 59, 0.12);
+  --status-neutral-wash: rgba(137, 135, 129, 0.16);
+  --delta-up: #006300;
+  --delta-down: #b12d2d;
+
+  /* Charts */
+  --series-1: #2a78d6;
+  --chart-muted: #898781;
+  --chart-grid: #e1e0d9;
+  --chart-axis: #c3c2b7;
+  --diverge-negative: #2a78d6;
+  --diverge-positive: #e34948;
+  --diverge-mid: #f0efec;
+  --heat-ink: #0b0b0b;
+  --heat-ink-strong: #0b0b0b;
+
+  /* Elevation */
+  --shadow-1: 0 1px 2px rgba(11, 11, 11, 0.06);
+  --shadow-2: 0 8px 24px rgba(11, 11, 11, 0.12);
+  --shadow-3: 0 18px 48px rgba(11, 11, 11, 0.20);
+
+  /* Typography */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Consolas, "Liberation Mono", monospace;
+  --text-xs: 0.6875rem;
+  --text-sm: 0.75rem;
+  --text-md: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.625rem;
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* Spacing */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+
+  /* Shape */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+
+  /* Layout */
+  --telemetry-h: 52px; /* kept in sync by telemetryBar.js */
+  --screener-w: 288px;
+  --drawer-w: 420px;
+  --content-max: 1680px;
+  --label-col: 216px;
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --fast: 120ms;
+  --medium: 220ms;
+
+  /* Layers */
+  --z-sticky: 10;
+  --z-telemetry: 30;
+  --z-scrim: 40;
+  --z-drawer: 50;
+  --z-notice: 70;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --surface-2: #222220;
+    --surface-3: #2c2c2a;
+    --overlay: rgba(0, 0, 0, 0.62);
+
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #9a988f;
+    --text-on-accent: #ffffff;
+
+    --hairline: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255, 255, 255, 0.12);
+    --border-strong: rgba(255, 255, 255, 0.26);
+
+    --accent: #3987e5;
+    --accent-strong: #6da7ec;
+    --accent-text: #86b6ef;
+    --accent-wash: rgba(57, 135, 229, 0.14);
+    --accent-wash-strong: rgba(57, 135, 229, 0.26);
+    --focus-ring: #86b6ef;
+
+    --status-good-wash: rgba(12, 163, 12, 0.18);
+    --status-warning-wash: rgba(250, 178, 25, 0.16);
+    --status-critical-wash: rgba(208, 59, 59, 0.22);
+    --status-neutral-wash: rgba(137, 135, 129, 0.20);
+    --delta-up: #3fbf3f;
+    --delta-down: #ee7b7b;
+
+    --series-1: #3987e5;
+    --chart-muted: #898781;
+    --chart-grid: #2c2c2a;
+    --chart-axis: #383835;
+    --diverge-negative: #3987e5;
+    --diverge-positive: #e66767;
+    --diverge-mid: #383835;
+    --heat-ink: #f0efec;
+    --heat-ink-strong: #0b0b0b;
+
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --shadow-2: 0 8px 24px rgba(0, 0, 0, 0.55);
+    --shadow-3: 0 18px 48px rgba(0, 0, 0, 0.7);
+  }
+}
+
+@media (max-width: 767px) {
+  :root {
+    --label-col: 31%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --fast: 0ms;
+    --medium: 0ms;
+  }
+}

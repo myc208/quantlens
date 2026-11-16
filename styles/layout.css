@@ -1,0 +1,355 @@
+/*
+ * layout.css: page structure and responsive behaviour.
+ *
+ *   >= 1280px  screener | matrix, drawer pushes the matrix (all columns stay visible)
+ *   1024-1279  screener | matrix, drawer slides over the matrix
+ *   768-1023   screener collapses into a panel above the matrix, drawer slides over
+ *   < 768px    telemetry becomes a scrolling strip, drawer becomes a bottom sheet
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-padding-top: calc(var(--telemetry-h) + var(--space-4));
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+h1,
+h2,
+h3,
+h4,
+p,
+ul,
+ol,
+dl,
+dd,
+figure {
+  margin: 0;
+}
+
+ul,
+ol {
+  padding: 0;
+  list-style: none;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: fixed;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: calc(var(--z-notice) + 1);
+  padding: var(--space-2) var(--space-3);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  border-radius: var(--radius-md);
+  text-decoration: none;
+  font-weight: var(--weight-semibold);
+  transform: translateY(-200%);
+}
+
+.skip-link:focus {
+  transform: none;
+}
+
+/* ---------------- Telemetry bar ---------------- */
+
+.telemetry {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-telemetry);
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-height: 52px;
+  padding: var(--space-2) var(--space-4);
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border);
+}
+
+.telemetry__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+
+.telemetry__strip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.telemetry__strip::-webkit-scrollbar {
+  display: none;
+}
+
+.telemetry__controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+
+/* ---------------- Shell ---------------- */
+
+.app-shell {
+  flex: 1 0 auto;
+  display: grid;
+  grid-template-columns: var(--screener-w) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-4);
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-4);
+  transition: padding-right var(--medium) var(--ease);
+}
+
+.screener {
+  position: sticky;
+  top: calc(var(--telemetry-h) + var(--space-4));
+  max-height: calc(100vh - var(--telemetry-h) - var(--space-6));
+  max-height: calc(100dvh - var(--telemetry-h) - var(--space-6));
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.workspace {
+  min-width: 0;
+  outline: none;
+}
+
+.app-footer {
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  padding: var(--space-4) var(--space-4) var(--space-6);
+}
+
+/* ---------------- Derivation drawer ---------------- */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-scrim);
+  background: var(--overlay);
+}
+
+.drawer {
+  position: fixed;
+  top: var(--telemetry-h);
+  right: 0;
+  bottom: 0;
+  z-index: var(--z-drawer);
+  width: min(var(--drawer-w), 100vw);
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  visibility: hidden;
+  transition: transform var(--medium) var(--ease), visibility 0s linear var(--medium);
+}
+
+.drawer[data-open="true"] {
+  transform: none;
+  visibility: visible;
+  transition: transform var(--medium) var(--ease), visibility 0s;
+}
+
+.drawer__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* Wide screens: the drawer pushes the workspace so every asset column stays visible. */
+@media (min-width: 1280px) {
+  body[data-drawer="open"] .app-shell {
+    padding-right: calc(var(--drawer-w) + var(--space-4));
+    max-width: none;
+  }
+
+  .scrim {
+    display: none;
+  }
+}
+
+/* Between 768 and 1279 the drawer overlays the matrix; no scrim, the page stays usable. */
+@media (min-width: 768px) and (max-width: 1279px) {
+  .scrim {
+    display: none;
+  }
+}
+
+/* ---------------- Risk sandbox modal ---------------- */
+
+.modal {
+  width: min(960px, calc(100vw - 2 * var(--space-4)));
+  max-height: calc(100vh - 2 * var(--space-4));
+  max-height: calc(100dvh - 2 * var(--space-4));
+  padding: 0;
+  overflow: hidden;
+}
+
+.modal[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.modal__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.sandbox {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: var(--space-5);
+  align-items: start;
+}
+
+/* ---------------- Notices ---------------- */
+
+.notice-region {
+  position: fixed;
+  left: 50%;
+  bottom: var(--space-5);
+  z-index: var(--z-notice);
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100vw - 2 * var(--space-4));
+  pointer-events: none;
+}
+
+/* ---------------- Tablet: screener above the matrix ---------------- */
+
+@media (max-width: 1023px) {
+  .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-3);
+  }
+
+  .screener {
+    position: static;
+    max-height: none;
+  }
+
+  .sandbox {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---------------- Mobile ---------------- */
+
+@media (max-width: 767px) {
+  .telemetry {
+    flex-wrap: wrap;
+    row-gap: var(--space-2);
+    column-gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+  }
+
+  /* Row 1: one horizontally scrolling strip. Row 2: brand and the two switches. */
+  .telemetry__strip {
+    order: 1;
+    flex: 1 0 100%;
+  }
+
+  .telemetry__brand {
+    order: 2;
+  }
+
+  .telemetry__controls {
+    order: 3;
+    margin-left: auto;
+  }
+
+  .app-shell {
+    padding: var(--space-3) var(--space-2);
+  }
+
+  .app-footer {
+    padding: var(--space-3) var(--space-3) var(--space-5);
+  }
+
+  /* Bottom sheet */
+  .drawer {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: 85vh;
+    height: 85dvh;
+    transform: translateY(100%);
+  }
+
+  .drawer[data-open="true"] {
+    transform: none;
+  }
+
+  .modal {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+  }
+
+  .notice-region {
+    bottom: var(--space-3);
+  }
+}

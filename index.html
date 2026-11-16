@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuantLens · Multi-Asset Comparison Workstation</title>
+  <meta name="description" content="Compare up to three US stocks, Singapore stocks and crypto assets side by side, with every indicator, score and position size traced back to its arithmetic.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#fcfcfb" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1a1a19" media="(prefers-color-scheme: dark)">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232a78d6'/%3E%3Cpath d='M6 21l6-7 5 4 9-10' fill='none' stroke='%23fff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./styles/tokens.css">
+  <link rel="stylesheet" href="./styles/layout.css">
+  <link rel="stylesheet" href="./styles/components.css">
+  <link rel="stylesheet" href="./styles/guided.css">
+</head>
+<body data-mode="guided" data-status="loading" data-drawer="closed">
+  <a class="skip-link" href="#workspace">Skip to the comparison</a>
+
+  <!-- Telemetry bar: live crypto ticks, USD/SGD, data age, currency and mode switches. -->
+  <header id="telemetry-bar" class="telemetry" aria-label="Market telemetry and display settings">
+    <div class="telemetry__brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">QuantLens</span>
+    </div>
+    <div class="telemetry__strip" aria-hidden="true">
+      <span class="tick tick--placeholder">Loading market data…</span>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <!-- Screener: filters and the asset list (pick up to three). -->
+    <aside id="screener" class="screener" aria-label="Screener: filter and pick assets"></aside>
+
+    <!-- Workspace: status messages and the comparison matrix. -->
+    <main id="workspace" class="workspace" tabindex="-1" aria-busy="true">
+      <div id="app-status" class="app-status" role="status" aria-live="polite">
+        <div class="status-card">
+          <span class="spinner" aria-hidden="true"></span>
+          <p class="status-card__title">Loading the market snapshot…</p>
+          <p class="status-card__text">Prices and fundamentals are read from a file that is refreshed once a day.</p>
+        </div>
+      </div>
+      <section id="comparison-matrix" class="matrix" aria-labelledby="matrix-title" hidden></section>
+    </main>
+  </div>
+
+  <footer class="app-footer">
+    <p>
+      <strong>Educational tool, not financial advice.</strong>
+      Verdicts and position sizes are produced by fixed, published rules so that you can check every step. They do not know your circumstances.
+    </p>
+    <p class="app-footer__sources">
+      Daily candles and fundamentals: Yahoo Finance via yfinance, refreshed by GitHub Actions.
+      Live crypto: Binance public market data. USD/SGD: Frankfurter (ECB daily reference rate).
+      Nothing you enter is stored or sent anywhere.
+    </p>
+  </footer>
+
+  <!-- Derivation drawer: right-hand panel on desktop, bottom sheet on mobile. -->
+  <div id="drawer-scrim" class="scrim" hidden></div>
+  <aside id="derivation-drawer" class="drawer" role="dialog" aria-modal="false" aria-labelledby="drawer-title" aria-hidden="true" data-open="false" tabindex="-1" inert></aside>
+
+  <!-- Risk sandbox: native modal dialog (focus trap and Esc handled by the browser). -->
+  <dialog id="risk-sandbox" class="modal" aria-labelledby="sandbox-title"></dialog>
+
+  <!-- Transient notices (for example "You can compare up to 3 assets"). -->
+  <div id="notice-region" class="notice-region" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <noscript>
+    <div class="noscript">QuantLens needs JavaScript to load market data and run its calculations.</div>
+  </noscript>
+
+  <script>
+    // ES modules do not load from file:// URLs. Explain how to run the site instead of showing an endless spinner.
+    if (location.protocol === 'file:') {
+      document.body.dataset.status = 'error';
+      document.getElementById('app-status').innerHTML =
+        '<div class="status-card status-card--error"><p class="status-card__title">Open this site through a web server</p>' +
+        '<p class="status-card__text">Browsers block module scripts and data files when a page is opened straight from disk. ' +
+        'In the project folder run <code>python -m http.server 8000</code> and open <code>http://localhost:8000</code>.</p></div>';
+    }
+  </script>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

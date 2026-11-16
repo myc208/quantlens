@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "history": { "period": "1y", "interval": "1d" },
+  "fx": { "base": "USD", "quote": "SGD", "yahooSymbol": "SGD=X" },
+  "assets": [
+    { "ticker": "AAPL",    "name": "Apple Inc.",                                    "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "NVDA",    "name": "NVIDIA Corporation",                            "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "MSFT",    "name": "Microsoft Corporation",                         "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "GOOGL",   "name": "Alphabet Inc.",                                 "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "AMZN",    "name": "Amazon.com, Inc.",                              "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "JPM",     "name": "JPMorgan Chase & Co.",                          "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "D05.SI",  "name": "DBS Group Holdings Ltd",                        "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "O39.SI",  "name": "Oversea-Chinese Banking Corporation Limited",   "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "Z74.SI",  "name": "Singapore Telecommunications Limited",          "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "C38U.SI", "name": "CapitaLand Integrated Commercial Trust",        "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,      "scoringProfile": null },
+    { "ticker": "BTC-USD", "name": "Bitcoin",                                       "assetClass": "crypto", "market": "CRYPTO", "currency": "USD", "lotSize": 0.000001, "binanceSymbol": "BTCUSDT", "scoringProfile": "CRYPTO" },
+    { "ticker": "ETH-USD", "name": "Ethereum",                                      "assetClass": "crypto", "market": "CRYPTO", "currency": "USD", "lotSize": 0.000001, "binanceSymbol": "ETHUSDT", "scoringProfile": "CRYPTO" }
+  ]
+}

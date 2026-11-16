@@ -1,0 +1,173 @@
+/*
+ * guided.css: everything that differs between Guided and Pro mode.
+ *
+ * Guided (default) teaches: every metric row carries an explainer with what it
+ * measures, why it matters, and what healthy and risky readings look like.
+ * Pro is the same data at higher density, with the explainers out of the way.
+ *
+ * The mode is a body attribute (data-mode="guided" | "pro") set by main.js.
+ */
+
+/* Elements that exist in only one mode. */
+body[data-mode="pro"] .guided-only,
+body[data-mode="guided"] .pro-only {
+  display: none !important;
+}
+
+/* ---------------- Explainer rows inside the matrix ---------------- */
+
+.explainer-row > td {
+  padding: 0;
+  border-top: 0;
+}
+
+.explainer {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-2) var(--space-4);
+  margin: 0 var(--space-3) var(--space-3);
+  padding: var(--space-3);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  background: var(--accent-wash);
+  font-size: var(--text-md);
+  line-height: 1.45;
+}
+
+.explainer__part {
+  min-width: 0;
+}
+
+.explainer__label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.explainer__text {
+  color: var(--text-primary);
+}
+
+.explainer__notes {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--accent-wash-strong);
+  color: var(--text-secondary);
+}
+
+.explainer__notes strong {
+  color: var(--text-primary);
+  font-weight: var(--weight-semibold);
+}
+
+/* The info button only makes sense where explainers exist. */
+body[data-mode="pro"] .info-btn {
+  display: none;
+}
+
+/* Pro mode: tighter rows. */
+body[data-mode="pro"] .metric-label,
+body[data-mode="pro"] .cell {
+  min-height: 34px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
+body[data-mode="pro"] .section-row th {
+  padding-top: var(--space-2);
+  padding-bottom: var(--space-1);
+}
+
+/* ---------------- Guided callouts ---------------- */
+
+.guide-note {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  background: var(--accent-wash);
+  color: var(--text-primary);
+  font-size: var(--text-md);
+}
+
+.guide-note__badge {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.04em;
+  line-height: 1.7;
+  text-transform: uppercase;
+}
+
+.matrix > .guide-note {
+  margin-bottom: var(--space-3);
+}
+
+/* ---------------- Explainer inside the derivation drawer ---------------- */
+
+.glossary {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  background: var(--accent-wash);
+  font-size: var(--text-md);
+}
+
+.glossary dt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.glossary dd + dt {
+  margin-top: var(--space-1);
+}
+
+.glossary__note {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--accent-wash-strong);
+  color: var(--text-secondary);
+}
+
+/* ---------------- Responsive ---------------- */
+
+@media (max-width: 1279px) {
+  .explainer {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 767px) {
+  .explainer {
+    grid-template-columns: minmax(0, 1fr);
+    margin: 0 var(--space-2) var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    font-size: var(--text-sm);
+  }
+
+  .guide-note {
+    font-size: var(--text-sm);
+  }
+}
