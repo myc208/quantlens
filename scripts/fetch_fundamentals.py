@@ -289,10 +289,16 @@ def trailing_columns(frame: pd.DataFrame | None) -> list[pd.Timestamp] | None:
     columns = statement_columns(frame)
     if len(columns) < 2:
         return None
-    gap = (columns[0] - columns[1]).days
+    gaps = [(newer - older).days for newer, older in zip(columns, columns[1:])][:4]
+    gap = gaps[0]
     if 80 <= gap <= 100:
         needed, low, high = 4, 80, 100
     elif 170 <= gap <= 195:
+        # A six-month gap means a semi-annual reporter ONLY if the company never
+        # reports quarterly. If any nearby gap is a quarter, this is a quarterly
+        # reporter with one period missing, and two quarters must not pass as a year.
+        if any(80 <= other <= 100 for other in gaps):
+            return None
         needed, low, high = 2, 170, 195
     else:
         return None
@@ -339,7 +345,14 @@ def income_items(quarterly: pd.DataFrame | None, annual: pd.DataFrame | None) ->
     ttm_count = sum(v is not None for v in ttm.values())
     fiscal_count = sum(v is not None for v in fiscal.values())
     ttm_is_current = window is not None and (fiscal_column is None or window[0] >= fiscal_column)
-    if ttm_count > 0 and ttm_count >= fiscal_count and ttm_is_current:
+    # Second, independent guard against a mis-read window: twelve months of revenue
+    # cannot plausibly be under 60% or over 180% of the latest full fiscal year. If it
+    # is, the periods were probably mis-identified, and the labelled fiscal year is safer.
+    ttm_revenue, fiscal_revenue = ttm["totalRevenue"], fiscal["totalRevenue"]
+    ttm_is_plausible = True
+    if ttm_revenue is not None and fiscal_revenue is not None and ttm_revenue > 0 and fiscal_revenue > 0:
+        ttm_is_plausible = 0.6 <= ttm_revenue / fiscal_revenue <= 1.8
+    if ttm_count > 0 and ttm_count >= fiscal_count and ttm_is_current and ttm_is_plausible:
         return ttm, "TTM"
     if fiscal_count > 0:
         return fiscal, fiscal_label
