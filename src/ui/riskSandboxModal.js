@@ -6,6 +6,12 @@
  * compared assets and a Monte Carlo fan of where its price could go, with the
  * stop and the 2R target drawn on it.
  *
+ * The simulation itself runs in the Web Worker. This module asks for it
+ * (app.requestSimulation) whenever an input changes and renders whatever is in
+ * state.compute.monteCarlo: the previous fan stays on screen, dimmed, until the
+ * new one arrives, and a late reply for older inputs is discarded by the store.
+ * Its volatility is estimated from the selected time range.
+ *
  * Privacy: the inputs live in the in-memory store only. They are never written
  * to the URL, to browser storage or to any network request.
  *
@@ -201,12 +207,23 @@ export function mountRiskSandboxModal(dialog, app) {
 
   function simulationBlock(state, comparison, ticker) {
     const asset = state.snapshot.byTicker[ticker];
-    const simulation = app.simulate(ticker, { useHistoricalDrift });
-    if (!simulation || !simulation.ok) {
-      const reason = simulation ? simulation.metrics.monteCarlo.naReason : 'No simulation is available.';
-      return { html: `<div class="guide-note"><span class="guide-note__badge">Note</span><span>${esc(reason)}</span></div>`, simulation: null };
+    const job = app.simulation(ticker);
+    const simulation = job.result;
+    const note = (badge, text) => `<div class="guide-note"><span class="guide-note__badge">${esc(badge)}</span><span>${esc(text)}</span></div>`;
+    if (!simulation) {
+      if (job.status === 'error') return { html: note('Error', job.error ?? 'The simulation failed.'), simulation: null };
+      return {
+        html: `<div class="sim-status" role="status"><span class="spinner" aria-hidden="true"></span><span>Simulating ${esc(ticker)} off the main thread…</span></div>`,
+        simulation: null,
+      };
     }
+    if (!simulation.ok) return { html: note('Note', simulation.metrics.monteCarlo.naReason), simulation: null };
     const { params, horizons, outcomes } = simulation;
+    const range = h.rangeInfo(state.range);
+    const stale = job.status === 'running';
+    let timing = '';
+    if (stale) timing = 'Recalculating…';
+    else if (isNum(job.ms)) timing = `Simulated ${job.mode === 'worker' ? 'in a Web Worker' : 'on the main thread'} in ${job.ms < 1 ? 'under 1' : h.formatNumber(job.ms, 0)} ms`;
     const start = horizons.length ? simulation.fan.p50[0] : null;
     const longest = horizons[horizons.length - 1];
     const move = (value) => {
@@ -259,14 +276,15 @@ export function mountRiskSandboxModal(dialog, app) {
     const guide = `
       <div class="guide-note guided-only">
         <span class="guide-note__badge">Guide</span>
-        <span>${esc(app.explain('monteCarlo').what)} The model assumes no trend at all: one year of returns is too little to predict the next. ${outcomes ? esc(explainer.healthy) : ''}</span>
+        <span>${esc(app.explain('monteCarlo').what)} The model assumes no trend at all: a year of returns is too little to predict the next. How widely the paths spread comes from the volatility of the selected time range. ${outcomes ? esc(explainer.healthy) : ''}</span>
       </div>`;
 
     const html = `
+      <div class="${stale ? 'is-stale' : ''}" data-role="simulation">
       <div>
         <div class="sandbox__block-title">
           <h3>Range of outcomes for ${esc(ticker)}</h3>
-          <span class="field__hint">${h.formatNumber(params.paths, 0)} simulated paths · prices in ${esc(asset.currency)} · volatility ${h.formatPercent(params.sigmaAnnual, 0)} a year · ${params.driftMode === 'zero' ? 'no trend assumed' : 'last year\'s trend assumed'}</span>
+          <span class="field__hint">${h.formatNumber(params.paths, 0)} simulated paths · prices in ${esc(asset.currency)} · volatility ${h.formatPercent(params.sigmaAnnual, 0)} a year, from the last ${esc(range.label)} · ${params.driftMode === 'zero' ? 'no trend assumed' : `the last ${esc(range.label)}'s trend assumed`}</span>
         </div>
         <div class="chart">
           <div class="chart__plot" data-role="fan" tabindex="0" role="img" aria-label="${esc(summary)}"></div>
@@ -280,6 +298,8 @@ export function mountRiskSandboxModal(dialog, app) {
       </div>
       ${horizonTable}
       ${outcomeBlock}
+      <p class="field__hint" role="status">${esc(timing)}</p>
+      </div>
       ${guide}`;
     return { html, simulation };
   }
@@ -471,9 +491,23 @@ export function mountRiskSandboxModal(dialog, app) {
     if (plot && simulation) drawFan(plot, simulation, lastLevels);
   }
 
+  /** Ask the worker for the simulation that matches the current inputs. Identical inputs are not rerun. */
+  function requestSimulation() {
+    const state = store.getState();
+    const comparison = app.comparison();
+    const ticker = activeTicker(state, comparison);
+    if (ticker) app.requestSimulation(ticker, { useHistoricalDrift });
+  }
+
+  /** An input changed: recompute the tiles now and ask for a new simulation. */
+  function refresh() {
+    requestSimulation();
+    renderResults();
+  }
+
   function scheduleResults() {
     clearTimeout(resultsTimer);
-    resultsTimer = setTimeout(renderResults, 90);
+    resultsTimer = setTimeout(refresh, 90);
   }
 
   /* ------------------------------------------------------------------ */
@@ -486,7 +520,7 @@ export function mountRiskSandboxModal(dialog, app) {
     renderShell();
     if (typeof dialog.showModal === 'function') dialog.showModal();
     else dialog.setAttribute('open', '');
-    renderResults();
+    refresh();
     if (typeof ResizeObserver === 'function' && !resizeObserver) {
       let lastWidth = 0;
       resizeObserver = new ResizeObserver((entries) => {
@@ -633,8 +667,11 @@ export function mountRiskSandboxModal(dialog, app) {
     if (!next.sandbox.open) return;
     if (next.account !== previous.account || next.mode !== previous.mode || next.currency !== previous.currency) syncInputs();
     if (next.account !== previous.account || next.sandbox !== previous.sandbox || next.selected !== previous.selected
-      || next.currency !== previous.currency || next.live.fx !== previous.live.fx) {
+      || next.currency !== previous.currency || next.live.fx !== previous.live.fx || next.range !== previous.range) {
       scheduleResults();
+    } else if (next.compute.monteCarlo !== previous.compute.monteCarlo) {
+      // The worker answered (or started): redraw without asking again.
+      renderResults();
     }
   });
 

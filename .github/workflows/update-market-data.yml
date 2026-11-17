@@ -1,10 +1,16 @@
 name: Update market data and deploy
 
-# One workflow, two jobs:
-#   refresh - pulls fresh data from Yahoo Finance (no API key) and commits
-#             data/market_snapshot.json. Runs on the daily schedule and on demand.
-#   deploy  - publishes the static site to GitHub Pages. Runs after every
-#             successful refresh and on every push to the default branch.
+# Three jobs, one rule: nothing reaches the live site without passing the tests.
+#
+#   refresh  Scheduled and manual runs. Fetches data, validates it, runs the
+#            pipeline unit tests and the browser test suite against the NEW
+#            snapshot, and only then commits it. If any step fails the job stops:
+#            nothing is committed, nothing is deployed, and the site keeps serving
+#            yesterday's data.
+#   test     Pushes and pull requests. Runs the same two test suites against the
+#            code as pushed.
+#   deploy   Publishes to GitHub Pages. Runs only after a successful refresh, or
+#            after a successful test on a push to the default branch.
 #
 # One-time setup: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
 
@@ -16,25 +22,32 @@ on:
   workflow_dispatch:
     inputs:
       skip_refresh:
-        description: "Deploy the site without refreshing market data"
+        description: "Test and deploy the site without refreshing market data"
         type: boolean
         default: false
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: market-data-pages
+  # Serialise runs that touch the default branch; let pull requests run alongside.
+  group: market-data-${{ github.event_name == 'pull_request' && github.ref || 'default-branch' }}
   cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
 
 jobs:
   refresh:
     name: Refresh market snapshot
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.skip_refresh)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Budget: about 30 tickers at 2-3 seconds each, news, and (from Batch 5) two model
+    # fits per ticker. The script enforces its own 12-minute data budget; this is the backstop.
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
@@ -46,18 +59,24 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
 
-      - name: Install yfinance
-        # Deliberately unpinned: when Yahoo changes its endpoints, the fix ships in
-        # a new yfinance release. Schema validation below guards against drift.
-        run: python -m pip install --upgrade pip yfinance
+      - name: Install pipeline dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r scripts/requirements.txt
 
-      - name: Fetch candles and fundamentals
+      - name: Fetch candles, fundamentals, news and macro data
         run: python scripts/fetch_fundamentals.py
 
-      - name: Validate the snapshot
+      - name: Validate the snapshot schema
         run: python scripts/fetch_fundamentals.py --validate-only
+
+      - name: "Gate 1: pipeline unit tests"
+        run: python -m unittest discover -s scripts -p "test_*.py"
+
+      - name: "Gate 2: browser test suite against the new snapshot"
+        run: python scripts/run_browser_tests.py --min-tests 100
 
       - name: Commit the refreshed snapshot
         env:
@@ -74,12 +93,45 @@ jobs:
           git pull --rebase origin "$BRANCH"
           git push origin "HEAD:$BRANCH"
 
+  test:
+    name: Test
+    if: >-
+      github.event_name == 'push' || github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.skip_refresh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install pipeline dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r scripts/requirements.txt
+
+      - name: Validate the committed snapshot
+        run: python scripts/fetch_fundamentals.py --validate-only
+
+      - name: Pipeline unit tests
+        run: python -m unittest discover -s scripts -p "test_*.py"
+
+      - name: Browser test suite
+        run: python scripts/run_browser_tests.py --min-tests 100
+
   deploy:
     name: Deploy to GitHub Pages
-    needs: refresh
-    # Deploy when the refresh succeeded or was skipped (push events). If the refresh
-    # failed, the live site is left untouched and keeps serving yesterday's data.
-    if: ${{ !cancelled() && (needs.refresh.result == 'success' || needs.refresh.result == 'skipped') }}
+    needs: [refresh, test]
+    # Deploy when the refresh passed its gates, or when it did not run and the test
+    # job passed. A failed gate leaves the live site untouched. Never on pull requests.
+    if: >-
+      ${{ !cancelled() && github.event_name != 'pull_request' &&
+          (needs.refresh.result == 'success' ||
+           (needs.refresh.result == 'skipped' && needs.test.result == 'success')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

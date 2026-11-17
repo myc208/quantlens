@@ -2,8 +2,18 @@
  * comparisonMatrix.js: the side-by-side comparison of up to three assets.
  *
  * Layout: one table with a sticky metric-label column and one column per
- * asset, in sections (Verdict, Price, Technical, Fundamental), then the
- * correlation card, then the position-sizing table.
+ * asset, in sections (Verdict, Price, Period, Technical, Fundamental, News and
+ * forecast), then the correlation card, then the position-sizing table.
+ *
+ * Time range: the price chart, the Period rows and the correlation card use
+ * the series sliced to the selected range (1M / 3M / 6M / 1Y). The verdict,
+ * the Technical rows and the Fundamental rows never change with it.
+ *
+ * News and forecast are context only. Up to three recent, de-duplicated
+ * headlines are listed with the tone of their wording; the 30-day Prophet
+ * projection is drawn on the price chart as a dotted line inside its 80% band
+ * and is always shown next to its own track record (how far it missed in its
+ * last 30-day test, against simply assuming no change).
  *
  * Every value is a button. Clicking it dispatches openTrace(ticker, metricId),
  * and the derivation drawer shows that metric's formula, raw inputs and
@@ -37,13 +47,24 @@ const SECTIONS = Object.freeze([
     note: 'Crypto is live; stocks are the last daily close',
     rows: [
       { id: 'price', lead: true },
-      { id: 'chart', kind: 'chart', label: 'One-year price' },
+      { id: 'chart', kind: 'chart' },
+    ],
+  },
+  {
+    id: 'period',
+    title: 'Period',
+    note: (range) => `The last ${range.label} · follows the time range, unlike the scores below`,
+    rows: [
+      { id: 'periodReturn' },
+      { id: 'periodVolatility' },
+      { id: 'maxDrawdown' },
+      { id: 'periodRange', meter: 'fraction' },
     ],
   },
   {
     id: 'technical',
     title: 'Technical',
-    note: 'Price behaviour, from completed daily candles',
+    note: 'Price behaviour, from a full year of completed daily candles',
     rows: [
       { id: 'technicalScore', lead: true, meter: 'score' },
       { id: 'rsi14', meter: 'score' },
@@ -52,7 +73,6 @@ const SECTIONS = Object.freeze([
       { id: 'ema50' },
       { id: 'sma200' },
       { id: 'atrPct' },
-      { id: 'volatility' },
       { id: 'range52w', meter: 'fraction' },
       { id: 'trendScore', pro: true, meter: 'score' },
       { id: 'macdScore', pro: true, meter: 'score' },
@@ -90,6 +110,17 @@ const SECTIONS = Object.freeze([
       { id: 'freeCashFlow', pro: true },
     ],
   },
+  {
+    id: 'context',
+    title: 'News and forecast',
+    note: 'Context only: neither is part of the verdict',
+    rows: [
+      { id: 'headlineTone' },
+      { id: 'news', kind: 'news', label: 'Recent headlines' },
+      { id: 'forecast30d' },
+      { id: 'forecastBacktest', label: 'Forecast miss rate (30-day test)' },
+    ],
+  },
 ]);
 
 const SIZING_SECTION = Object.freeze({
@@ -110,6 +141,9 @@ const SIZING_SECTION = Object.freeze({
 const VERDICT_TONES = Object.freeze({ BUY: 'healthy', HOLD: 'neutral', SELL: 'risky' });
 const PROFILE_CHIPS = Object.freeze({ CORPORATE: 'Corporate', FINANCIAL: 'Bank', REIT: 'REIT', CRYPTO: 'Crypto' });
 const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'banks', REIT: 'REITs', CRYPTO: 'crypto' });
+const STORY_TONES = Object.freeze({ positive: 'healthy', neutral: 'neutral', negative: 'caution' });
+const DAY_MS = 86400000;
+const dayOf = (isoDate) => Date.parse(`${isoDate}T00:00:00Z`);
 
 export function mountComparisonMatrix(root, app) {
   const { store, actions, h } = app;
@@ -130,8 +164,18 @@ export function mountComparisonMatrix(root, app) {
   const domId = (key) => `exp-${key.replace(/[^a-zA-Z0-9]+/g, '-')}`;
 
   function rowLabel(row) {
+    if (row.kind === 'chart') return `Price, last ${h.rangeInfo().label}`;
     return row.label ?? app.explain(row.id).term;
   }
+
+  function sectionNote(section, state) {
+    return typeof section.note === 'function' ? section.note(h.rangeInfo(state.range)) : section.note;
+  }
+
+  const amount = (value, currency) => {
+    const shown = h.money(value, currency);
+    return `${shown.currency} ${h.formatAmount(shown.value)}`;
+  };
 
   function visibleRows(section, state) {
     return section.rows.filter((row) => !row.pro || state.mode === 'pro');
@@ -200,6 +244,20 @@ export function mountComparisonMatrix(root, app) {
         return isNum(meta.meanCorrelation) ? sub(`Mean correlation ${h.formatNumber(meta.meanCorrelation, 2)}`) : sub('No overlap to adjust for');
       case 'riskBudget':
         return sub(`${h.formatNumber(state.account.riskPct, 2)}% of account`);
+      case 'periodReturn':
+        return meta.from ? sub(`${h.shortDate(meta.from, true)} to ${h.shortDate(meta.to)}`) : '';
+      case 'periodVolatility':
+        return isNum(meta.returns) ? sub(`From ${meta.returns} daily returns${meta.returns < 40 ? ' · rough' : ''}`) : '';
+      case 'maxDrawdown':
+        return metric.value < 0 ? sub(`${h.shortDate(meta.peakDate)} to ${h.shortDate(meta.troughDate)}`) : sub('No fall from a high');
+      case 'periodRange':
+        return sub(`Low ${h.formatAmount(h.money(meta.low, meta.currency).value)} · High ${h.formatAmount(h.money(meta.high, meta.currency).value)}`);
+      case 'headlineTone':
+        return sub(`${metric.value > 0 ? '+' : ''}${h.formatNumber(metric.value, 2)} on a −1 to +1 scale · ${meta.basis} stor${meta.basis === 1 ? 'y' : 'ies'}${meta.stale ? ' · old headlines' : ''}`);
+      case 'forecast30d':
+        return sub(`≈ ${amount(meta.endPrice, meta.currency)} by ${h.shortDate(meta.endDate)} · 80% band ${h.signedPercent(meta.lowerChange, 0)} to ${h.signedPercent(meta.upperChange, 0)}${meta.stale ? ' · older run' : ''}`);
+      case 'forecastBacktest':
+        return sub(`Assuming no change missed by ${h.formatPercent(meta.naiveMape, 1)}${meta.beatsNaive ? ' · model was closer' : ' · the model added nothing'}`);
       default:
         return meta.scored && isNum(meta.subScore) ? scoreSub(meta, state, '') : '';
     }
@@ -215,6 +273,10 @@ export function mountComparisonMatrix(root, app) {
     if (metric.id === 'verdict') {
       const tone = VERDICT_TONES[metric.value] ?? 'neutral';
       return `<span class="badge badge--verdict badge--${tone}">${h.toneMark(tone)}${esc(metric.value)}</span>`;
+    }
+    if (metric.id === 'headlineTone') {
+      const word = String(metric.meta.label ?? '');
+      return `${h.toneMark(metric.tone)}<span class="cell__value">${esc(word.charAt(0).toUpperCase() + word.slice(1))}</span>`;
     }
     const unit = metric.id === 'positionSize' && metric.meta.unitName
       ? ` <span class="cell__unit">${esc(metric.meta.unitName)}</span>` : '';
@@ -244,50 +306,144 @@ export function mountComparisonMatrix(root, app) {
   }
 
   /* ------------------------------------------------------------------ */
-  /* Sparkline (one series: the row title names it, so there is no legend) */
+  /* Price chart: the selected range, plus the dotted 30-day projection   */
   /* ------------------------------------------------------------------ */
 
-  function sparkCell(asset) {
-    const { close, dates } = asset.series;
-    const count = close.length;
+  const charts = new Map(); // ticker -> the model of the chart on screen, for hover
+
+  /**
+   * Geometry and data of one asset's chart. The x axis is calendar time, so the
+   * 30 projected days take up their true share of the width; the y axis covers
+   * the closes and the whole projection band.
+   */
+  function chartModel(asset) {
+    const view = app.window(asset.ticker);
+    const { forecast } = app.analysis(asset.ticker);
+    const { close, dates } = view.series;
+    const points = dates.map((date, index) => ({ time: dayOf(date), date, price: close[index], projected: false }));
+    const usable = forecast.status !== 'unavailable' && forecast.aligned !== false && forecast.series.dates.length > 0 && points.length > 1;
+    const projection = usable ? forecast.series : null;
+    if (projection) {
+      projection.dates.forEach((date, index) => points.push({
+        time: dayOf(date), date, price: projection.yhat[index], lower: projection.lower[index], upper: projection.upper[index], projected: true,
+      }));
+    }
+    const history = close.length;
+    const start = points.length ? points[0].time : 0;
+    const today = history ? points[history - 1].time : start;
+    const span = Math.max(DAY_MS, (points.length ? points[points.length - 1].time : start) - start);
     let low = Infinity;
     let high = -Infinity;
     for (const price of close) {
       if (price < low) low = price;
       if (price > high) high = price;
     }
-    const span = high - low || 1;
-    const x = (index) => (index / (count - 1)) * 100;
-    const y = (price) => 4 + (1 - (price - low) / span) * 32;
+    const windowLow = low;
+    const windowHigh = high;
+    if (projection) {
+      low = Math.min(low, ...projection.lower);
+      high = Math.max(high, ...projection.upper);
+    }
+    const height = high - low || Math.abs(high) * 0.01 || 1;
+    return {
+      asset, view, forecast, projection, points, history, start, span, windowLow, windowHigh,
+      x: (time) => ((time - start) / span) * 100,
+      y: (price) => 4 + (1 - (price - low) / height) * 32,
+      todayX: ((today - start) / span) * 100,
+      change: history >= 2 ? safeDiv(close[history - 1] - close[0], close[0]) : null,
+    };
+  }
+
+  function sparkDefaults(model) {
+    const projected = model.projection ? app.trace(model.asset.ticker, 'forecast30d') : null;
+    return {
+      label: `${esc(model.view.info.title)} ${deltaMarkup(model.change)}`,
+      value: projected && projected.status === 'ok' ? `Projection ${esc(h.signedPercent(projected.value, 1))}` : '',
+    };
+  }
+
+  function sparkCell(asset) {
+    const model = chartModel(asset);
+    charts.set(asset.ticker, model);
+    const { points, history, projection, x, y } = model;
+    if (history < 2) {
+      return '<td><div class="cell cell--static cell--na"><span class="cell__sub">Not enough price history in this range to draw a chart.</span></div></td>';
+    }
+    const at = (point, price = point.price) => `${x(point.time).toFixed(2)},${y(price).toFixed(2)}`;
     let line = '';
-    for (let i = 0; i < count; i += 1) line += `${i === 0 ? 'M' : 'L'}${x(i).toFixed(2)},${y(close[i]).toFixed(2)}`;
-    const area = `${line}L100,40L0,40Z`;
-    const change = safeDiv(close[count - 1] - close[0], close[0]);
-    const shownLow = h.money(low, asset.currency);
-    const shownHigh = h.money(high, asset.currency);
-    const summary = `One-year price for ${asset.ticker}, ${dates[0]} to ${dates[count - 1]}: ${change >= 0 ? 'up' : 'down'} ${h.formatPercent(Math.abs(change ?? 0), 1)}. Low ${shownLow.currency} ${h.formatAmount(shownLow.value)}, high ${shownHigh.currency} ${h.formatAmount(shownHigh.value)}.`;
+    for (let i = 0; i < history; i += 1) line += `${i === 0 ? 'M' : 'L'}${at(points[i])}`;
+    const last = points[history - 1];
+    const area = `${line}L${model.todayX.toFixed(2)},40L0,40Z`;
+
+    let band = '';
+    let dotted = '';
+    if (projection) {
+      const future = points.slice(history);
+      dotted = `M${at(last)}${future.map((point) => `L${at(point)}`).join('')}`;
+      band = `M${at(last)}${future.map((point) => `L${at(point, point.upper)}`).join('')}`
+        + `${[...future].reverse().map((point) => `L${at(point, point.lower)}`).join('')}Z`;
+    }
+
+    const { ticker, currency } = asset;
+    const change = model.change ?? 0;
+    let summary = `Price of ${ticker} over the last ${model.view.info.label}, ${points[0].date} to ${last.date}: ${change >= 0 ? 'up' : 'down'} ${h.formatPercent(Math.abs(change), 1)}. `
+      + `Low ${amount(model.windowLow, currency)}, high ${amount(model.windowHigh, currency)}.`;
+    if (projection) {
+      const end = points[points.length - 1];
+      summary += ` A trend model projects ${amount(end.price, currency)} by ${end.date}, with an 80% band from ${amount(end.lower, currency)} to ${amount(end.upper, currency)}. The projection is not part of the verdict.`;
+    }
+    const defaults = sparkDefaults(model);
     return `
       <td>
-        <div class="spark" data-spark="${esc(asset.ticker)}">
+        <div class="spark" data-spark="${esc(ticker)}">
           <div class="spark__plot" role="img" aria-label="${esc(summary)}">
             <svg class="spark__svg" viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+              ${band ? `<path class="spark__band" d="${band}"></path>` : ''}
               <path class="spark__area" d="${area}"></path>
               <path class="spark__line" d="${line}"></path>
+              ${dotted ? `<path class="spark__forecast" d="${dotted}"></path>` : ''}
             </svg>
-            <span class="spark__dot" style="left:100%;top:${(y(close[count - 1]) / 40 * 100).toFixed(2)}%"></span>
+            ${projection ? `<span class="spark__today" style="left:${model.todayX.toFixed(2)}%"></span>` : ''}
+            <span class="spark__dot" style="left:${model.todayX.toFixed(2)}%;top:${(y(last.price) / 40 * 100).toFixed(2)}%"></span>
             <span class="spark__cursor" hidden></span>
           </div>
           <div class="spark__readout">
-            <span data-role="spark-label">1 year</span>
-            <span data-role="spark-value">${deltaMarkup(change)}</span>
+            <span data-role="spark-label">${defaults.label}</span>
+            <span data-role="spark-value">${defaults.value}</span>
           </div>
         </div>
       </td>`;
   }
 
-  function sparkDefaults(asset) {
-    const { close } = asset.series;
-    return { label: '1 year', value: deltaMarkup(safeDiv(close[close.length - 1] - close[0], close[0])) };
+  /* ------------------------------------------------------------------ */
+  /* Recent headlines                                                    */
+  /* ------------------------------------------------------------------ */
+
+  function newsCell(asset) {
+    const { sentiment } = app.analysis(asset.ticker);
+    const stories = sentiment.stories.slice(0, 3);
+    if (stories.length === 0) {
+      return `<td><p class="news-empty">${esc(sentiment.note || 'No recent headlines are available for this asset.')}</p></td>`;
+    }
+    const items = stories.map((story) => {
+      const label = typeof story.label === 'string' ? story.label : null;
+      // Only http(s) links from the feed become links; anything else is shown as plain text.
+      const safe = typeof story.link === 'string' && /^https?:\/\//i.test(story.link);
+      const title = safe
+        ? `<a href="${esc(story.link)}" target="_blank" rel="noopener noreferrer">${esc(story.title)}</a>`
+        : `<span>${esc(story.title)}</span>`;
+      const meta = [
+        h.relativeAge(story.ageHours),
+        label ? `${label} wording` : 'not scored',
+        story.duplicates ? `${story.duplicates} syndicated cop${story.duplicates === 1 ? 'y' : 'ies'} folded in` : '',
+      ].filter(Boolean).join(' · ');
+      return `
+        <li class="news-item">
+          ${h.toneMark(STORY_TONES[label] ?? null)}
+          <span>${title}<span class="news-item__meta">${esc(meta)}</span></span>
+        </li>`;
+    }).join('');
+    return `<td><ul class="news-list" aria-label="${esc(`Recent headlines for ${asset.ticker}`)}">${items}</ul></td>`;
   }
 
   /* ------------------------------------------------------------------ */
@@ -298,10 +454,28 @@ export function mountComparisonMatrix(root, app) {
     const key = `${section.id}:${row.id}`;
     const label = rowLabel(row);
     if (row.kind === 'chart') {
+      const cells = assets.map((asset) => sparkCell(asset)).join('');
+      // Two series (price and projection) need a legend; it sits once, in the label column.
+      const projected = assets.some((asset) => charts.get(asset.ticker) && charts.get(asset.ticker).projection);
+      return `
+        <tr class="metric-row" data-rowkey="${esc(key)}">
+          <th scope="row">
+            <div class="metric-label"><span class="metric-term">${esc(label)}</span></div>
+            ${projected ? `
+              <div class="spark__legend" aria-hidden="true">
+                <span><span class="spark__key"></span>Price</span>
+                <span><span class="spark__key spark__key--forecast"></span>30-day projection</span>
+                <span><span class="spark__key spark__key--band"></span>80% band</span>
+              </div>` : ''}
+          </th>
+          ${cells}
+        </tr>`;
+    }
+    if (row.kind === 'news') {
       return `
         <tr class="metric-row" data-rowkey="${esc(key)}">
           <th scope="row"><div class="metric-label"><span class="metric-term">${esc(label)}</span></div></th>
-          ${assets.map((asset) => sparkCell(asset)).join('')}
+          ${assets.map((asset) => newsCell(asset)).join('')}
         </tr>`;
     }
     const open = explainerOpen(key, state);
@@ -319,7 +493,7 @@ export function mountComparisonMatrix(root, app) {
   }
 
   function explainerRow(section, row, assets, state, span) {
-    if (row.kind === 'chart') return '';
+    if (row.kind) return ''; // charts and headline lists explain themselves
     const key = `${section.id}:${row.id}`;
     const base = app.explain(row.id);
     const notes = new Map(); // note text -> tickers it applies to
@@ -358,7 +532,7 @@ export function mountComparisonMatrix(root, app) {
       <tbody data-section="${esc(section.id)}">
         <tr class="section-row">
           <th colspan="${span}" scope="rowgroup">
-            <span class="section-row__title">${esc(section.title)}</span><span class="section-row__note">${esc(section.note)}</span>
+            <span class="section-row__title">${esc(section.title)}</span><span class="section-row__note">${esc(sectionNote(section, state))}</span>
           </th>
         </tr>
         ${rows.map((row) => metricRow(section, row, assets, state, comparison) + explainerRow(section, row, assets, state, span)).join('')}
@@ -454,7 +628,7 @@ export function mountComparisonMatrix(root, app) {
       <section class="card correlation" aria-labelledby="correlation-title">
         <div class="correlation__head">
           <h2 class="correlation__title" id="correlation-title">Correlation</h2>
-          <span class="section-row__note">How much the compared assets overlap, from one year of daily returns</span>
+          <span class="section-row__note">How much the compared assets overlap, from the last ${esc(h.rangeInfo(state.range).label)} of daily returns. Position sizes below use it.</span>
         </div>
         <div class="correlation__grid">
           ${table}
@@ -549,7 +723,7 @@ export function mountComparisonMatrix(root, app) {
       <header class="matrix__toolbar">
         <div>
           <h1 class="matrix__title" id="matrix-title">${count ? esc(comparison.tickers.join(' vs ')) : 'Comparison'}</h1>
-          <p class="matrix__sub">Amounts in ${esc(state.currency)}${fxText}. Select any value to see exactly how it was calculated.</p>
+          <p class="matrix__sub">Amounts in ${esc(state.currency)}${fxText} · chart, Period rows and correlation cover the last ${esc(h.rangeInfo(state.range).label)}. Select any value to see exactly how it was calculated.</p>
         </div>
         <div class="toolbar-actions">
           ${count ? `<button type="button" class="btn guided-only" data-action="toggle-explainers" data-key="toolbar|explainers" aria-pressed="${allOpen}">${allOpen ? 'Hide explanations' : 'Show explanations'}</button>` : ''}
@@ -615,12 +789,16 @@ export function mountComparisonMatrix(root, app) {
     for (const cell of root.querySelectorAll(selector)) cell.setAttribute('aria-current', 'true');
   }
 
+  let dirty = true;
+
   function render() {
     const state = store.getState();
     if (!state.snapshot) {
       root.innerHTML = '';
       return;
     }
+    dirty = false;
+    charts.clear();
     const comparison = app.comparison();
     const hasAssets = comparison.assets.length > 0;
     withFocus(() => {
@@ -728,38 +906,45 @@ export function mountComparisonMatrix(root, app) {
     }
   });
 
-  // Sparkline hover: a vertical hairline snaps to the nearest day and the readout shows its date and price.
+  // Chart hover: a vertical hairline snaps to the nearest day and the readout shows its date and
+  // price. Past the "today" line it reads the projection and its 80% band instead.
   root.addEventListener('pointermove', (event) => {
     const plot = event.target.closest ? event.target.closest('.spark__plot') : null;
     if (!plot) return;
     const holder = plot.closest('[data-spark]');
-    const analysis = app.analysis(holder.dataset.spark);
-    if (!analysis) return;
-    const { close, dates } = analysis.asset.series;
+    const model = charts.get(holder.dataset.spark);
+    if (!model || model.points.length === 0) return;
     const box = plot.getBoundingClientRect();
     const fraction = Math.min(1, Math.max(0, (event.clientX - box.left) / box.width));
-    const index = Math.round(fraction * (close.length - 1));
+    const time = model.start + fraction * model.span;
+    let nearest = model.points[0];
+    for (const point of model.points) {
+      if (Math.abs(point.time - time) < Math.abs(nearest.time - time)) nearest = point;
+    }
     const cursor = plot.querySelector('.spark__cursor');
     cursor.hidden = false;
-    cursor.style.left = `${(index / (close.length - 1)) * 100}%`;
-    const shown = h.money(close[index], analysis.asset.currency);
-    holder.querySelector('[data-role="spark-label"]').textContent = h.shortDate(dates[index], true);
+    cursor.style.left = `${model.x(nearest.time)}%`;
+    const { currency } = model.asset;
+    holder.querySelector('[data-role="spark-label"]').textContent = `${h.shortDate(nearest.date, true)}${nearest.projected ? ' · projected' : ''}`;
     const value = holder.querySelector('[data-role="spark-value"]');
     value.textContent = '';
     const strong = document.createElement('strong');
-    strong.textContent = `${shown.currency} ${h.formatAmount(shown.value)}`;
+    strong.textContent = amount(nearest.price, currency);
     value.append(strong);
+    if (nearest.projected) {
+      value.append(` (${h.formatAmount(h.money(nearest.lower, currency).value)} – ${h.formatAmount(h.money(nearest.upper, currency).value)})`);
+    }
   });
 
   root.addEventListener('pointerout', (event) => {
     const plot = event.target.closest ? event.target.closest('.spark__plot') : null;
     if (!plot || (event.relatedTarget && plot.contains(event.relatedTarget))) return;
     const holder = plot.closest('[data-spark]');
-    const analysis = app.analysis(holder.dataset.spark);
+    const model = charts.get(holder.dataset.spark);
     plot.querySelector('.spark__cursor').hidden = true;
-    if (!analysis) return;
-    const defaults = sparkDefaults(analysis.asset);
-    holder.querySelector('[data-role="spark-label"]').textContent = defaults.label;
+    if (!model) return;
+    const defaults = sparkDefaults(model);
+    holder.querySelector('[data-role="spark-label"]').innerHTML = defaults.label;
     holder.querySelector('[data-role="spark-value"]').innerHTML = defaults.value;
   });
 
@@ -767,8 +952,14 @@ export function mountComparisonMatrix(root, app) {
     const structural = next.snapshot !== previous.snapshot || next.selected !== previous.selected
       || next.currency !== previous.currency || next.mode !== previous.mode
       || next.account !== previous.account || next.live.fx !== previous.live.fx
-      || next.warnings !== previous.warnings;
-    if (structural) {
+      || next.warnings !== previous.warnings || next.range !== previous.range;
+    // The matrix is only rebuilt while it is the visible view; otherwise it is marked stale
+    // and rebuilt once when the user comes back to it.
+    if (next.view !== 'compare') {
+      if (structural) dirty = true;
+      return;
+    }
+    if (structural || (next.view !== previous.view && dirty)) {
       render();
       return;
     }
@@ -778,7 +969,7 @@ export function mountComparisonMatrix(root, app) {
     }
   });
 
-  render();
+  if (store.getState().view === 'compare') render();
 
   return {
     destroy() {

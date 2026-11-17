@@ -16,7 +16,7 @@
 html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
-  scroll-padding-top: calc(var(--telemetry-h) + var(--space-4));
+  scroll-padding-top: calc(var(--chrome-h) + var(--space-4));
 }
 
 body {
@@ -139,6 +139,14 @@ select {
   flex: none;
 }
 
+/* ---------------- Tab bar ---------------- */
+
+.app-tabs {
+  position: sticky;
+  top: var(--telemetry-h);
+  z-index: var(--z-tabs);
+}
+
 /* ---------------- Shell ---------------- */
 
 .app-shell {
@@ -156,9 +164,9 @@ select {
 
 .screener {
   position: sticky;
-  top: calc(var(--telemetry-h) + var(--space-4));
-  max-height: calc(100vh - var(--telemetry-h) - var(--space-6));
-  max-height: calc(100dvh - var(--telemetry-h) - var(--space-6));
+  top: calc(var(--chrome-h) + var(--space-4));
+  max-height: calc(100vh - var(--chrome-h) - var(--space-6));
+  max-height: calc(100dvh - var(--chrome-h) - var(--space-6));
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -187,7 +195,7 @@ select {
 
 .drawer {
   position: fixed;
-  top: var(--telemetry-h);
+  top: var(--chrome-h);
   right: 0;
   bottom: 0;
   z-index: var(--z-drawer);
@@ -294,6 +302,11 @@ select {
 /* ---------------- Mobile ---------------- */
 
 @media (max-width: 767px) {
+  /* On a phone the tab bar scrolls away with the page: two sticky bars would eat the screen. */
+  .app-tabs {
+    position: static;
+  }
+
   .telemetry {
     flex-wrap: wrap;
     row-gap: var(--space-2);

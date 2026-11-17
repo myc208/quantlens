@@ -17,6 +17,9 @@
 
 const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'banks', REIT: 'REITs', CRYPTO: 'crypto' });
 
+// Metrics that belong to the portfolio as a whole rather than to one asset or one pair.
+const PORTFOLIO_METRICS = new Set(['portfolioReturn', 'portfolioVolatility', 'sharpeRatio', 'diversificationRatio', 'riskFreeRate']);
+
 export function mountDerivationDrawer(root, app, scrim) {
   const { store, actions, h } = app;
   const { esc } = h;
@@ -232,7 +235,9 @@ export function mountDerivationDrawer(root, app, scrim) {
       return;
     }
     const asset = drawer.ticker && state.snapshot ? state.snapshot.byTicker[drawer.ticker] : null;
-    const eyebrow = asset ? `${asset.ticker} · ${asset.name}` : 'All compared assets';
+    let eyebrow = 'All compared assets';
+    if (asset) eyebrow = `${asset.ticker} · ${asset.name}`;
+    else if (PORTFOLIO_METRICS.has(drawer.trail[0])) eyebrow = 'Your portfolio';
     const scrollTop = lastRenderedId === metric.id ? (root.querySelector('.drawer__body') || {}).scrollTop : 0;
 
     root.innerHTML = `
@@ -336,6 +341,8 @@ export function mountDerivationDrawer(root, app, scrim) {
       next.selected !== previous.selected || next.account !== previous.account
       || next.currency !== previous.currency || next.mode !== previous.mode
       || next.live.fx !== previous.live.fx || next.snapshot !== previous.snapshot
+      // Time-range statistics, the simulation and the portfolio maths all change what a trace shows.
+      || next.range !== previous.range || next.compute !== previous.compute
     );
     if (drawerChanged || contextChanged) render();
   });

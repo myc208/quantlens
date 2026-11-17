@@ -17,7 +17,13 @@ import {
   traced, notAvailable, input, step, threshold, interpretation, valueOf, fmtN,
 } from '../core/derivationTracer.js';
 
-export const CORR_CONFIG = Object.freeze({ minOverlap: 60, dangerThreshold: 0.8, elevatedThreshold: 0.6 });
+export const CORR_CONFIG = Object.freeze({
+  minOverlap: 60, // full-year view
+  minWindowOverlap: 15, // shorter time ranges: allowed, and the trace says the figure is rough
+  roughBelow: 40,
+  dangerThreshold: 0.8,
+  elevatedThreshold: 0.6,
+});
 
 const THRESHOLDS = [
   threshold('0.80 to 1.00', 'Effectively one bet', 'risky'),
@@ -92,16 +98,18 @@ function describe(rho, a, b) {
  * Correlation of two assets as a traced metric.
  * @param {object} assetA normalised asset
  * @param {object} assetB normalised asset
+ * @param {{ minOverlap?: number, windowLabel?: string }} [options] minimum return pairs, and the
+ *        name of the period the series cover ("year", "3 months"), used in the explanation
  */
-export function correlatePair(assetA, assetB) {
+export function correlatePair(assetA, assetB, { minOverlap = CORR_CONFIG.minOverlap, windowLabel = 'year' } = {}) {
   const id = pairId(assetA.ticker, assetB.ticker);
   const label = `Correlation: ${assetA.ticker} vs ${assetB.ticker}`;
   const formula = 'ρ = covariance(rA, rB) ÷ (stdev(rA) × stdev(rB)), using daily log returns on dates both assets traded';
   const crossMarket = assetA.market !== assetB.market;
   const caveat = crossMarket
     ? `${assetA.ticker} and ${assetB.ticker} trade in different sessions (${assetA.market} and ${assetB.market}), so their daily closes are hours apart. This understates how closely they really move; treat the figure as a lower bound.`
-    : 'Correlation is measured over the past year and rises sharply in market sell-offs, exactly when diversification is needed most.';
-  const base = { id, label, unit: 'ratio', formula, meta: { tickers: [assetA.ticker, assetB.ticker], crossMarket } };
+    : `Correlation is measured over the past ${windowLabel} and rises sharply in market sell-offs, exactly when diversification is needed most.`;
+  const base = { id, label, unit: 'ratio', formula, meta: { tickers: [assetA.ticker, assetB.ticker], crossMarket, window: windowLabel } };
 
   const aligned = alignedReturns(assetA.series, assetB.series);
   const overlap = aligned ? aligned.a.length : 0;
@@ -110,10 +118,10 @@ export function correlatePair(assetA, assetB) {
     input(`${assetB.ticker} daily closes`, assetB.series.close.length, 'candles', 'snapshot', assetB.quote.asOf),
     input('Overlapping daily returns', overlap, 'observations', 'dates present in both series'),
   ];
-  if (overlap < CORR_CONFIG.minOverlap) {
+  if (overlap < minOverlap) {
     return notAvailable({
       ...base, rawInputs,
-      reason: `Only ${overlap} overlapping daily returns are available; at least ${CORR_CONFIG.minOverlap} are needed for a reliable correlation.`,
+      reason: `Only ${overlap} overlapping daily returns are available; at least ${minOverlap} are needed for a reliable correlation.`,
     });
   }
   const stats = pearson(aligned.a, aligned.b);
@@ -133,7 +141,11 @@ export function correlatePair(assetA, assetB) {
       step('Covariance of the two return series', 'Σ (rA − mean A)(rB − mean B) ÷ (n − 1)', stats.covariance),
       step('Divide the covariance by the product of the standard deviations', `${fmtN(stats.covariance, 8)} ÷ (${fmtN(stats.sdX, 6)} × ${fmtN(stats.sdY, 6)})`, rho),
     ],
-    interpretation: interpretation(describe(rho, assetA.ticker, assetB.ticker), THRESHOLDS, caveat),
+    interpretation: interpretation(
+      describe(rho, assetA.ticker, assetB.ticker),
+      THRESHOLDS,
+      overlap < CORR_CONFIG.roughBelow ? `Based on only ${overlap} pairs of daily returns, so this is a rough figure that can swing a lot from one month to the next. ${caveat}` : caveat,
+    ),
   });
 }
 
@@ -141,6 +153,7 @@ export function correlatePair(assetA, assetB) {
  * Full correlation picture for the compared assets (normally up to three).
  *
  * @param {object[]} assets normalised assets
+ * @param {{ minOverlap?: number, windowLabel?: string }} [options] see correlatePair
  * @returns {{
  *   tickers: string[],
  *   matrix: (number|null)[][],
@@ -151,7 +164,7 @@ export function correlatePair(assetA, assetB) {
  *   overall: { level:'danger'|'elevated'|'ok'|'unknown', headline:string }
  * }}
  */
-export function analyzeCorrelation(assets) {
+export function analyzeCorrelation(assets, options = {}) {
   const list = Array.isArray(assets) ? assets.filter(Boolean) : [];
   const tickers = list.map((asset) => asset.ticker);
   const size = list.length;
@@ -162,7 +175,7 @@ export function analyzeCorrelation(assets) {
 
   for (let i = 0; i < size; i += 1) {
     for (let j = i + 1; j < size; j += 1) {
-      const metric = correlatePair(list[i], list[j]);
+      const metric = correlatePair(list[i], list[j], options);
       pairs[metric.id] = metric;
       pairsByTicker[tickers[i]].push(metric.id);
       pairsByTicker[tickers[j]].push(metric.id);

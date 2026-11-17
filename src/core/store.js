@@ -4,8 +4,12 @@
  * Stateless by design: nothing is written to localStorage, sessionStorage,
  * cookies or IndexedDB. Every visit starts from defaults plus whatever the URL
  * says. The URL carries only the shareable view (tickers, filters, currency,
- * mode). Account size and risk settings stay in memory so a shared link can
- * never leak them.
+ * mode, tab, time range and portfolio weights as percentages). Account size and
+ * risk settings stay in memory so a shared link can never leak them.
+ *
+ * Heavy calculations run in a Web Worker. Their state lives in the `compute`
+ * slice, keyed by the inputs they were started with, so a late reply for
+ * inputs that have since changed is discarded ("latest wins").
  *
  *   UI event -> dispatch(action) -> reduce(state, action) -> new state
  *            -> URL updated (history.replaceState) -> subscribers re-render
@@ -16,6 +20,12 @@ export const DEFAULT_SELECTED = Object.freeze(['AAPL', 'D05.SI', 'BTC-USD']);
 
 export const CURRENCIES = Object.freeze(['USD', 'SGD']);
 export const MODES = Object.freeze(['guided', 'pro']);
+export const VIEWS = Object.freeze(['compare', 'leaderboard', 'portfolio']);
+export const RANGES = Object.freeze(['1m', '3m', '6m', '1y']);
+export const DEFAULT_VIEW = 'compare';
+export const DEFAULT_RANGE = '1y';
+export const MAX_PORTFOLIO_ASSETS = 8;
+export const COMPUTE_JOBS = Object.freeze(['monteCarlo', 'portfolio']);
 export const FILTER_OPTIONS = Object.freeze({
   assetClass: Object.freeze(['all', 'equity', 'crypto']),
   market: Object.freeze(['all', 'US', 'SG', 'CRYPTO']),
@@ -36,6 +46,7 @@ export const ACCOUNT_LIMITS = Object.freeze({
 const URL_KEYS = Object.freeze({
   selected: 't', currency: 'ccy', mode: 'mode',
   assetClass: 'class', market: 'mkt', sector: 'sector', verdict: 'verdict',
+  view: 'view', range: 'range', portfolio: 'p',
 });
 const TICKER_PATTERN = /^[A-Z0-9][A-Z0-9.\-=^]{0,14}$/;
 
@@ -51,6 +62,39 @@ function uniqueTickers(list) {
     if (seen.length === MAX_SELECTED) break;
   }
   return seen;
+}
+
+/** Round a percentage to two decimals and keep it inside 0..100. */
+function cleanWeight(value) {
+  const number = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;
+  if (typeof number !== 'number' || !Number.isFinite(number)) return null;
+  return Math.round(Math.min(100, Math.max(0, number)) * 100) / 100;
+}
+
+/** Equal percentages that add up to exactly 100 (the last one absorbs the rounding). */
+export function equalWeights(tickers) {
+  const count = tickers.length;
+  if (count === 0) return [];
+  const share = Math.floor((100 / count) * 100) / 100;
+  return tickers.map((ticker, index) => ({
+    ticker,
+    weight: index === count - 1 ? Math.round((100 - share * (count - 1)) * 100) / 100 : share,
+  }));
+}
+
+/** Parse "AAPL:40,D05.SI:35,BTC-USD:25" into weights. Returns null when nothing valid is present. */
+function parsePortfolio(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  const entries = [];
+  for (const part of raw.split(',')) {
+    const [rawTicker, rawWeight] = part.split(':');
+    const ticker = String(rawTicker ?? '').trim().toUpperCase();
+    const weight = cleanWeight(rawWeight);
+    if (!TICKER_PATTERN.test(ticker) || weight === null || entries.some((entry) => entry.ticker === ticker)) continue;
+    entries.push({ ticker, weight });
+    if (entries.length === MAX_PORTFOLIO_ASSETS) break;
+  }
+  return entries.length ? entries : null;
 }
 
 function matchOption(options, raw) {
@@ -72,6 +116,9 @@ export function parseUrlState(search = '') {
     selected: rawTickers === null ? [...DEFAULT_SELECTED] : uniqueTickers(rawTickers.split(',')),
     currency: matchOption(CURRENCIES, params.get(URL_KEYS.currency)) ?? 'USD',
     mode: matchOption(MODES, params.get(URL_KEYS.mode)) ?? 'guided',
+    view: matchOption(VIEWS, params.get(URL_KEYS.view)) ?? DEFAULT_VIEW,
+    range: matchOption(RANGES, params.get(URL_KEYS.range)) ?? DEFAULT_RANGE,
+    portfolio: { weights: parsePortfolio(params.get(URL_KEYS.portfolio)) },
     filters: {
       assetClass: matchOption(FILTER_OPTIONS.assetClass, params.get(URL_KEYS.assetClass)) ?? 'all',
       market: matchOption(FILTER_OPTIONS.market, params.get(URL_KEYS.market)) ?? 'all',
@@ -102,6 +149,13 @@ export function serializeUrlState(state) {
   if (filters.market !== 'all') add(URL_KEYS.market, filters.market);
   if (filters.sector !== 'all') add(URL_KEYS.sector, encodeURIComponent(filters.sector).replace(/%20/g, '+'));
   if (filters.verdict !== 'all') add(URL_KEYS.verdict, filters.verdict);
+  if (state.view && state.view !== DEFAULT_VIEW) add(URL_KEYS.view, state.view);
+  if (state.range && state.range !== DEFAULT_RANGE) add(URL_KEYS.range, state.range);
+  // Weights are percentages only, so a shared portfolio never reveals an amount of money.
+  const weights = state.portfolio ? state.portfolio.weights : null;
+  if (Array.isArray(weights) && weights.length) {
+    add(URL_KEYS.portfolio, weights.map((entry) => `${encodeURIComponent(entry.ticker)}:${entry.weight}`).join(','));
+  }
   return parts.length ? `?${parts.join('&')}` : '';
 }
 
@@ -140,7 +194,12 @@ export function createInitialState(search) {
     filters: view.filters,
     currency: view.currency,
     mode: view.mode,
+    view: view.view,
+    range: view.range,
+    // weights: null means "follow the compared assets, equally weighted".
+    portfolio: view.portfolio,
     account: { ...DEFAULT_ACCOUNT },
+    compute: Object.fromEntries(COMPUTE_JOBS.map((job) => [job, emptyJob()])),
     live: {
       prices: {}, // ticker -> { price, ts, source }
       fx: null, // { rate, asOf, source, live }
@@ -150,6 +209,16 @@ export function createInitialState(search) {
     sandbox: { open: false, ticker: null },
     notice: null, // { id, text }
   };
+}
+
+function emptyJob() {
+  return { key: null, status: 'idle', result: null, error: null, ms: null, mode: null };
+}
+
+/** The portfolio in force: explicit weights, or the compared assets weighted equally. */
+function effectiveWeights(state) {
+  if (Array.isArray(state.portfolio.weights)) return state.portfolio.weights;
+  return equalWeights(state.selected);
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -194,6 +263,18 @@ export const actions = Object.freeze({
   setCurrency: (currency) => ({ type: 'SET_CURRENCY', currency }),
   setMode: (mode) => ({ type: 'SET_MODE', mode }),
   setAccount: (key, value) => ({ type: 'SET_ACCOUNT', key, value }),
+  setView: (view) => ({ type: 'SET_VIEW', view }),
+  setRange: (range) => ({ type: 'SET_RANGE', range }),
+  setPortfolioWeight: (ticker, weight) => ({ type: 'SET_PORTFOLIO_WEIGHT', ticker, weight }),
+  setPortfolioWeights: (weights) => ({ type: 'SET_PORTFOLIO_WEIGHTS', weights }),
+  addPortfolioAsset: (ticker) => ({ type: 'ADD_PORTFOLIO_ASSET', ticker }),
+  removePortfolioAsset: (ticker) => ({ type: 'REMOVE_PORTFOLIO_ASSET', ticker }),
+  equalisePortfolio: () => ({ type: 'EQUALISE_PORTFOLIO' }),
+  normalisePortfolio: () => ({ type: 'NORMALISE_PORTFOLIO' }),
+  resetPortfolio: () => ({ type: 'RESET_PORTFOLIO' }),
+  computeStarted: (job, key) => ({ type: 'COMPUTE_STARTED', job, key }),
+  computeFinished: (job, key, result, ms = null, mode = null) => ({ type: 'COMPUTE_FINISHED', job, key, result, ms, mode }),
+  computeFailed: (job, key, message) => ({ type: 'COMPUTE_FAILED', job, key, message }),
   livePrice: (ticker, price, ts, source) => ({ type: 'LIVE_PRICE', ticker, price, ts, source }),
   liveFx: (fx) => ({ type: 'LIVE_FX', fx }),
   feedStatus: (feed, status) => ({ type: 'FEED_STATUS', feed, status }),
@@ -219,6 +300,11 @@ export function reduce(state, action) {
       const selected = state.selected.filter((ticker) => known.has(ticker));
       const dropped = state.selected.filter((ticker) => !known.has(ticker));
       const sectorKnown = state.filters.sector === 'all' || action.snapshot.sectors.includes(state.filters.sector);
+      let portfolio = state.portfolio;
+      if (Array.isArray(portfolio.weights)) {
+        const kept = portfolio.weights.filter((entry) => known.has(entry.ticker));
+        if (kept.length !== portfolio.weights.length) portfolio = { weights: kept.length ? kept : null };
+      }
       return {
         ...state,
         status: 'ready',
@@ -226,6 +312,7 @@ export function reduce(state, action) {
         snapshot: action.snapshot,
         warnings: Array.isArray(action.warnings) ? action.warnings : [],
         selected,
+        portfolio,
         filters: sectorKnown ? state.filters : { ...state.filters, sector: 'all' },
         notice: dropped.length ? notice(`Not in the watchlist, so removed from the comparison: ${dropped.join(', ')}`) : state.notice,
       };
@@ -289,6 +376,95 @@ export function reduce(state, action) {
       const account = sanitiseAccount({ ...state.account, [action.key]: action.value }, state.mode);
       if (account[action.key] === state.account[action.key]) return state;
       return { ...state, account };
+    }
+
+    case 'SET_VIEW': {
+      const view = matchOption(VIEWS, String(action.view));
+      return !view || view === state.view ? state : { ...state, view };
+    }
+    case 'SET_RANGE': {
+      const range = matchOption(RANGES, String(action.range));
+      return !range || range === state.range ? state : { ...state, range };
+    }
+
+    case 'SET_PORTFOLIO_WEIGHT': {
+      const weight = cleanWeight(action.weight);
+      const current = effectiveWeights(state);
+      const index = current.findIndex((entry) => entry.ticker === action.ticker);
+      if (weight === null || index < 0 || (Array.isArray(state.portfolio.weights) && current[index].weight === weight)) return state;
+      const weights = current.map((entry, position) => (position === index ? { ticker: entry.ticker, weight } : entry));
+      return { ...state, portfolio: { weights } };
+    }
+    case 'SET_PORTFOLIO_WEIGHTS': {
+      // Replace the whole allocation at once (used when applying a suggested mix).
+      const weights = [];
+      for (const entry of Array.isArray(action.weights) ? action.weights : []) {
+        const ticker = String((entry && entry.ticker) || '').toUpperCase();
+        const weight = cleanWeight(entry ? entry.weight : null);
+        if (!TICKER_PATTERN.test(ticker) || weight === null || weights.some((item) => item.ticker === ticker)) continue;
+        if (state.snapshot && !state.snapshot.byTicker[ticker]) continue;
+        weights.push({ ticker, weight });
+        if (weights.length === MAX_PORTFOLIO_ASSETS) break;
+      }
+      return weights.length ? { ...state, portfolio: { weights } } : state;
+    }
+    case 'ADD_PORTFOLIO_ASSET': {
+      const ticker = String(action.ticker || '').toUpperCase();
+      const current = effectiveWeights(state);
+      if (!TICKER_PATTERN.test(ticker) || current.some((entry) => entry.ticker === ticker)) return state;
+      if (state.snapshot && !state.snapshot.byTicker[ticker]) return state;
+      if (current.length >= MAX_PORTFOLIO_ASSETS) {
+        return { ...state, notice: notice(`A portfolio can hold up to ${MAX_PORTFOLIO_ASSETS} assets. Remove one first.`) };
+      }
+      // A new asset starts at 0% so that adding it never silently changes the existing allocation.
+      return { ...state, portfolio: { weights: [...current, { ticker, weight: 0 }] } };
+    }
+    case 'REMOVE_PORTFOLIO_ASSET': {
+      const current = effectiveWeights(state);
+      if (!current.some((entry) => entry.ticker === action.ticker)) return state;
+      return { ...state, portfolio: { weights: current.filter((entry) => entry.ticker !== action.ticker) } };
+    }
+    case 'EQUALISE_PORTFOLIO': {
+      const current = effectiveWeights(state);
+      if (current.length === 0) return state;
+      return { ...state, portfolio: { weights: equalWeights(current.map((entry) => entry.ticker)) } };
+    }
+    case 'NORMALISE_PORTFOLIO': {
+      const current = effectiveWeights(state);
+      const total = current.reduce((sum, entry) => sum + entry.weight, 0);
+      if (!(total > 0) || Math.abs(total - 100) < 0.005) return state;
+      const scaled = current.map((entry) => ({ ticker: entry.ticker, weight: Math.round((entry.weight / total) * 10000) / 100 }));
+      // Put the rounding remainder on the largest holding so the total is exactly 100.
+      const drift = Math.round((100 - scaled.reduce((sum, entry) => sum + entry.weight, 0)) * 100) / 100;
+      const largest = scaled.reduce((best, entry, index) => (entry.weight > scaled[best].weight ? index : best), 0);
+      scaled[largest] = { ticker: scaled[largest].ticker, weight: Math.round((scaled[largest].weight + drift) * 100) / 100 };
+      return { ...state, portfolio: { weights: scaled } };
+    }
+    case 'RESET_PORTFOLIO':
+      return state.portfolio.weights === null ? state : { ...state, portfolio: { weights: null } };
+
+    case 'COMPUTE_STARTED': {
+      const job = state.compute[action.job];
+      if (!job || typeof action.key !== 'string' || (job.key === action.key && job.status === 'running')) return state;
+      // The previous result is kept on purpose: the UI shows it dimmed while the new one is computed.
+      return { ...state, compute: { ...state.compute, [action.job]: { ...job, key: action.key, status: 'running', error: null } } };
+    }
+    case 'COMPUTE_FINISHED': {
+      const job = state.compute[action.job];
+      // Latest wins: a reply for inputs that are no longer current is discarded.
+      if (!job || job.key !== action.key || job.status !== 'running') return state;
+      return {
+        ...state,
+        compute: { ...state.compute, [action.job]: { key: action.key, status: 'done', result: action.result, error: null, ms: action.ms ?? null, mode: action.mode ?? null } },
+      };
+    }
+    case 'COMPUTE_FAILED': {
+      const job = state.compute[action.job];
+      if (!job || job.key !== action.key || job.status !== 'running') return state;
+      return {
+        ...state,
+        compute: { ...state.compute, [action.job]: { ...job, status: 'error', result: null, error: String(action.message || 'The calculation failed.') } },
+      };
     }
 
     case 'LIVE_PRICE': {
@@ -371,7 +547,8 @@ export function createStore(initialState = createInitialState(), { syncUrl = tru
     if (next === previous) return state;
     state = next;
     const viewChanged = next.selected !== previous.selected || next.filters !== previous.filters
-      || next.currency !== previous.currency || next.mode !== previous.mode;
+      || next.currency !== previous.currency || next.mode !== previous.mode
+      || next.view !== previous.view || next.range !== previous.range || next.portfolio !== previous.portfolio;
     if (syncUrl && viewChanged) writeUrlState(next);
     for (const listener of [...listeners]) {
       try {
@@ -422,6 +599,22 @@ export function selectPrice(state, ticker) {
   const tick = state.live.prices[ticker];
   if (tick) return { price: tick.price, source: tick.source, ts: tick.ts, live: true, currency: asset.currency };
   return { price: asset.quote.lastClose, source: 'snapshot', ts: asset.quote.asOf, live: false, currency: asset.currency };
+}
+
+/** The portfolio weights in force, as percentages: explicit, or the compared assets weighted equally. */
+export function selectPortfolioWeights(state) {
+  return effectiveWeights(state);
+}
+
+/** True when the user has set weights by hand (and so they are in the URL). */
+export function hasCustomPortfolio(state) {
+  return Array.isArray(state.portfolio.weights);
+}
+
+/** The risk-free rate for the display currency, or null before the snapshot loads. */
+export function selectRiskFree(state) {
+  if (!state.snapshot || !state.snapshot.macro) return null;
+  return state.snapshot.macro.riskFree[state.currency] ?? null;
 }
 
 export function selectSelectedAssets(state) {

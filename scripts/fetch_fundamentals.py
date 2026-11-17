@@ -1,31 +1,44 @@
 #!/usr/bin/env python3
-"""QuantLens market-data pipeline.
+"""QuantLens market-data pipeline (snapshot schema v2).
 
-Reads ``scripts/watchlist.json``, pulls one year of daily candles plus
-fundamentals for every asset from Yahoo Finance (via the free ``yfinance``
-package, no API key), and writes ``data/market_snapshot.json``.
+Reads ``scripts/watchlist.json`` and writes ``data/market_snapshot.json`` with,
+for every asset:
+
+* one year of daily candles and fundamentals (Yahoo Finance via ``yfinance``),
+* the three most recent *unique* news stories with a sentiment score
+  (Yahoo Finance RSS, de-duplicated with ``difflib``, scored with VADER),
+* a 30-calendar-day price projection with an 80% band and a backtest of how
+  the same model did over the previous 30 days (Prophet on ``log(close)``,
+  weekly seasonality only, fitted by optimisation),
+
+plus two macro inputs: the US and Singapore 10-year government yields, used as
+risk-free rates, and one year of daily USD/SGD closes.
 
 Design rules
 ------------
-* Every network call is retried with exponential backoff and jitter.
-* Every number is sanitised: ``NaN``, ``Infinity`` and non-numeric values
-  become ``null``. The JSON encoder runs with ``allow_nan=False`` as a backstop.
-* The snapshot is validated against the schema before it is written. If
-  validation fails nothing is written and the exit code is 1, so the site keeps
-  serving the previous file.
-* If one asset cannot be fetched, its entry from the previous snapshot is kept
-  and marked ``"status": "stale"``. If more than half of the watchlist is not
-  fresh, the run aborts without writing.
+* **Polite.** A randomised pause separates tickers, every request has a timeout,
+  every ticker has a hard deadline, the whole run has a time budget, and
+  repeated rate-limit responses open a circuit breaker instead of hammering.
+* **Never NaN.** Every number is sanitised; the JSON encoder runs with
+  ``allow_nan=False`` as a backstop.
+* **Fail small.** News, forecast and macro data each fail on their own and can
+  never cost an asset its prices. A ticker that cannot be fetched keeps its
+  previous entry, marked ``stale``.
+* **Fail safe.** The snapshot is validated before it is written. If validation
+  fails, or more than half of the watchlist is not fresh, nothing is written and
+  the exit code is 1, so the site keeps serving the previous file.
 
 Units
 -----
 * ``marketCap`` and ``enterpriseValue`` are in the trading ``currency``.
-* Statement items (revenue, EBIT, debt, equity ...) are in ``financialCurrency``.
-* Ratios and yields are decimals (0.171 means 17.1 %).
-* Candles are split- and dividend-adjusted and contain completed sessions only.
+* Statement items are in ``financialCurrency``.
+* Ratios and yields are decimals (0.0514 means 5.14 %).
+* Candles are split- and dividend-adjusted, completed sessions only.
+* Timestamps are ISO-8601 UTC (``2026-11-17T22:31:04Z``).
 
 Usage
 -----
+    pip install -r scripts/requirements.txt
     python scripts/fetch_fundamentals.py
     python scripts/fetch_fundamentals.py --validate-only
 """
@@ -33,14 +46,27 @@ Usage
 from __future__ import annotations
 
 import argparse
+import difflib
+import email.utils
+import html
+import http.cookiejar
+import importlib.util
 import json
 import logging
 import math
+import multiprocessing
 import os
 import random
 import re
 import sys
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
+import xml.etree.ElementTree as ElementTree
+import zlib
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -48,12 +74,18 @@ from typing import Any, Callable
 import pandas as pd
 import yfinance as yf
 
+try:  # Sentiment is optional at import time so the script still runs without it.
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+except ImportError:  # pragma: no cover - exercised only when the package is missing
+    SentimentIntensityAnalyzer = None
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WATCHLIST = REPO_ROOT / "scripts" / "watchlist.json"
 DEFAULT_OUTPUT = REPO_ROOT / "data" / "market_snapshot.json"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CANDLE_FIELDS = ["date", "open", "high", "low", "close", "volume"]
+FORECAST_FIELDS = ["date", "yhat", "lower", "upper"]
 MIN_CANDLES = 200
 
 FUNDAMENTAL_KEYS = [
@@ -68,11 +100,20 @@ ASSET_KEYS = [
     "ticker", "name", "assetClass", "market", "currency", "financialCurrency",
     "sector", "industry", "scoringProfile", "lotSize", "binanceSymbol",
     "status", "statusNote", "fundamentalsPeriod", "quote", "fundamentals", "candles",
+    "news", "forecast",
 ]
+NEWS_KEYS = ["status", "fetchedAt", "headlineCount", "clusterCount", "newestAt", "sentiment", "clusters", "note"]
+CLUSTER_KEYS = ["title", "link", "publishedAt", "firstSeenAt", "duplicates", "scores", "label"]
+FORECAST_KEYS = ["status", "model", "modelVersion", "config", "trainedOn", "horizon", "backtest", "points", "note"]
+RISK_FREE_KEYS = ["name", "symbol", "yield", "asOf", "source", "status"]
+
 ASSET_CLASSES = {"equity", "crypto"}
 MARKETS = {"US", "SG", "CRYPTO"}
 PROFILES = {"CORPORATE", "FINANCIAL", "REIT", "CRYPTO"}
 STATUSES = {"fresh", "stale"}
+SECTION_STATUSES = {"fresh", "stale", "unavailable"}
+RISK_FREE_STATUSES = {"fresh", "stale", "proxy", "unavailable"}
+SENTIMENT_LABELS = {"positive", "neutral", "negative"}
 
 # Local session close per market. A candle dated "today" is only kept once the
 # session has closed (plus a buffer for Yahoo's delayed quotes).
@@ -96,6 +137,41 @@ BALANCE_ROWS = {
     "totalAssets": ["Total Assets"],
 }
 
+# --- News and sentiment --------------------------------------------------------
+NEWS_FEED_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
+NEWS_MAX_HEADLINES = 15          # most recent headlines considered per ticker
+NEWS_SCORED_CLUSTERS = 3         # unique stories that are scored and stored
+NEWS_SIMILARITY = 0.85           # difflib ratio at or above which two titles are the same story
+NEWS_WINDOW = timedelta(hours=24)  # ...provided they are less than this far apart
+NEWS_STALE_AFTER = timedelta(days=7)
+NEWS_MAX_BYTES = 2_000_000
+NEWS_TITLE_LIMIT = 300
+SENTIMENT_THRESHOLD = 0.05       # VADER's conventional cut-off for positive / negative
+
+# --- Forecast --------------------------------------------------------------------
+FORECAST_HORIZON_DAYS = 30           # calendar days projected, for every asset class
+FORECAST_HOLDOUT_DAYS = 30           # calendar days hidden from the model for its backtest
+FORECAST_INTERVAL = 0.8              # width of the projected band
+FORECAST_UNCERTAINTY_SAMPLES = 300   # simulated trend paths behind the band (default is 1000)
+# Share of the history in which the trend may change slope. This is Prophet's default.
+# A holdout comparison of 0.8, 0.9 and 0.95 over three separate 30-day windows and twelve
+# assets found no setting that wins consistently, and 0.8 marginally best on average, so
+# there is no evidence for a custom value.
+FORECAST_CHANGEPOINT_RANGE = 0.8
+FORECAST_MIN_TRAIN = 120             # candles the backtest model must have left to learn from
+FORECAST_MIN_HOLDOUT = 5
+
+# --- Macro -----------------------------------------------------------------------
+US_10Y_SYMBOL = "^TNX"
+MAS_YIELD_URL = "https://eservices.mas.gov.sg/statistics/fdanet/BenchmarkPricesAndYields.aspx"
+MAS_FIELD_PREFIX = "ctl00$ContentPlaceHolder1$"
+MAS_STALE_LIMIT_DAYS = 10        # an older MAS value is replaced by the US proxy
+YIELD_BOUNDS = (-0.02, 0.25)
+MONTHS = {name: number for number, name in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
+
+USER_AGENT = "Mozilla/5.0 (compatible; quantlens-data-pipeline)"
+
 TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-=^]{0,14}$")
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -106,6 +182,10 @@ IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 class FetchError(RuntimeError):
     """Raised when a data source keeps failing after all retries."""
+
+    def __init__(self, message: str, rate_limited: bool = False) -> None:
+        super().__init__(message)
+        self.rate_limited = rate_limited
 
 
 # --------------------------------------------------------------------------- #
@@ -125,7 +205,7 @@ def fail(message: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Number sanitisation
+# Number and time sanitisation
 # --------------------------------------------------------------------------- #
 
 def clean_number(value: Any, digits: int | None = None) -> float | int | None:
@@ -164,33 +244,101 @@ def first_not_none(*values: Any) -> Any:
     return None
 
 
+def iso_timestamp(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 # --------------------------------------------------------------------------- #
-# Retry
+# Retry, deadlines and rate limits
 # --------------------------------------------------------------------------- #
 
-def with_retry(label: str, fn: Callable[[], Any], attempts: int, base_delay: float) -> Any:
-    """Run ``fn`` with exponential backoff (x3 per attempt) and jitter."""
+def is_rate_limit(error: BaseException) -> bool:
+    """True when an exception looks like "you are sending too many requests"."""
+    if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+        return True
+    text = f"{type(error).__name__} {error}".lower()
+    return "ratelimit" in text or "too many requests" in text or "rate limit" in text or " 429" in text
+
+
+def with_retry(label: str, fn: Callable[[], Any], attempts: int, base_delay: float,
+               deadline: float | None = None) -> Any:
+    """Run ``fn`` with exponential backoff (x3 per attempt) and jitter.
+
+    ``deadline`` is a ``time.monotonic()`` value. A retry that could not finish
+    before it is not started, so a slow source cannot eat a whole ticker budget.
+    """
     last_error: Exception | None = None
+    rate_limited = False
     for attempt in range(1, attempts + 1):
         try:
             return fn()
         except Exception as exc:  # noqa: BLE001 - yfinance raises many types
             last_error = exc
+            rate_limited = rate_limited or is_rate_limit(exc)
             if attempt == attempts:
                 break
             delay = base_delay * (3 ** (attempt - 1)) + random.uniform(0, base_delay)
+            if rate_limited:
+                delay *= 2
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                break
             LOG.warning("%s failed (attempt %d/%d): %s. Retrying in %.1fs",
                         label, attempt, attempts, exc, delay)
             time.sleep(delay)
-    raise FetchError(f"{label} failed after {attempts} attempts: {last_error}") from last_error
+    raise FetchError(f"{label} failed: {last_error}", rate_limited=rate_limited) from last_error
+
+
+def run_with_deadline(label: str, fn: Callable[[], Any], seconds: float) -> Any:
+    """Run ``fn`` in a worker thread and give up after ``seconds``.
+
+    Python cannot kill a thread, so an overrunning call is abandoned rather than
+    stopped: it is a daemon thread and every network call inside it has its own
+    timeout, so it ends on its own shortly afterwards.
+    """
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=target, name=f"fetch-{label}", daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise FetchError(f"{label} exceeded its {seconds:.0f}s deadline")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
+def http_get(url: str, timeout: float, max_bytes: int = NEWS_MAX_BYTES, opener: Any = None) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    open_url = opener.open if opener is not None else urllib.request.urlopen
+    with open_url(request, timeout=timeout) as response:
+        data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"response is larger than {max_bytes} bytes")
+    return data
 
 
 # --------------------------------------------------------------------------- #
 # Candles
 # --------------------------------------------------------------------------- #
 
-def fetch_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    frame = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True, actions=True)
+def fetch_history(symbol: str, period: str, interval: str, timeout: float = 10) -> pd.DataFrame:
+    frame = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True,
+                                      actions=True, timeout=timeout)
     if frame is None or frame.empty:
         raise ValueError(f"empty price history for {symbol}")
     missing = [c for c in ("Open", "High", "Low", "Close", "Volume") if c not in frame.columns]
@@ -387,7 +535,8 @@ def balance_item(quarterly: pd.DataFrame | None, annual: pd.DataFrame | None, ro
     return None
 
 
-def fetch_statements(ticker: yf.Ticker, attempts: int, base_delay: float, symbol: str) -> dict[str, pd.DataFrame]:
+def fetch_statements(ticker: yf.Ticker, symbol: str, settings: argparse.Namespace,
+                     deadline: float | None) -> dict[str, pd.DataFrame]:
     names = {
         "q_income": "quarterly_income_stmt", "a_income": "income_stmt",
         "q_balance": "quarterly_balance_sheet", "a_balance": "balance_sheet",
@@ -398,7 +547,7 @@ def fetch_statements(ticker: yf.Ticker, attempts: int, base_delay: float, symbol
         # An empty frame is a legitimate answer (e.g. no interim statements); only
         # exceptions are retried.
         statements[key] = with_retry(f"{symbol} {attribute}", lambda a=attribute: getattr(ticker, a),
-                                     attempts, base_delay)
+                                     settings.max_retries, settings.retry_delay, deadline)
     return statements
 
 
@@ -460,15 +609,20 @@ def resolve_profile(entry: dict[str, Any], sector: str | None) -> str:
 
 
 def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings: argparse.Namespace,
-                history_cfg: dict[str, str], now_utc: datetime) -> dict[str, Any]:
-    """Fetch one asset. Raises ``FetchError`` when price history is unavailable."""
+                history_cfg: dict[str, str], now_utc: datetime, deadline: float | None = None) -> dict[str, Any]:
+    """Fetch prices and fundamentals for one asset.
+
+    Raises ``FetchError`` when price history is unavailable. News and forecast
+    are attached afterwards by the caller, so they can never cost an asset its prices.
+    """
     symbol = entry["ticker"]
     is_crypto = entry["assetClass"] == "crypto"
     ticker = yf.Ticker(symbol)
 
-    history = with_retry(f"{symbol} price history",
-                         lambda: fetch_history(symbol, history_cfg["period"], history_cfg["interval"]),
-                         settings.max_retries, settings.retry_delay)
+    history = with_retry(
+        f"{symbol} price history",
+        lambda: fetch_history(symbol, history_cfg["period"], history_cfg["interval"], settings.request_timeout),
+        settings.max_retries, settings.retry_delay, deadline)
     candles = build_candles(history, entry["market"], now_utc)
     if len(candles) < MIN_CANDLES:
         raise FetchError(f"{symbol} has only {len(candles)} completed candles (minimum {MIN_CANDLES})")
@@ -478,12 +632,12 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
     status, status_note = "fresh", None
     try:
         info = with_retry(f"{symbol} profile", lambda: fetch_info(ticker, symbol),
-                          settings.max_retries, settings.retry_delay)
+                          settings.max_retries, settings.retry_delay, deadline)
         if is_crypto:
             fundamentals, period = empty_fundamentals(), None
             fundamentals["marketCap"] = clean_number(info.get("marketCap"))
         else:
-            statements = fetch_statements(ticker, settings.max_retries, settings.retry_delay, symbol)
+            statements = fetch_statements(ticker, symbol, settings, deadline)
             fundamentals, period = build_fundamentals(info, statements, dividend_yield)
         currency = info.get("currency") or entry["currency"]
         if currency != entry["currency"]:
@@ -525,7 +679,29 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
         "quote": {"lastClose": last_close, "previousClose": candles[-2][4], "asOf": candles[-1][0]},
         "fundamentals": fundamentals,
         "candles": candles,
+        "news": empty_news("News has not been fetched for this asset yet."),
+        "forecast": empty_forecast("The forecast model has not been run for this snapshot."),
     }
+
+
+def aged_section(section: dict[str, Any], note: str) -> dict[str, Any]:
+    """A copy of a news or forecast block, marked stale if it was fresh."""
+    copy = json.loads(json.dumps(section))
+    if copy.get("status") == "fresh":
+        copy["status"] = "stale"
+        copy["note"] = note
+    return copy
+
+
+def upgrade_asset(asset: dict[str, Any]) -> dict[str, Any]:
+    """Bring an asset from an older snapshot schema up to the current shape."""
+    upgraded = dict(asset)
+    upgraded.setdefault("statusNote", None)
+    if not isinstance(upgraded.get("news"), dict):
+        upgraded["news"] = empty_news("No news was stored in the previous snapshot.")
+    if not isinstance(upgraded.get("forecast"), dict):
+        upgraded["forecast"] = empty_forecast("No forecast was stored in the previous snapshot.")
+    return upgraded
 
 
 def carry_over(previous: dict[str, Any], entry: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -535,24 +711,577 @@ def carry_over(previous: dict[str, Any], entry: dict[str, Any], reason: str) -> 
     asset["binanceSymbol"] = entry.get("binanceSymbol")
     asset["status"] = "stale"
     asset["statusNote"] = f"Carried over from an earlier snapshot (last candle {previous['quote']['asOf']}): {reason}"
+    asset["news"] = aged_section(previous["news"], "Carried over from an earlier snapshot.")
+    asset["forecast"] = aged_section(previous["forecast"], "Carried over from an earlier snapshot.")
     return asset
 
 
-def fetch_fx(config: dict[str, str], previous: dict[str, Any] | None, settings: argparse.Namespace) -> dict[str, Any]:
-    symbol = config["yahooSymbol"]
+# --------------------------------------------------------------------------- #
+# News: RSS, semantic de-duplication, sentiment
+# --------------------------------------------------------------------------- #
+
+def empty_news(note: str | None) -> dict[str, Any]:
+    return {"status": "unavailable", "fetchedAt": None, "headlineCount": 0, "clusterCount": 0,
+            "newestAt": None, "sentiment": None, "clusters": [], "note": note}
+
+
+def parse_rss(data: bytes) -> list[dict[str, Any]]:
+    """Parse an RSS 2.0 document into ``[{title, link, published}]``.
+
+    Documents that declare a DOCTYPE or entities are rejected outright: a news
+    feed has no need for them, and they are the vector for XML entity attacks.
+    """
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        raise ValueError("feed declares a DOCTYPE or entity, which is not accepted")
+    root = ElementTree.fromstring(data)
+    headlines: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in root.iter("item"):
+        title = re.sub(r"\s+", " ", html.unescape(item.findtext("title") or "")).strip()
+        link = (item.findtext("link") or "").strip()
+        try:
+            published = email.utils.parsedate_to_datetime(item.findtext("pubDate") or "")
+        except (TypeError, ValueError):
+            continue
+        if not title or published is None:
+            continue
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        key = (title, link)
+        if key in seen:
+            continue
+        seen.add(key)
+        headlines.append({
+            "title": title[:NEWS_TITLE_LIMIT],
+            "link": link if link.startswith("https://") and len(link) <= 2000 else None,
+            "published": published.astimezone(timezone.utc),
+        })
+    return headlines
+
+
+def normalise_title(title: str) -> str:
+    """Lower-case, strip punctuation and collapse whitespace before comparing titles."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", title.lower())).strip()
+
+
+def cluster_headlines(headlines: list[dict[str, Any]], threshold: float = NEWS_SIMILARITY,
+                      window: timedelta = NEWS_WINDOW) -> list[dict[str, Any]]:
+    """Group syndicated copies of the same story.
+
+    Headlines are processed oldest first. One joins an existing cluster when its
+    normalised title is at least ``threshold`` similar (``difflib`` ratio) to the
+    cluster's *first* title AND it was published strictly less than ``window``
+    after the cluster's most recent member. The window therefore rolls: a story
+    that keeps being re-reported stays one cluster, while the same headline
+    resurfacing days later starts a new one, because that is an escalation.
+    """
+    clusters: list[dict[str, Any]] = []
+    for headline in sorted(headlines, key=lambda h: h["published"]):
+        key = normalise_title(headline["title"])
+        best: tuple[float, dict[str, Any]] | None = None
+        for cluster in clusters:
+            if headline["published"] - cluster["latest"] >= window:
+                continue
+            ratio = difflib.SequenceMatcher(None, key, cluster["key"], autojunk=False).ratio()
+            if ratio >= threshold and (best is None or ratio > best[0]):
+                best = (ratio, cluster)
+        if best is not None:
+            best[1]["members"].append(headline)
+            best[1]["latest"] = headline["published"]
+        else:
+            clusters.append({"key": key, "first": headline, "latest": headline["published"], "members": [headline]})
+    return clusters
+
+
+def sentiment_label(compound: float) -> str:
+    if compound >= SENTIMENT_THRESHOLD:
+        return "positive"
+    if compound <= -SENTIMENT_THRESHOLD:
+        return "negative"
+    return "neutral"
+
+
+def score_title(analyzer: Any, title: str) -> dict[str, float] | None:
+    if analyzer is None:
+        return None
+    scores = analyzer.polarity_scores(title)
+    cleaned = {key: clean_number(scores.get(short), digits=4)
+               for key, short in (("compound", "compound"), ("pos", "pos"), ("neu", "neu"), ("neg", "neg"))}
+    return None if any(value is None for value in cleaned.values()) else cleaned
+
+
+def build_news(headlines: list[dict[str, Any]], analyzer: Any, now_utc: datetime) -> dict[str, Any]:
+    """Turn raw headlines into the snapshot's ``news`` block."""
+    recent = sorted(headlines, key=lambda h: h["published"], reverse=True)[:NEWS_MAX_HEADLINES]
+    if not recent:
+        news = empty_news("The news feed returned no headlines for this asset.")
+        news["fetchedAt"] = iso_timestamp(now_utc)
+        return news
+
+    clusters = sorted(cluster_headlines(recent), key=lambda c: c["latest"], reverse=True)
+    stored = []
+    for cluster in clusters[:NEWS_SCORED_CLUSTERS]:
+        scores = score_title(analyzer, cluster["first"]["title"])
+        stored.append({
+            "title": cluster["first"]["title"],
+            "link": cluster["first"]["link"],
+            "publishedAt": iso_timestamp(cluster["latest"]),
+            "firstSeenAt": iso_timestamp(cluster["first"]["published"]),
+            "duplicates": len(cluster["members"]) - 1,
+            "scores": scores,
+            "label": sentiment_label(scores["compound"]) if scores else None,
+        })
+
+    scored = [c["scores"]["compound"] for c in stored if c["scores"]]
+    sentiment = None
+    if scored:
+        compound = clean_number(sum(scored) / len(scored), digits=4)
+        sentiment = {"compound": compound, "label": sentiment_label(compound), "basis": len(scored)}
+
+    newest = recent[0]["published"]
+    stale = now_utc - newest > NEWS_STALE_AFTER
+    note = None
+    if stale:
+        note = f"The most recent headline is more than {NEWS_STALE_AFTER.days} days old."
+    elif analyzer is None:
+        note = "Headlines only: the sentiment package is not installed."
+    return {
+        "status": "stale" if stale else "fresh",
+        "fetchedAt": iso_timestamp(now_utc),
+        "headlineCount": len(recent),
+        "clusterCount": len(clusters),
+        "newestAt": iso_timestamp(newest),
+        "sentiment": sentiment,
+        "clusters": stored,
+        "note": note,
+    }
+
+
+def fetch_news(symbol: str, previous: dict[str, Any] | None, settings: argparse.Namespace,
+               analyzer: Any, now_utc: datetime) -> dict[str, Any]:
+    """Fetch and score news for one ticker. Never raises."""
+    url = NEWS_FEED_URL.format(symbol=urllib.parse.quote(symbol, safe=""))
+    deadline = time.monotonic() + settings.news_timeout
     try:
-        history = with_retry(f"{symbol} FX rate", lambda: fetch_history(symbol, "5d", "1d"),
-                             settings.max_retries, settings.retry_delay)
+        data = with_retry(f"{symbol} news feed", lambda: http_get(url, settings.request_timeout),
+                          2, settings.retry_delay, deadline)
+        return build_news(parse_rss(data), analyzer, now_utc)
+    except Exception as exc:  # noqa: BLE001 - news must never break a ticker
+        warn(f"{symbol}: news unavailable ({str(exc)[:160]})")
+        if previous and previous.get("status") in {"fresh", "stale"}:
+            return aged_section(previous, "The news feed could not be reached; these headlines are from an earlier run.")
+        return empty_news("The news feed could not be reached.")
+
+
+# --------------------------------------------------------------------------- #
+# Forecast: a deliberately small Prophet model, with its own track record
+# --------------------------------------------------------------------------- #
+
+def empty_forecast(note: str | None) -> dict[str, Any]:
+    return {"status": "unavailable", "model": None, "modelVersion": None, "config": None,
+            "trainedOn": None, "horizon": None, "backtest": None, "points": [], "note": note}
+
+
+def future_dates(last_date: str, horizon_days: int, weekdays_only: bool) -> list[str]:
+    """The calendar days after ``last_date`` that the asset can trade on.
+
+    Crypto trades every day. Stocks get Monday to Friday; exchange holidays are
+    not removed, so a stock forecast can include a day the market is shut.
+    """
+    start = datetime.strptime(last_date, "%Y-%m-%d").date()
+    days = (start + timedelta(days=offset) for offset in range(1, horizon_days + 1))
+    return [day.isoformat() for day in days if not weekdays_only or day.weekday() < 5]
+
+
+def stable_seed(text: str) -> int:
+    """A seed that is the same on every machine and every run for the same text."""
+    return zlib.crc32(text.encode("utf-8")) & 0x7FFFFFFF
+
+
+def project_prices(dates: list[str], closes: list[float], target_dates: list[str],
+                   seed: int) -> tuple[list[list[Any]], float]:
+    """Fit Prophet to ``log(close)`` and project ``target_dates``.
+
+    Model: piecewise-linear trend plus weekly seasonality, fitted by optimisation
+    (no MCMC). Yearly seasonality is off because one year of history cannot
+    identify it. Working in logs keeps every projected price positive.
+
+    Anchoring: Prophet's fitted trend can sit well away from the latest price
+    after a sharp move. The projection therefore uses the model's projected
+    *change* from the last history date and applies it to the actual last close,
+    so the path always starts where the price really is. The gap that anchoring
+    closed is returned as the second value.
+
+    Returns ``([[date, estimate, lower, upper], ...], level_gap)``.
+    """
+    import numpy as np  # imported here so only forecast workers pay for these imports
+    from prophet import Prophet
+
+    frame = pd.DataFrame({"ds": pd.to_datetime(dates), "y": np.log(np.asarray(closes, dtype=float))})
+    model = Prophet(
+        growth="linear",
+        weekly_seasonality=True,
+        yearly_seasonality=False,
+        daily_seasonality=False,
+        mcmc_samples=0,
+        interval_width=FORECAST_INTERVAL,
+        uncertainty_samples=FORECAST_UNCERTAINTY_SAMPLES,
+        changepoint_range=FORECAST_CHANGEPOINT_RANGE,
+    )
+    model.fit(frame)
+    asked = pd.DataFrame({"ds": pd.to_datetime([dates[-1], *target_dates])})
+    np.random.seed(seed)  # the uncertainty band is simulated; seeding makes it reproducible
+    predicted = model.predict(asked)
+
+    fitted_last = float(predicted["yhat"].iloc[0])
+    shift = math.log(closes[-1]) - fitted_last
+    rows: list[list[Any]] = []
+    for date, estimate, lower, upper in zip(target_dates, predicted["yhat"].iloc[1:],
+                                            predicted["yhat_lower"].iloc[1:], predicted["yhat_upper"].iloc[1:]):
+        values = [clean_number(math.exp(float(v) + shift)) for v in (estimate, lower, upper)]
+        if any(v is None or v <= 0 for v in values):
+            raise ValueError(f"the model produced a non-finite or non-positive price for {date}")
+        mid, low, high = (round_price(float(v)) for v in values)
+        rows.append([date, mid, min(low, mid), max(high, mid)])
+    return rows, math.exp(fitted_last - math.log(closes[-1])) - 1
+
+
+def backtest_metrics(actual: list[float], rows: list[list[Any]], anchor: float) -> dict[str, Any]:
+    """How a past projection compared with what then happened.
+
+    mape             mean absolute percentage error of the projection
+    naiveMape        the same error for "the price stays where it is": the bar any
+                     forecast has to beat to be worth looking at
+    endError         signed error on the final held-out day
+    directionCorrect did the projection get the direction of the move right
+    coverage         share of actual prices that fell inside the projected band
+    """
+    count = len(actual)
+    estimates = [row[1] for row in rows]
+    mape = sum(abs(e - a) / a for e, a in zip(estimates, actual)) / count
+    naive = sum(abs(anchor - a) / a for a in actual) / count
+    inside = sum(1 for row, a in zip(rows, actual) if row[2] <= a <= row[3])
+    actual_move = actual[-1] - anchor
+    direction = None if actual_move == 0 else (estimates[-1] - anchor > 0) == (actual_move > 0)
+    return {
+        "holdoutDays": FORECAST_HOLDOUT_DAYS,
+        "holdoutPoints": count,
+        "mape": clean_number(mape, digits=6),
+        "naiveMape": clean_number(naive, digits=6),
+        "endError": clean_number((estimates[-1] - actual[-1]) / actual[-1], digits=6),
+        "directionCorrect": direction,
+        "coverage": clean_number(inside / count, digits=4),
+        "note": None,
+    }
+
+
+def forecast_series(ticker: str, asset_class: str, dates: list[str], closes: list[float]) -> dict[str, Any]:
+    """Build the snapshot's ``forecast`` block for one asset (two model fits)."""
+    import prophet
+
+    weekdays_only = asset_class != "crypto"
+    seed = stable_seed(ticker)
+    targets = future_dates(dates[-1], FORECAST_HORIZON_DAYS, weekdays_only)
+    points, level_gap = project_prices(dates, closes, targets, seed)
+
+    # Track record: hide the last 30 calendar days, project them with the same
+    # procedure, and compare with what actually happened.
+    cutoff = (datetime.strptime(dates[-1], "%Y-%m-%d").date() - timedelta(days=FORECAST_HOLDOUT_DAYS)).isoformat()
+    split = sum(1 for date in dates if date <= cutoff)
+    if split >= FORECAST_MIN_TRAIN and len(dates) - split >= FORECAST_MIN_HOLDOUT:
+        held_rows, _ = project_prices(dates[:split], closes[:split], dates[split:], seed)
+        backtest = backtest_metrics(closes[split:], held_rows, closes[split - 1])
+    else:
+        backtest = {"holdoutDays": FORECAST_HOLDOUT_DAYS, "holdoutPoints": 0, "mape": None, "naiveMape": None,
+                    "endError": None, "directionCorrect": None, "coverage": None,
+                    "note": "Not enough history to hold out a test period."}
+
+    return {
+        "status": "fresh",
+        "model": "prophet",
+        "modelVersion": prophet.__version__,
+        "config": {
+            "target": "log(close)",
+            "growth": "linear",
+            "weeklySeasonality": True,
+            "yearlySeasonality": False,
+            "dailySeasonality": False,
+            "mcmcSamples": 0,
+            "intervalWidth": FORECAST_INTERVAL,
+            "uncertaintySamples": FORECAST_UNCERTAINTY_SAMPLES,
+            "changepointRange": FORECAST_CHANGEPOINT_RANGE,
+            "anchor": "last close",
+            "levelGap": clean_number(level_gap, digits=6),
+            "seed": seed,
+        },
+        "trainedOn": {"from": dates[0], "to": dates[-1], "observations": len(dates)},
+        "horizon": {"calendarDays": FORECAST_HORIZON_DAYS, "points": len(points), "weekdaysOnly": weekdays_only},
+        "backtest": backtest,
+        "points": points,
+        "note": None,
+    }
+
+
+def forecast_worker_init() -> None:
+    """Runs once in each forecast process: keep Stan's progress chatter out of the log."""
+    try:
+        # cmdstanpy sets its logger to INFO when it is first imported, so import it before
+        # lowering the level. This also warms the worker before its first job.
+        import prophet  # noqa: F401
+    except ImportError:
+        pass
+    logging.getLogger("prophet").setLevel(logging.ERROR)
+    # Lowering cmdstanpy's level is not enough: it logs "Chain [1] start/done processing" at INFO
+    # through its own handler on every fit. Real failures still surface as exceptions.
+    stan_logger = logging.getLogger("cmdstanpy")
+    stan_logger.setLevel(logging.ERROR)
+    stan_logger.disabled = True
+    # Prophet triggers pandas deprecation notices from inside its own code on every fit.
+    warnings.filterwarnings("ignore", module=r"prophet(\..*)?")
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+
+def forecast_job(job: tuple[str, str, list[str], list[float]]) -> dict[str, Any]:
+    """Process-pool entry point. Must stay a top-level function so it can be pickled."""
+    ticker, asset_class, dates, closes = job
+    return forecast_series(ticker, asset_class, dates, closes)
+
+
+def fallback_forecast(previous: dict[str, Any] | None, reason: str) -> dict[str, Any]:
+    if previous and previous.get("status") in {"fresh", "stale"} and previous.get("points"):
+        return aged_section(previous, f"{reason} This projection is from an earlier run.")
+    return empty_forecast(reason)
+
+
+def run_forecasts(assets: list[dict[str, Any]], previous_assets: dict[str, dict[str, Any]],
+                  settings: argparse.Namespace) -> dict[str, dict[str, Any]]:
+    """Forecast every freshly fetched asset. Never raises.
+
+    The fits run in separate processes for two reasons: they use both of the
+    runner's cores, and a process, unlike a thread, can be stopped. When the
+    stage budget runs out the pool is terminated and every unfinished asset
+    falls back to its previous projection or to "unavailable".
+    """
+    previous = {ticker: old.get("forecast") for ticker, old in previous_assets.items()}
+    if not assets:
+        return {}
+    if settings.skip_forecast:
+        return {a["ticker"]: fallback_forecast(previous.get(a["ticker"]), "Forecasting was skipped in this run.")
+                for a in assets}
+    if importlib.util.find_spec("prophet") is None:
+        warn("prophet is not installed: forecasts are unavailable")
+        return {a["ticker"]: fallback_forecast(previous.get(a["ticker"]), "The forecasting package is not installed.")
+                for a in assets}
+
+    started = time.monotonic()
+    deadline = started + settings.forecast_budget
+    results: dict[str, dict[str, Any]] = {}
+    context = multiprocessing.get_context("spawn")  # never fork a process that has live threads
+    pool = context.Pool(processes=max(1, settings.forecast_workers), initializer=forecast_worker_init)
+    try:
+        handles = {}
+        for asset in assets:
+            job = (asset["ticker"], asset["assetClass"], [c[0] for c in asset["candles"]], [c[4] for c in asset["candles"]])
+            handles[asset["ticker"]] = pool.apply_async(forecast_job, (job,))
+        for ticker, handle in handles.items():
+            wait = min(settings.forecast_timeout, deadline - time.monotonic())
+            try:
+                if wait <= 0:
+                    raise multiprocessing.TimeoutError()
+                block = handle.get(timeout=wait)
+                problems = validate_forecast(block)
+                if problems:
+                    raise ValueError("; ".join(problems))
+                results[ticker] = block
+            except multiprocessing.TimeoutError:
+                warn(f"{ticker}: forecast did not finish in time")
+                results[ticker] = fallback_forecast(previous.get(ticker), "The forecast model ran out of time.")
+            except Exception as exc:  # noqa: BLE001 - a failed fit must never cost an asset its prices
+                warn(f"{ticker}: forecast failed ({str(exc)[:160]})")
+                results[ticker] = fallback_forecast(previous.get(ticker), "The forecast model could not be fitted.")
+    finally:
+        pool.terminate()
+        pool.join()
+    done = sum(1 for block in results.values() if block["status"] == "fresh")
+    LOG.info("forecasts: %d of %d fitted in %.0fs", done, len(assets), time.monotonic() - started)
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Macro: risk-free rates and FX
+# --------------------------------------------------------------------------- #
+
+def risk_free_entry(name: str, symbol: str | None, value: float | None, as_of: str | None,
+                    source: str | None, status: str) -> dict[str, Any]:
+    return {"name": name, "symbol": symbol, "yield": value, "asOf": as_of, "source": source, "status": status}
+
+
+def plausible_yield(value: Any) -> bool:
+    return is_finite_number(value) and YIELD_BOUNDS[0] <= value <= YIELD_BOUNDS[1]
+
+
+def fetch_us_10y(settings: argparse.Namespace) -> dict[str, Any]:
+    """US 10-year Treasury yield from Yahoo's ^TNX index (quoted in percent)."""
+    deadline = time.monotonic() + settings.macro_timeout
+    history = with_retry(f"{US_10Y_SYMBOL} yield",
+                         lambda: fetch_history(US_10Y_SYMBOL, "5d", "1d", settings.request_timeout),
+                         settings.max_retries, settings.retry_delay, deadline)
+    closes = history["Close"].dropna()
+    value = clean_number(closes.iloc[-1] / 100, digits=6) if len(closes) else None
+    if not plausible_yield(value):
+        raise FetchError(f"{US_10Y_SYMBOL} returned an implausible yield: {value}")
+    return risk_free_entry("US 10-year Treasury yield", US_10Y_SYMBOL, value,
+                           closes.index[-1].strftime("%Y-%m-%d"), "yahoo", "fresh")
+
+
+def parse_mas_table(page: str) -> tuple[float, str]:
+    """Latest 10-year yield from the MAS result table.
+
+    Rows look like ``[year, month, day, yield]`` where the year and month cells
+    are blank when they repeat the row above.
+    """
+    table = re.search(r"<table.*?</table>", page, flags=re.S)
+    if not table:
+        raise ValueError("MAS response contains no result table")
+    year = month = None
+    latest: tuple[float, str] | None = None
+    for row in re.findall(r"<tr.*?</tr>", table.group(0), flags=re.S):
+        cells = [re.sub(r"<[^>]+>|\s+", " ", html.unescape(c)).strip()
+                 for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, flags=re.S)]
+        if len(cells) != 4:
+            continue
+        if cells[0].isdigit():
+            year = int(cells[0])
+        if cells[1] in MONTHS:
+            month = MONTHS[cells[1]]
+        if year is None or month is None or not cells[2].isdigit():
+            continue
+        value = clean_number(cells[3])
+        if value is None:
+            continue
+        try:
+            day = datetime(year, month, int(cells[2]))
+        except ValueError:
+            continue
+        latest = (value / 100, day.strftime("%Y-%m-%d"))
+    if latest is None:
+        raise ValueError("MAS result table contains no yields")
+    return latest
+
+
+def fetch_sg_10y(settings: argparse.Namespace, now_utc: datetime) -> dict[str, Any]:
+    """Singapore 10-year SGS benchmark yield from the MAS statistics form.
+
+    MAS has no key-less API, so this submits the public form the way a browser
+    does: load the page for its ASP.NET state fields, then post it back with the
+    10-year yield ticked and a daily frequency over the last six weeks.
+    """
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+    def attempt() -> tuple[float, str]:
+        page = http_get(MAS_YIELD_URL, settings.request_timeout, opener=opener).decode("utf-8", "replace")
+        hidden = {name: html.unescape(value) for name, value in
+                  re.findall(r'<input type="hidden" name="(__[A-Z]+)" id="[^"]*" value="([^"]*)"', page)}
+        if "__VIEWSTATE" not in hidden or "__EVENTVALIDATION" not in hidden:
+            raise ValueError("MAS form state fields were not found")
+        end = now_utc + timedelta(hours=8)  # Singapore time
+        start = end - timedelta(days=42)
+        form = {
+            **hidden,
+            "__EVENTTARGET": "", "__EVENTARGUMENT": "", "__LASTFOCUS": "",
+            MAS_FIELD_PREFIX + "StartYearDropDownList": str(start.year),
+            MAS_FIELD_PREFIX + "StartMonthDropDownList": str(start.month),
+            MAS_FIELD_PREFIX + "EndYearDropDownList": str(end.year),
+            MAS_FIELD_PREFIX + "EndMonthDropDownList": str(end.month),
+            MAS_FIELD_PREFIX + "FrequencyDropDownList": "D",
+            MAS_FIELD_PREFIX + "TenYearBondYieldCheckBox": "on",
+            MAS_FIELD_PREFIX + "DisplayButton": "Display",
+        }
+        request = urllib.request.Request(
+            MAS_YIELD_URL, data=urllib.parse.urlencode(form).encode("utf-8"),
+            headers={"User-Agent": USER_AGENT, "Content-Type": "application/x-www-form-urlencoded",
+                     "Referer": MAS_YIELD_URL})
+        with opener.open(request, timeout=settings.request_timeout) as response:
+            body = response.read(NEWS_MAX_BYTES + 1)
+        if len(body) > NEWS_MAX_BYTES:
+            raise ValueError("MAS response is unexpectedly large")
+        return parse_mas_table(body.decode("utf-8", "replace"))
+
+    deadline = time.monotonic() + settings.macro_timeout
+    value, as_of = with_retry("MAS 10-year yield", attempt, 2, settings.retry_delay, deadline)
+    value = clean_number(value, digits=6)
+    if not plausible_yield(value):
+        raise FetchError(f"MAS returned an implausible yield: {value}")
+    return risk_free_entry("Singapore 10-year SGS benchmark yield", None, value, as_of, "mas", "fresh")
+
+
+def build_macro(previous: dict[str, Any] | None, settings: argparse.Namespace, now_utc: datetime) -> dict[str, Any]:
+    """Risk-free rates. Never raises: each rate degrades through its own chain.
+
+    USD: Yahoo ^TNX  ->  previous value (stale)  ->  unavailable
+    SGD: MAS form    ->  recent previous MAS value (stale)  ->  US yield as a labelled proxy  ->  unavailable
+    """
+    old = {}
+    if previous and isinstance(previous.get("macro"), dict) and isinstance(previous["macro"].get("riskFree"), dict):
+        old = previous["macro"]["riskFree"]
+
+    def previous_entry(key: str) -> dict[str, Any] | None:
+        entry = old.get(key)
+        if isinstance(entry, dict) and plausible_yield(entry.get("yield")) and is_iso_date(entry.get("asOf")):
+            return entry
+        return None
+
+    try:
+        usd = fetch_us_10y(settings)
+    except Exception as exc:  # noqa: BLE001
+        warn(f"US 10-year yield unavailable ({str(exc)[:160]})")
+        kept = previous_entry("USD")
+        usd = ({**{k: kept.get(k) for k in RISK_FREE_KEYS}, "status": "stale"} if kept
+               else risk_free_entry("US 10-year Treasury yield", US_10Y_SYMBOL, None, None, None, "unavailable"))
+
+    try:
+        sgd = fetch_sg_10y(settings, now_utc)
+    except Exception as exc:  # noqa: BLE001
+        warn(f"Singapore 10-year yield unavailable from MAS ({str(exc)[:160]})")
+        kept = previous_entry("SGD")
+        recent = False
+        if kept and kept.get("source") == "mas":
+            age = now_utc.date() - datetime.strptime(kept["asOf"], "%Y-%m-%d").date()
+            recent = age.days <= MAS_STALE_LIMIT_DAYS
+        if recent:
+            sgd = {**{k: kept.get(k) for k in RISK_FREE_KEYS}, "status": "stale"}
+        elif usd["yield"] is not None:
+            sgd = risk_free_entry("US 10-year Treasury yield (proxy for Singapore)", usd["symbol"],
+                                  usd["yield"], usd["asOf"], usd["source"], "proxy")
+        else:
+            sgd = risk_free_entry("Singapore 10-year SGS benchmark yield", None, None, None, None, "unavailable")
+    return {"riskFree": {"USD": usd, "SGD": sgd}}
+
+
+def fetch_fx(config: dict[str, str], previous: dict[str, Any] | None, settings: argparse.Namespace) -> dict[str, Any]:
+    """Latest USD/SGD rate plus one year of daily closes (for multi-currency portfolio maths)."""
+    symbol = config["yahooSymbol"]
+    deadline = time.monotonic() + settings.macro_timeout
+    try:
+        history = with_retry(f"{symbol} FX rate", lambda: fetch_history(symbol, "1y", "1d", settings.request_timeout),
+                             settings.max_retries, settings.retry_delay, deadline)
         closes = history["Close"].dropna()
-        rate = clean_number(closes.iloc[-1], digits=5) if len(closes) else None
-        if rate is None or not 0.5 <= rate <= 3:
-            raise FetchError(f"{symbol} returned an implausible rate: {rate}")
-        return {"base": config["base"], "quote": config["quote"], "rate": rate,
-                "asOf": closes.index[-1].strftime("%Y-%m-%d")}
+        series_by_date: dict[str, float] = {}
+        for stamp, value in closes.items():
+            rate = clean_number(value, digits=5)
+            if rate is not None and 0.5 <= rate <= 3:
+                series_by_date[stamp.strftime("%Y-%m-%d")] = rate
+        series = [[date, series_by_date[date]] for date in sorted(series_by_date)]
+        if not series:
+            raise FetchError(f"{symbol} returned no plausible rates")
+        return {"base": config["base"], "quote": config["quote"], "rate": series[-1][1],
+                "asOf": series[-1][0], "series": series}
     except FetchError as exc:
-        if previous and isinstance(previous.get("fx"), dict):
+        old = previous.get("fx") if previous else None
+        if isinstance(old, dict) and is_finite_number(old.get("rate")):
             warn(f"FX rate unavailable ({exc}); keeping the previous rate")
-            return previous["fx"]
+            return {"base": old.get("base"), "quote": old.get("quote"), "rate": old["rate"],
+                    "asOf": old.get("asOf"), "series": old.get("series") if isinstance(old.get("series"), list) else []}
         raise
 
 
@@ -572,6 +1301,113 @@ def is_iso_date(value: Any) -> bool:
     except ValueError:
         return False
     return True
+
+
+def validate_news(news: Any) -> list[str]:
+    if not isinstance(news, dict) or sorted(news) != sorted(NEWS_KEYS):
+        return ["news must contain exactly the documented keys"]
+    errors: list[str] = []
+    if news["status"] not in SECTION_STATUSES:
+        errors.append(f"news.status must be one of {sorted(SECTION_STATUSES)}")
+    for key in ("fetchedAt", "newestAt"):
+        if news[key] is not None and parse_timestamp(news[key]) is None:
+            errors.append(f"news.{key} must be an ISO-8601 UTC timestamp or null")
+    for key in ("headlineCount", "clusterCount"):
+        if not isinstance(news[key], int) or isinstance(news[key], bool) or news[key] < 0:
+            errors.append(f"news.{key} must be a non-negative integer")
+    if news["note"] is not None and not isinstance(news["note"], str):
+        errors.append("news.note must be a string or null")
+
+    clusters = news["clusters"]
+    if not isinstance(clusters, list) or len(clusters) > NEWS_SCORED_CLUSTERS:
+        return errors + [f"news.clusters must be a list of at most {NEWS_SCORED_CLUSTERS} stories"]
+    if news["status"] == "unavailable" and clusters:
+        errors.append("an unavailable news block must not carry stories")
+    for index, cluster in enumerate(clusters):
+        where = f"news.clusters[{index}]"
+        if not isinstance(cluster, dict) or sorted(cluster) != sorted(CLUSTER_KEYS):
+            errors.append(f"{where} must contain exactly the documented keys")
+            continue
+        if not isinstance(cluster["title"], str) or not cluster["title"].strip() or len(cluster["title"]) > NEWS_TITLE_LIMIT:
+            errors.append(f"{where}.title must be a non-empty string of at most {NEWS_TITLE_LIMIT} characters")
+        if cluster["link"] is not None and not (isinstance(cluster["link"], str) and cluster["link"].startswith("https://")):
+            errors.append(f"{where}.link must be an https URL or null")
+        first = parse_timestamp(cluster["firstSeenAt"])
+        last = parse_timestamp(cluster["publishedAt"])
+        if first is None or last is None or first > last:
+            errors.append(f"{where} needs firstSeenAt <= publishedAt as ISO-8601 UTC timestamps")
+        if not isinstance(cluster["duplicates"], int) or isinstance(cluster["duplicates"], bool) or cluster["duplicates"] < 0:
+            errors.append(f"{where}.duplicates must be a non-negative integer")
+        scores = cluster["scores"]
+        if scores is None:
+            if cluster["label"] is not None:
+                errors.append(f"{where}.label must be null when there are no scores")
+        elif (not isinstance(scores, dict) or sorted(scores) != ["compound", "neg", "neu", "pos"]
+              or not all(is_finite_number(v) for v in scores.values())
+              or not -1 <= scores["compound"] <= 1
+              or not all(0 <= scores[k] <= 1 for k in ("pos", "neu", "neg"))):
+            errors.append(f"{where}.scores must hold compound in [-1, 1] and pos, neu, neg in [0, 1]")
+        elif cluster["label"] not in SENTIMENT_LABELS:
+            errors.append(f"{where}.label must be one of {sorted(SENTIMENT_LABELS)}")
+
+    sentiment = news["sentiment"]
+    if sentiment is not None:
+        if (not isinstance(sentiment, dict) or sorted(sentiment) != ["basis", "compound", "label"]
+                or not is_finite_number(sentiment["compound"]) or not -1 <= sentiment["compound"] <= 1
+                or sentiment["label"] not in SENTIMENT_LABELS
+                or not isinstance(sentiment["basis"], int) or not 1 <= sentiment["basis"] <= NEWS_SCORED_CLUSTERS):
+            errors.append("news.sentiment must hold compound in [-1, 1], a label and a basis of 1 to 3")
+    return errors
+
+
+def validate_forecast(forecast: Any) -> list[str]:
+    if not isinstance(forecast, dict) or sorted(forecast) != sorted(FORECAST_KEYS):
+        return ["forecast must contain exactly the documented keys"]
+    errors: list[str] = []
+    if forecast["status"] not in SECTION_STATUSES:
+        errors.append(f"forecast.status must be one of {sorted(SECTION_STATUSES)}")
+    if forecast["note"] is not None and not isinstance(forecast["note"], str):
+        errors.append("forecast.note must be a string or null")
+    points = forecast["points"]
+    if not isinstance(points, list):
+        return errors + ["forecast.points must be a list"]
+    if forecast["status"] == "unavailable":
+        if points:
+            errors.append("an unavailable forecast must not carry points")
+        return errors
+    if not points:
+        errors.append("an available forecast needs at least one point")
+    for key in ("model", "modelVersion"):
+        if not isinstance(forecast[key], str) or not forecast[key]:
+            errors.append(f"forecast.{key} must be a non-empty string")
+    for key in ("config", "trainedOn", "horizon", "backtest"):
+        if not isinstance(forecast[key], dict):
+            errors.append(f"forecast.{key} must be an object")
+    if len(points) > FORECAST_HORIZON_DAYS:
+        errors.append(f"forecast.points must not exceed the {FORECAST_HORIZON_DAYS}-day horizon")
+    backtest = forecast["backtest"]
+    if isinstance(backtest, dict):
+        for key in ("mape", "naiveMape", "coverage"):
+            value = backtest.get(key)
+            if value is not None and (not is_finite_number(value) or value < 0):
+                errors.append(f"forecast.backtest.{key} must be a non-negative number or null")
+        end_error = backtest.get("endError")
+        if end_error is not None and not is_finite_number(end_error):
+            errors.append("forecast.backtest.endError must be a finite number or null")
+    previous_date = ""
+    for index, row in enumerate(points):
+        if not isinstance(row, list) or len(row) != len(FORECAST_FIELDS):
+            errors.append(f"forecast.points[{index}] must have {len(FORECAST_FIELDS)} fields")
+            break
+        date, yhat, lower, upper = row
+        if not is_iso_date(date) or date <= previous_date:
+            errors.append(f"forecast.points must be strictly ascending by date (at index {index})")
+            break
+        previous_date = date
+        if not all(is_finite_number(v) and v > 0 for v in (yhat, lower, upper)) or not lower <= yhat <= upper:
+            errors.append(f"forecast point {date} needs 0 < lower <= yhat <= upper")
+            break
+    return errors
 
 
 def validate_asset(asset: Any) -> list[str]:
@@ -624,6 +1460,9 @@ def validate_asset(asset: Any) -> list[str]:
             if value is not None and not is_finite_number(value):
                 err(f"fundamentals.{key} must be a finite number or null (got {value!r})")
 
+    for message in validate_news(asset["news"]) + validate_forecast(asset["forecast"]):
+        err(message)
+
     candles = asset["candles"]
     if not isinstance(candles, list) or len(candles) < MIN_CANDLES:
         count = len(candles) if isinstance(candles, list) else 0
@@ -665,12 +1504,36 @@ def validate_asset(asset: Any) -> list[str]:
     return errors
 
 
+def validate_macro(macro: Any) -> list[str]:
+    if not isinstance(macro, dict) or not isinstance(macro.get("riskFree"), dict):
+        return ["macro.riskFree must be an object"]
+    errors: list[str] = []
+    rates = macro["riskFree"]
+    if sorted(rates) != ["SGD", "USD"]:
+        return ["macro.riskFree must contain exactly USD and SGD"]
+    for currency, entry in rates.items():
+        where = f"macro.riskFree.{currency}"
+        if not isinstance(entry, dict) or sorted(entry) != sorted(RISK_FREE_KEYS):
+            errors.append(f"{where} must contain exactly the documented keys")
+            continue
+        if entry["status"] not in RISK_FREE_STATUSES:
+            errors.append(f"{where}.status must be one of {sorted(RISK_FREE_STATUSES)}")
+        if not isinstance(entry["name"], str) or not entry["name"]:
+            errors.append(f"{where}.name must be a non-empty string")
+        if entry["status"] == "unavailable":
+            if entry["yield"] is not None:
+                errors.append(f"{where}.yield must be null when the rate is unavailable")
+        elif not plausible_yield(entry["yield"]) or not is_iso_date(entry["asOf"]):
+            errors.append(f"{where} needs a plausible yield and an asOf date")
+    return errors
+
+
 def validate_snapshot(snapshot: Any) -> list[str]:
     """Return a list of schema violations. An empty list means valid."""
     if not isinstance(snapshot, dict):
         return ["snapshot is not a JSON object"]
     errors: list[str] = []
-    for key in ("schemaVersion", "generatedAt", "fx", "candleFields", "assets"):
+    for key in ("schemaVersion", "generatedAt", "fx", "macro", "candleFields", "forecastFields", "assets"):
         if key not in snapshot:
             errors.append(f"missing top-level key '{key}'")
     if errors:
@@ -678,16 +1541,16 @@ def validate_snapshot(snapshot: Any) -> list[str]:
 
     if snapshot["schemaVersion"] != SCHEMA_VERSION:
         errors.append(f"schemaVersion must be {SCHEMA_VERSION}")
-    try:
-        datetime.strptime(snapshot["generatedAt"], "%Y-%m-%dT%H:%M:%SZ")
-    except (TypeError, ValueError):
+    if parse_timestamp(snapshot["generatedAt"]) is None:
         errors.append("generatedAt must be ISO-8601 UTC, e.g. 2026-01-31T22:30:00Z")
     if snapshot["candleFields"] != CANDLE_FIELDS:
         errors.append(f"candleFields must be {CANDLE_FIELDS}")
+    if snapshot["forecastFields"] != FORECAST_FIELDS:
+        errors.append(f"forecastFields must be {FORECAST_FIELDS}")
 
     fx = snapshot["fx"]
-    if not isinstance(fx, dict) or sorted(fx) != ["asOf", "base", "quote", "rate"]:
-        errors.append("fx must contain base, quote, rate and asOf")
+    if not isinstance(fx, dict) or sorted(fx) != ["asOf", "base", "quote", "rate", "series"]:
+        errors.append("fx must contain base, quote, rate, asOf and series")
     else:
         if fx["base"] != "USD" or fx["quote"] != "SGD":
             errors.append("fx must be the USD/SGD pair")
@@ -695,6 +1558,19 @@ def validate_snapshot(snapshot: Any) -> list[str]:
             errors.append(f"fx.rate is implausible: {fx['rate']!r}")
         if not is_iso_date(fx["asOf"]):
             errors.append("fx.asOf must be an ISO date")
+        if not isinstance(fx["series"], list):
+            errors.append("fx.series must be a list")
+        else:
+            previous_date = ""
+            for row in fx["series"]:
+                ok = (isinstance(row, list) and len(row) == 2 and is_iso_date(row[0]) and row[0] > previous_date
+                      and is_finite_number(row[1]) and 0.5 <= row[1] <= 3)
+                if not ok:
+                    errors.append("fx.series rows must be [date, rate], ascending, with plausible rates")
+                    break
+                previous_date = row[0]
+
+    errors.extend(validate_macro(snapshot["macro"]))
 
     assets = snapshot["assets"]
     if not isinstance(assets, list) or not assets:
@@ -753,15 +1629,23 @@ def validate_watchlist(watchlist: Any) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 def render_snapshot(snapshot: dict[str, Any]) -> str:
-    """Serialise with readable metadata and one candle per line (clean git diffs)."""
+    """Serialise with readable metadata and one data row per line (clean git diffs)."""
     clone = json.loads(json.dumps(snapshot, allow_nan=False))
     replacements: dict[str, str] = {}
+
+    def compact(rows: list[Any], indent: int, name: str) -> Any:
+        if not rows:
+            return rows
+        token = f"@@ROWS_{name}@@"
+        pad = " " * indent
+        body = ",\n".join(pad + "  " + json.dumps(row, separators=(",", ":"), allow_nan=False) for row in rows)
+        replacements[json.dumps(token)] = "[\n" + body + "\n" + pad + "]"
+        return token
+
+    clone["fx"]["series"] = compact(clone["fx"]["series"], 4, "fx")
     for index, asset in enumerate(clone["assets"]):
-        token = f"@@CANDLES_{index}@@"
-        rows = ",\n".join("        " + json.dumps(row, separators=(",", ":"), allow_nan=False)
-                          for row in asset["candles"])
-        replacements[json.dumps(token)] = "[\n" + rows + "\n      ]"
-        asset["candles"] = token
+        asset["candles"] = compact(asset["candles"], 6, f"candles_{index}")
+        asset["forecast"]["points"] = compact(asset["forecast"]["points"], 8, f"forecast_{index}")
     text = json.dumps(clone, indent=2, ensure_ascii=False, allow_nan=False)
     for token, block in replacements.items():
         text = text.replace(token, block)
@@ -770,7 +1654,8 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
 
 def write_snapshot(snapshot: dict[str, Any], path: Path) -> None:
     text = render_snapshot(snapshot)
-    json.loads(text)  # the rendered text must round-trip
+    if json.loads(text) != json.loads(json.dumps(snapshot, allow_nan=False)):
+        raise RuntimeError("rendered snapshot does not round-trip")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(text, encoding="utf-8", newline="\n")
@@ -793,22 +1678,33 @@ def load_previous(path: Path) -> dict[str, Any] | None:
     return previous if isinstance(previous, dict) else None
 
 
-def write_step_summary(snapshot: dict[str, Any]) -> None:
+def write_step_summary(snapshot: dict[str, Any], elapsed: float) -> None:
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if not target:
         return
+    rates = snapshot["macro"]["riskFree"]
+
+    def rate(entry: dict[str, Any]) -> str:
+        if entry["yield"] is None:
+            return "unavailable"
+        return f"{entry['yield'] * 100:.2f}% ({entry['status']}, {entry['asOf']})"
+
     lines = [
         "### Market snapshot",
         "",
-        f"Generated {snapshot['generatedAt']} · USD/SGD {snapshot['fx']['rate']} ({snapshot['fx']['asOf']})",
+        f"Generated {snapshot['generatedAt']} in {elapsed:.0f}s · USD/SGD {snapshot['fx']['rate']} ({snapshot['fx']['asOf']})",
+        f"Risk-free: USD {rate(rates['USD'])} · SGD {rate(rates['SGD'])}",
         "",
-        "| Ticker | Status | Candles | Last candle | Last close | Period |",
-        "|---|---|---|---|---|---|",
+        "| Ticker | Status | Candles | Last candle | Last close | Period | News | Tone | Forecast |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for asset in snapshot["assets"]:
+        news = asset["news"]
+        tone = news["sentiment"]["label"] if news["sentiment"] else "-"
         lines.append(
             f"| {asset['ticker']} | {asset['status']} | {len(asset['candles'])} | {asset['quote']['asOf']} "
-            f"| {asset['quote']['lastClose']} {asset['currency']} | {asset['fundamentalsPeriod'] or '-'} |"
+            f"| {asset['quote']['lastClose']} {asset['currency']} | {asset['fundamentalsPeriod'] or '-'} "
+            f"| {news['status']} ({news['clusterCount']} stories) | {tone} | {asset['forecast']['status']} |"
         )
     with open(target, "a", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
@@ -819,14 +1715,25 @@ def write_step_summary(snapshot: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Refresh data/market_snapshot.json from Yahoo Finance.")
+    parser = argparse.ArgumentParser(description="Refresh data/market_snapshot.json from free public sources.")
     parser.add_argument("--watchlist", type=Path, default=DEFAULT_WATCHLIST)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--max-retries", type=int, default=4, help="attempts per network call")
-    parser.add_argument("--retry-delay", type=float, default=4.0, help="base backoff in seconds")
-    parser.add_argument("--pause", type=float, default=1.5, help="pause between tickers in seconds")
-    parser.add_argument("--validate-only", action="store_true",
-                        help="validate the existing snapshot and exit")
+    parser.add_argument("--max-retries", type=int, default=3, help="attempts per network call")
+    parser.add_argument("--retry-delay", type=float, default=2.0, help="base backoff in seconds")
+    parser.add_argument("--pause-min", type=float, default=0.5, help="shortest pause between tickers, seconds")
+    parser.add_argument("--pause-max", type=float, default=1.0, help="longest pause between tickers, seconds")
+    parser.add_argument("--request-timeout", type=float, default=10.0, help="timeout of one network request")
+    parser.add_argument("--ticker-timeout", type=float, default=45.0, help="hard deadline for one ticker's prices and fundamentals")
+    parser.add_argument("--news-timeout", type=float, default=15.0, help="deadline for one ticker's news")
+    parser.add_argument("--macro-timeout", type=float, default=30.0, help="deadline for each macro series")
+    parser.add_argument("--time-budget", type=float, default=720.0, help="seconds after which remaining tickers are carried over")
+    parser.add_argument("--rate-limit-trips", type=int, default=3, help="consecutive rate-limited tickers that stop the run")
+    parser.add_argument("--skip-news", action="store_true", help="do not fetch news (headlines are carried over)")
+    parser.add_argument("--skip-forecast", action="store_true", help="do not fit forecasts (projections are carried over)")
+    parser.add_argument("--forecast-workers", type=int, default=2, help="processes used for model fitting")
+    parser.add_argument("--forecast-timeout", type=float, default=60.0, help="longest wait for one asset's forecast, seconds")
+    parser.add_argument("--forecast-budget", type=float, default=300.0, help="seconds after which unfinished forecasts are abandoned")
+    parser.add_argument("--validate-only", action="store_true", help="validate the existing snapshot and exit")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -843,8 +1750,11 @@ def run_validation(path: Path) -> int:
             fail(message)
         return 1
     stale = [a["ticker"] for a in snapshot["assets"] if a["status"] != "fresh"]
-    LOG.info("%s is valid: %d assets, %d stale%s", path.name, len(snapshot["assets"]), len(stale),
-             f" ({', '.join(stale)})" if stale else "")
+    with_news = sum(1 for a in snapshot["assets"] if a["news"]["status"] != "unavailable")
+    with_forecast = sum(1 for a in snapshot["assets"] if a["forecast"]["status"] != "unavailable")
+    LOG.info("%s is valid (schema v%d): %d assets, %d stale%s, %d with news, %d with a forecast",
+             path.name, snapshot["schemaVersion"], len(snapshot["assets"]), len(stale),
+             f" ({', '.join(stale)})" if stale else "", with_news, with_forecast)
     return 0
 
 
@@ -869,58 +1779,120 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     previous = load_previous(settings.output)
-    previous_assets = {}
+    previous_assets: dict[str, dict[str, Any]] = {}
     if previous and isinstance(previous.get("assets"), list):
-        previous_assets = {a.get("ticker"): a for a in previous["assets"]
-                           if isinstance(a, dict) and not validate_asset(a)}
+        for old in previous["assets"]:
+            if not isinstance(old, dict):
+                continue
+            upgraded = upgrade_asset(old)
+            if not validate_asset(upgraded):
+                previous_assets[upgraded["ticker"]] = upgraded
 
+    analyzer = SentimentIntensityAnalyzer() if SentimentIntensityAnalyzer is not None else None
+    if analyzer is None and not settings.skip_news:
+        warn("vaderSentiment is not installed: headlines will be stored without sentiment scores")
+
+    started = time.monotonic()
     now_utc = datetime.now(timezone.utc)
-    LOG.info("yfinance %s · %d assets · %s", yf.__version__, len(watchlist["assets"]),
-             now_utc.strftime("%Y-%m-%d %H:%M UTC"))
+    total = len(watchlist["assets"])
+    LOG.info("yfinance %s · %d assets · %s", yf.__version__, total, now_utc.strftime("%Y-%m-%d %H:%M UTC"))
 
     try:
         fx = fetch_fx(watchlist["fx"], previous, settings)
     except FetchError as exc:
         fail(f"no USD/SGD rate available and no previous snapshot to fall back on: {exc}")
         return 1
-    LOG.info("USD/SGD %s (%s)", fx["rate"], fx["asOf"])
+    LOG.info("USD/SGD %s (%s), %d daily closes", fx["rate"], fx["asOf"], len(fx["series"]))
+
+    macro = build_macro(previous, settings, now_utc)
+    for currency, entry in macro["riskFree"].items():
+        shown = "unavailable" if entry["yield"] is None else f"{entry['yield'] * 100:.2f}%"
+        LOG.info("risk-free %s: %s [%s] %s", currency, shown, entry["status"], entry["name"])
 
     assets: list[dict[str, Any]] = []
+    refreshed: list[dict[str, Any]] = []
     not_fresh: list[str] = []
+    rate_limit_streak = 0
+    halted_reason: str | None = None
     for position, entry in enumerate(watchlist["assets"]):
         symbol = entry["ticker"]
-        LOG.info("[%d/%d] %s", position + 1, len(watchlist["assets"]), symbol)
         previous_asset = previous_assets.get(symbol)
-        try:
-            asset = fetch_asset(entry, previous_asset, settings, watchlist["history"], now_utc)
-            problems = validate_asset(asset)
-            if problems:
-                raise FetchError("; ".join(problems))
-        except FetchError as exc:
+        ticker_started = time.monotonic()
+
+        if halted_reason is None and ticker_started - started > settings.time_budget:
+            halted_reason = f"the run exceeded its {settings.time_budget:.0f}s time budget"
+            warn(f"{halted_reason}; remaining tickers are carried over")
+        if halted_reason is None and rate_limit_streak >= settings.rate_limit_trips:
+            halted_reason = f"the data source rate-limited {rate_limit_streak} tickers in a row"
+            warn(f"{halted_reason}; remaining tickers are carried over")
+
+        asset = None
+        if halted_reason is None:
+            try:
+                deadline = ticker_started + settings.ticker_timeout
+                asset = run_with_deadline(
+                    symbol,
+                    lambda e=entry, p=previous_asset, d=deadline: fetch_asset(e, p, settings, watchlist["history"], now_utc, d),
+                    settings.ticker_timeout)
+                problems = validate_asset(asset)
+                if problems:
+                    raise FetchError("; ".join(problems))
+                rate_limit_streak = 0
+            except Exception as exc:  # noqa: BLE001 - one bad ticker must never abort the run
+                asset = None
+                failure = str(exc)[:200] or type(exc).__name__
+                limited = getattr(exc, "rate_limited", False) or is_rate_limit(exc)
+                rate_limit_streak = rate_limit_streak + 1 if limited else 0
+                if limited:
+                    cooldown = min(60.0, 15.0 * rate_limit_streak)
+                    LOG.warning("%s was rate-limited; cooling down for %.0fs", symbol, cooldown)
+                    time.sleep(cooldown)
+        else:
+            failure = halted_reason
+
+        if asset is None:
             not_fresh.append(symbol)
             if previous_asset is None:
-                fail(f"{symbol}: fetch failed and there is no previous entry to keep: {exc}")
+                fail(f"{symbol}: no fresh data and no previous entry to keep ({failure})")
                 continue
-            warn(f"{symbol}: fetch failed, keeping the previous entry: {exc}")
-            asset = carry_over(previous_asset, entry, str(exc)[:160])
+            warn(f"{symbol}: keeping the previous entry ({failure})")
+            asset = carry_over(previous_asset, entry, failure[:160])
         else:
             if asset["status"] != "fresh":
                 not_fresh.append(symbol)
-        assets.append(asset)
-        if position + 1 < len(watchlist["assets"]):
-            time.sleep(max(0.0, settings.pause))
+            old_news = previous_asset["news"] if previous_asset else None
+            if settings.skip_news:
+                asset["news"] = aged_section(old_news, "News was not refreshed in this run.") if old_news else empty_news("News was not fetched in this run.")
+            else:
+                asset["news"] = fetch_news(symbol, old_news, settings, analyzer, now_utc)
+            refreshed.append(asset)  # forecast after the network stage, in separate processes
 
-    total = len(watchlist["assets"])
+        assets.append(asset)
+        news = asset["news"]
+        tone = news["sentiment"]["label"] if news["sentiment"] else "-"
+        LOG.info("[%d/%d] %-8s %-5s %d candles · news %s (%d stories, %s) · %.1fs",
+                 position + 1, total, symbol, asset["status"], len(asset["candles"]),
+                 news["status"], news["clusterCount"], tone, time.monotonic() - ticker_started)
+        if halted_reason is None and position + 1 < total:
+            time.sleep(random.uniform(min(settings.pause_min, settings.pause_max), max(settings.pause_min, settings.pause_max)))
+
     if len(not_fresh) * 2 > total:
         fail(f"{len(not_fresh)} of {total} assets could not be refreshed "
              f"({', '.join(not_fresh)}); nothing was written")
         return 1
 
+    LOG.info("network stage finished in %.0fs", time.monotonic() - started)
+    forecasts = run_forecasts(refreshed, previous_assets, settings)
+    for asset in refreshed:
+        asset["forecast"] = forecasts.get(asset["ticker"], empty_forecast("The forecast model was not run for this asset."))
+
     snapshot = {
         "schemaVersion": SCHEMA_VERSION,
-        "generatedAt": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generatedAt": iso_timestamp(now_utc),
         "fx": fx,
+        "macro": macro,
         "candleFields": CANDLE_FIELDS,
+        "forecastFields": FORECAST_FIELDS,
         "assets": assets,
     }
     errors = validate_snapshot(snapshot)
@@ -931,8 +1903,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     write_snapshot(snapshot, settings.output)
-    write_step_summary(snapshot)
-    LOG.info("wrote %s: %d assets, %d not fresh%s", settings.output, len(assets), len(not_fresh),
+    elapsed = time.monotonic() - started
+    write_step_summary(snapshot, elapsed)
+    LOG.info("wrote %s in %.0fs: %d assets, %d not fresh%s", settings.output, elapsed, len(assets), len(not_fresh),
              f" ({', '.join(not_fresh)})" if not_fresh else "")
     return 0
 
