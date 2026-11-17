@@ -131,9 +131,45 @@
       document.getElementById('headline').textContent = 'Open this page through a web server';
       document.getElementById('meta').textContent = 'Run "python -m http.server 8000" in the project folder, then open http://localhost:8000/tests/engines.test.html';
     }
+
+    // Reporting for scripts/run_browser_tests.py (the CI gate). The runner opens this page
+    // with ?report=<path> and waits for one POST of the totals. Only a same-origin path is
+    // accepted, so results can never be sent to another site.
+    (function () {
+      var target = new URLSearchParams(location.search).get('report');
+      var accepted = typeof target === 'string' && /^\/[A-Za-z0-9_\-\/]+$/.test(target) && target.indexOf('//') === -1;
+      var failureSent = false;
+
+      window.__quantlensReport = function (totals) {
+        if (!accepted) return;
+        fetch(target, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(totals) })
+          .catch(function () { /* the runner will time out and say so */ });
+      };
+
+      // If a module fails to load or throws before the suites start, say so at once
+      // instead of leaving the runner to wait for its timeout.
+      window.__quantlensLoadFailure = function (message) {
+        if (failureSent || window.__quantlensStarted) return;
+        failureSent = true;
+        document.getElementById('summary').dataset.result = 'fail';
+        document.getElementById('headline').textContent = 'The test suite could not start';
+        document.getElementById('meta').textContent = String(message);
+        document.title = '✗ could not start · QuantLens engine tests';
+        window.__quantlensReport({
+          total: 1, passed: 0, failed: 1, skipped: 0, durationMs: 0,
+          failures: [{ suite: 'Test page', test: 'modules load and evaluate', message: String(message) }],
+        });
+      };
+      window.addEventListener('error', function (event) {
+        window.__quantlensLoadFailure(event.message || 'a script failed to load');
+      });
+      window.addEventListener('unhandledrejection', function (event) {
+        window.__quantlensLoadFailure(event.reason && event.reason.message ? event.reason.message : 'an unhandled error occurred');
+      });
+    })();
   </script>
 
-  <script type="module">
+  <script type="module" onerror="window.__quantlensLoadFailure('a JavaScript module failed to load')">
     import * as pm from '../src/core/precisionMath.js';
     import * as tracer from '../src/core/derivationTracer.js';
     import * as storeModule from '../src/core/store.js';
@@ -146,6 +182,11 @@
     import * as advisor from '../src/engines/advisorEngine.js';
     import * as sizer from '../src/engines/positionSizerEngine.js';
     import * as monteCarlo from '../src/engines/monteCarloEngine.js';
+    import * as portfolio from '../src/engines/portfolioEngine.js';
+    import * as sentiment from '../src/engines/sentimentEngine.js';
+    import * as forecasting from '../src/engines/forecastEngine.js';
+    import * as mathWorker from '../src/workers/mathWorker.js';
+    import * as workerService from '../src/services/workerService.js';
 
     /* ================================================================== */
     /* A minimal test harness: suite(), test(), expect(), skip()           */
@@ -1360,11 +1401,14 @@
         expect(snapshot.freshness).toBe('fresh');
       });
       test('an asset with a broken candle is dropped with a warning; the rest still load', async () => {
-        const copy = structuredClone(await rawSnapshot());
+        const raw = await rawSnapshot();
+        const baseline = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt)).warnings.length;
+        const copy = structuredClone(raw);
         copy.assets[0].candles[5][2] = 0.0001; // high below open and close
         const snapshot = snapshotService.normaliseSnapshot(copy, new Date(copy.generatedAt));
         expect(snapshot.assets.length).toBe(copy.assets.length - 1);
-        expect(snapshot.warnings.length).toBe(1);
+        // One more warning than the untouched snapshot, which may itself carry a stale-data notice.
+        expect(snapshot.warnings.length).toBe(baseline + 1);
         expect(snapshot.warnings[0]).toMatch(new RegExp(copy.assets[0].ticker.replace('.', '\\.')));
       });
       test('NaN, strings and missing keys in fundamentals are rejected', async () => {
@@ -1392,7 +1436,7 @@
         const raw = await rawSnapshot();
         let caught = null;
         try {
-          snapshotService.normaliseSnapshot({ ...raw, schemaVersion: 2 });
+          snapshotService.normaliseSnapshot({ ...raw, schemaVersion: 99 });
         } catch (error) {
           caught = error;
         }
@@ -1423,6 +1467,185 @@
         const raw = await rawSnapshot();
         const snapshot = await snapshotService.loadSnapshot({ fetchImpl: respond(raw), now: new Date(raw.generatedAt) });
         expect(snapshot.assets.length).toBe(raw.assets.length);
+      });
+    });
+
+    suite('snapshotService: schema v2 (news, forecast, macro)', () => {
+      const normalise = (raw) => snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+      const STORY = Object.freeze({
+        title: 'Fixture headline about a company', link: 'https://example.com/story',
+        publishedAt: '2026-01-02T10:00:00Z', firstSeenAt: '2026-01-02T08:00:00Z', duplicates: 2,
+        scores: { compound: 0.42, pos: 0.3, neu: 0.7, neg: 0 }, label: 'positive',
+      });
+      const NEWS = Object.freeze({
+        status: 'fresh', fetchedAt: '2026-01-02T12:00:00Z', headlineCount: 9, clusterCount: 6, newestAt: '2026-01-02T10:00:00Z',
+        sentiment: { compound: 0.42, label: 'positive', basis: 1 }, clusters: [STORY], note: null,
+      });
+      const FORECAST = Object.freeze({
+        status: 'fresh', model: 'prophet', modelVersion: '1.5.0',
+        config: { target: 'log(close)', weeklySeasonality: true }, trainedOn: { observations: 250 },
+        horizon: { calendarDays: 30, points: 2 }, backtest: { mape: 0.05 }, note: null,
+        points: [['2026-01-05', 101, 95, 108], ['2026-01-06', 102, 94, 111]],
+      });
+      /** A copy of the committed snapshot with one asset's news and forecast replaced. */
+      async function withSections({ news = NEWS, forecast = FORECAST } = {}) {
+        const copy = structuredClone(await rawSnapshot());
+        copy.assets[0].news = structuredClone(news);
+        copy.assets[0].forecast = structuredClone(forecast);
+        return copy;
+      }
+      const story = (changes) => ({ ...NEWS, clusters: [{ ...STORY, ...changes }] });
+      /** Warnings the untouched snapshot already carries (for example a stale-ticker notice on a degraded day). */
+      const baselineWarnings = async () => normalise(await rawSnapshot()).warnings.length;
+
+      test('the committed snapshot is schema v2 and none of its sections is malformed', async () => {
+        const raw = await rawSnapshot();
+        expect(raw.schemaVersion).toBe(2);
+        expect(snapshotService.validateSnapshot(raw).sectionProblems).toEqual([]);
+        const snapshot = normalise(raw);
+        expect(snapshot.fx.series.dates.length).toBe(snapshot.fx.series.rates.length);
+        if (snapshot.fx.series.dates.length) expect(snapshot.fx.series.dates.length).toBeGreaterThan(200);
+        for (const asset of snapshot.assets) {
+          expect(['fresh', 'stale', 'unavailable']).toContain(asset.news.status);
+          expect(['fresh', 'stale', 'unavailable']).toContain(asset.forecast.status);
+          expect(asset.news.clusters.length).toBeAtMost(3);
+          for (const item of asset.news.clusters) {
+            if (item.link !== null && !item.link.startsWith('https://')) fail(`${asset.ticker} stores a link that is not https`);
+          }
+        }
+      });
+      test('risk-free rates are decimals in a plausible range, each labelled with its source and status', async () => {
+        const snapshot = normalise(await rawSnapshot());
+        for (const currency of ['USD', 'SGD']) {
+          const rate = snapshot.macro.riskFree[currency];
+          expect(['fresh', 'stale', 'proxy', 'unavailable']).toContain(rate.status);
+          if (rate.status === 'unavailable') {
+            expect(rate.yield).toBeNull();
+          } else {
+            expect(rate.yield).toBeGreaterThan(-0.02);
+            expect(rate.yield).toBeAtMost(0.25);
+            expect(typeof rate.asOf).toBe('string');
+          }
+        }
+      });
+      test('a schema v1 snapshot still loads, with the new sections marked unavailable', async () => {
+        const v1 = structuredClone(await rawSnapshot());
+        v1.schemaVersion = 1;
+        delete v1.macro;
+        delete v1.forecastFields;
+        delete v1.fx.series;
+        for (const asset of v1.assets) {
+          delete asset.news;
+          delete asset.forecast;
+        }
+        const snapshot = normalise(v1);
+        expect(snapshot.assets.length).toBe(v1.assets.length);
+        expect(snapshot.warnings.length).toBe(await baselineWarnings()); // no complaint about the absent sections
+        expect(snapshot.assets[0].news.status).toBe('unavailable');
+        expect(snapshot.assets[0].forecast.status).toBe('unavailable');
+        expect(snapshot.macro.riskFree.USD.status).toBe('unavailable');
+        expect(snapshot.fx.series.dates).toEqual([]);
+      });
+      test('news is normalised: stories, scores and the aggregate tone', async () => {
+        const news = normalise(await withSections()).assets[0].news;
+        expect(news.status).toBe('fresh');
+        expect(news.clusters[0].title).toBe(STORY.title);
+        expect(news.clusters[0].duplicates).toBe(2);
+        expect(news.clusters[0].scores.compound).toBe(0.42);
+        expect(news.sentiment).toEqual({ compound: 0.42, label: 'positive', basis: 1 });
+        expect(news.headlineCount).toBe(9);
+      });
+      test('a malformed news block is blanked, but the asset keeps its prices and fundamentals', async () => {
+        const cases = [
+          story({ link: 'javascript:alert(1)' }),
+          story({ link: 'http://example.com/insecure' }),
+          story({ scores: { compound: 3, pos: 0, neu: 1, neg: 0 } }),
+          story({ title: '' }),
+          story({ publishedAt: 'yesterday' }),
+          story({ duplicates: -1 }),
+          { ...NEWS, clusters: [STORY, STORY, STORY, STORY] },
+          { ...NEWS, sentiment: { compound: 0.4, label: 'bullish', basis: 1 } },
+          { ...NEWS, status: 'unavailable' }, // claims to be unavailable but carries a story
+        ];
+        const baseline = await baselineWarnings();
+        for (const news of cases) {
+          const raw = await withSections({ news });
+          const snapshot = normalise(raw);
+          const asset = snapshot.assets[0];
+          expect(asset.ticker).toBe(raw.assets[0].ticker);
+          expect(asset.news.status).toBe('unavailable');
+          expect(asset.news.clusters).toEqual([]);
+          expect(asset.series.close.length).toBe(raw.assets[0].candles.length);
+          expect(snapshot.warnings.length).toBe(baseline + 1);
+          expect(snapshot.warnings.some((warning) => /supplementary data/.test(warning))).toBeTrue();
+        }
+      });
+      test('a story without scores is allowed (the sentiment package may be absent)', async () => {
+        const news = normalise(await withSections({ news: { ...NEWS, sentiment: null, clusters: [{ ...STORY, scores: null, label: null }] } })).assets[0].news;
+        expect(news.status).toBe('fresh');
+        expect(news.clusters[0].scores).toBeNull();
+        expect(news.clusters[0].label).toBeNull();
+        expect(news.sentiment).toBeNull();
+      });
+      test('a forecast is normalised into parallel date, estimate and band series', async () => {
+        const forecast = normalise(await withSections()).assets[0].forecast;
+        expect(forecast.status).toBe('fresh');
+        expect(forecast.series.dates).toEqual(['2026-01-05', '2026-01-06']);
+        expect(forecast.series.yhat).toEqual([101, 102]);
+        expect(forecast.series.lower).toEqual([95, 94]);
+        expect(forecast.series.upper).toEqual([108, 111]);
+        expect(forecast.backtest.mape).toBe(0.05);
+        expect(forecast.config.target).toBe('log(close)');
+      });
+      test('a forecast that breaks its own rules is ignored rather than drawn', async () => {
+        const cases = [
+          { ...FORECAST, points: [['2026-01-05', 120, 95, 108]] }, // estimate above its band
+          { ...FORECAST, points: [['2026-01-05', 101, -1, 108]] }, // non-positive price
+          { ...FORECAST, points: [['2026-01-06', 101, 95, 108], ['2026-01-05', 102, 94, 111]] }, // not ascending
+          { ...FORECAST, points: [['2026-01-05', 101, 95]] }, // wrong shape
+          { ...FORECAST, points: [] }, // available but empty
+          { ...FORECAST, status: 'unavailable' }, // unavailable but carries points
+          { ...FORECAST, model: '' },
+        ];
+        const baseline = await baselineWarnings();
+        for (const forecast of cases) {
+          const snapshot = normalise(await withSections({ forecast }));
+          expect(snapshot.assets[0].forecast.status).toBe('unavailable');
+          expect(snapshot.assets[0].forecast.series.dates).toEqual([]);
+          expect(snapshot.assets[0].news.status).toBe('fresh'); // the other section is unaffected
+          expect(snapshot.warnings.length).toBe(baseline + 1);
+        }
+      });
+      test('an unrecognised forecast layout disables forecasts only', async () => {
+        const raw = await withSections();
+        raw.forecastFields = ['date', 'value'];
+        const snapshot = normalise(raw);
+        expect(snapshot.assets[0].forecast.status).toBe('unavailable');
+        expect(snapshot.assets[0].news.status).toBe('fresh');
+        expect(snapshot.assets.length).toBe(raw.assets.length);
+      });
+      test('macro: a malformed or implausible rate becomes unavailable; a proxy stays labelled', async () => {
+        const raw = structuredClone(await rawSnapshot());
+        raw.macro = {
+          riskFree: {
+            USD: { name: 'US 10-year Treasury yield', symbol: '^TNX', yield: 5.13, asOf: '2026-01-02', source: 'yahoo', status: 'fresh' }, // percent, not a decimal
+            SGD: { name: 'US 10-year Treasury yield (proxy for Singapore)', symbol: '^TNX', yield: 0.0513, asOf: '2026-01-02', source: 'yahoo', status: 'proxy' },
+          },
+        };
+        const snapshot = normalise(raw);
+        expect(snapshot.macro.riskFree.USD.status).toBe('unavailable');
+        expect(snapshot.macro.riskFree.USD.yield).toBeNull();
+        expect(snapshot.macro.riskFree.SGD.status).toBe('proxy');
+        expect(snapshot.macro.riskFree.SGD.yield).toBe(0.0513);
+        expect(snapshot.assets.length).toBe(raw.assets.length);
+        expect(snapshotService.normaliseMacro(undefined).macro.riskFree.SGD.status).toBe('unavailable');
+      });
+      test('a malformed USD/SGD history is dropped without touching the current rate', async () => {
+        const raw = structuredClone(await rawSnapshot());
+        raw.fx.series = [['2026-01-02', 1.3], ['2026-01-01', 1.31]]; // not ascending
+        const snapshot = normalise(raw);
+        expect(snapshot.fx.series.dates).toEqual([]);
+        expect(snapshot.fx.rate).toBe(raw.fx.rate);
       });
     });
 
@@ -1633,6 +1856,11 @@
           for (const metrics of [tech.metrics, fund.metrics, advice.metrics]) Object.keys(metrics).forEach((id) => ids.add(id));
         }
         Object.keys(size().metrics).forEach((id) => ids.add(id));
+        // V2 metrics: news tone, the projection and its record, and the portfolio figures.
+        const anyAsset = Object.values(byTicker)[0].asset;
+        Object.keys(sentiment.analyzeSentiment(anyAsset).metrics).forEach((id) => ids.add(id));
+        Object.keys(forecasting.analyzeForecast(anyAsset).metrics).forEach((id) => ids.add(id));
+        Object.keys(portfolio.analyzePortfolio({ assets: [], weights: [], baseCurrency: 'USD' }).metrics).forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -1713,6 +1941,786 @@
     });
 
     /* ================================================================== */
+    /* 14. Portfolio engine: Modern Portfolio Theory                        */
+    /* ================================================================== */
+
+    suite('portfolioEngine: Modern Portfolio Theory', () => {
+      // Two assets with the same mean and variance and a correlation of exactly −1.
+      const repeat = (pattern, times) => Array.from({ length: pattern.length * times }, (_, i) => pattern[i % pattern.length]);
+      const pricesFrom = (returns, start = 100) => returns.reduce((prices, r) => [...prices, prices[prices.length - 1] * (1 + r)], [start]);
+      const RET_A = repeat([0.01, -0.01, 0.02, 0.00], 6); // 24 daily returns, mean 0.005
+      const RET_B = repeat([0.00, 0.02, -0.01, 0.01], 6); // the mirror image around the same mean
+      const meanOf = (values) => values.reduce((sum, value) => sum + value, 0) / values.length;
+      const sampleVariance = (values) => values.reduce((sum, value) => sum + (value - meanOf(values)) ** 2, 0) / (values.length - 1);
+      const DAILY_VARIANCE = sampleVariance(RET_A);
+      const SIGMA = Math.sqrt(DAILY_VARIANCE * 252); // annualised volatility of either asset
+      const RF = Object.freeze({ yield: 0.05, status: 'fresh', name: 'Fixture 10-year yield', source: 'fixture', asOf: '2026-01-02' });
+      const assetA = makeAsset({ ticker: 'AAA', closes: pricesFrom(RET_A) });
+      const assetB = makeAsset({ ticker: 'BBB', closes: pricesFrom(RET_B) });
+      const analyse = (overrides = {}) => portfolio.analyzePortfolio({
+        assets: [assetA, assetB],
+        weights: [{ ticker: 'AAA', weight: 75 }, { ticker: 'BBB', weight: 25 }],
+        baseCurrency: 'USD',
+        riskFree: RF,
+        ...overrides,
+      });
+
+      test('weights of any scale are normalised to fractions that sum to 1', () => {
+        expect(portfolio.normaliseWeights([{ ticker: 'A', weight: 75 }, { ticker: 'B', weight: 25 }])).toEqual([{ ticker: 'A', weight: 0.75 }, { ticker: 'B', weight: 0.25 }]);
+        expect(portfolio.normaliseWeights([{ ticker: 'A', weight: 2 }, { ticker: 'B', weight: 6 }])[1].weight).toBe(0.75);
+        expect(portfolio.normaliseWeights([{ ticker: 'A', weight: 0 }])).toBeNull();
+        expect(portfolio.normaliseWeights([{ ticker: 'A', weight: -5 }, { ticker: 'B', weight: NaN }])).toBeNull();
+      });
+      test('simple returns and the sample covariance matrix match a hand calculation', () => {
+        expect(portfolio.simpleReturns([100, 110, 99])).toEqual([110 / 100 - 1, 99 / 110 - 1]);
+        const { means, cov } = portfolio.covarianceMatrix([RET_A, RET_B]);
+        expect(means[0]).toBeCloseTo(0.005, 1e-12);
+        expect(means[1]).toBeCloseTo(0.005, 1e-12);
+        expect(cov[0][0]).toBeCloseTo(DAILY_VARIANCE, 1e-15);
+        expect(cov[1][1]).toBeCloseTo(DAILY_VARIANCE, 1e-15);
+        expect(cov[0][1]).toBeCloseTo(-DAILY_VARIANCE, 1e-15); // perfectly opposed
+        expect(cov[0][1]).toBe(cov[1][0]);
+        expect(portfolio.covarianceMatrix([[1, 2], [1]])).toBeNull();
+      });
+      test('portfolio return: Rp = Σ wᵢμᵢ, annualised by × 252', () => {
+        const result = analyse();
+        expect(result.ok).toBeTrue();
+        expect(result.observations).toBe(24);
+        expect(result.periodsPerYear).toBe(252);
+        expect(result.stats.means[0]).toBeCloseTo(0.005 * 252, 1e-9);
+        expect(result.metrics.portfolioReturn.value).toBeCloseTo(0.75 * 1.26 + 0.25 * 1.26, 1e-9); // 126% a year
+      });
+      test('portfolio volatility: σp = √(wᵀΣw), with the covariance term included', () => {
+        // w = (0.75, 0.25), ρ = −1: variance = σ²(0.5625 + 0.0625 − 0.375) = 0.25σ², so σp = 0.5σ.
+        const result = analyse();
+        expect(result.stats.volatilities[0]).toBeCloseTo(SIGMA, 1e-9);
+        expect(result.stats.correlation[0][1]).toBeCloseTo(-1, 1e-9);
+        expect(result.metrics.portfolioVolatility.value).toBeCloseTo(0.5 * SIGMA, 1e-9);
+        expect(result.metrics.portfolioVolatility.meta.variance).toBeCloseTo(0.25 * DAILY_VARIANCE * 252, 1e-12);
+      });
+      test('Sharpe ratio: (Rp − Rf) ÷ σp against the risk-free rate', () => {
+        const result = analyse();
+        expect(result.metrics.sharpeRatio.value).toBeCloseTo((1.26 - 0.05) / (0.5 * SIGMA), 1e-6);
+        expect(result.metrics.sharpeRatio.meta.excessReturn).toBeCloseTo(1.21, 1e-9);
+        const higherBar = analyse({ riskFree: { ...RF, yield: 0.10 } });
+        expect(higherBar.metrics.sharpeRatio.value).toBeCloseTo((1.26 - 0.10) / (0.5 * SIGMA), 1e-6);
+        expect(higherBar.metrics.sharpeRatio.value < result.metrics.sharpeRatio.value).toBeTrue();
+      });
+      test('risk shares sum to 1, and a hedging asset has a negative share', () => {
+        // (Σw) = σ²(0.5, −0.5); shares = w(Σw) ÷ σp² = (1.5, −0.5).
+        const result = analyse();
+        const shares = result.contributions.map((item) => item.riskShare);
+        expect(shares[0]).toBeCloseTo(1.5, 1e-9);
+        expect(shares[1]).toBeCloseTo(-0.5, 1e-9);
+        expect(shares[0] + shares[1]).toBeCloseTo(1, 1e-9);
+        expect(result.contributions[0].returnContribution).toBeCloseTo(0.75 * 1.26, 1e-9);
+      });
+      test('diversification ratio: Σ wᵢσᵢ ÷ σp', () => {
+        expect(analyse().metrics.diversificationRatio.value).toBeCloseTo(2, 1e-9); // σ ÷ 0.5σ
+        const single = analyse({ weights: [{ ticker: 'AAA', weight: 100 }] });
+        expect(single.metrics.diversificationRatio.value).toBeCloseTo(1, 1e-9);
+        expect(single.metrics.portfolioVolatility.value).toBeCloseTo(SIGMA, 1e-9);
+      });
+      test('a perfect hedge has no volatility, so the Sharpe ratio is N/A rather than infinite', () => {
+        const result = analyse({ weights: [{ ticker: 'AAA', weight: 50 }, { ticker: 'BBB', weight: 50 }] });
+        expect(result.ok).toBeTrue();
+        expect(result.metrics.portfolioVolatility.value).toBeCloseTo(0, 1e-7);
+        expect(result.metrics.sharpeRatio.status).toBe('na');
+        expect(result.metrics.sharpeRatio.naReason).toMatch(/no volatility/);
+        expect(result.metrics.diversificationRatio.status).toBe('na');
+        expect(result.metrics.portfolioReturn.value).toBeCloseTo(1.26, 1e-9);
+      });
+      test('percentages and fractions give the same answer; unknown tickers are ignored', () => {
+        const percent = analyse();
+        const fraction = analyse({ weights: [{ ticker: 'AAA', weight: 0.75 }, { ticker: 'BBB', weight: 0.25 }, { ticker: 'ZZZ', weight: 5 }] });
+        expect(fraction.metrics.sharpeRatio.value).toBeCloseTo(percent.metrics.sharpeRatio.value, 1e-12);
+        expect(fraction.weights).toEqual([0.75, 0.25]);
+      });
+      test('no risk-free rate: the Sharpe ratio is N/A, everything else still works', () => {
+        const result = analyse({ riskFree: { yield: null, status: 'unavailable' } });
+        expect(result.metrics.sharpeRatio.status).toBe('na');
+        expect(result.metrics.sharpeRatio.naReason).toMatch(/risk-free/);
+        expect(result.metrics.riskFreeRate.status).toBe('na');
+        expect(result.metrics.portfolioVolatility.status).toBe('ok');
+        expect(analyse({ riskFree: null }).metrics.sharpeRatio.status).toBe('na');
+      });
+      test('a proxy risk-free rate is used but flagged', () => {
+        const result = analyse({ riskFree: { ...RF, status: 'proxy', name: 'US 10-year Treasury yield (proxy for Singapore)' } });
+        expect(result.metrics.sharpeRatio.status).toBe('ok');
+        expect(result.metrics.sharpeRatio.trace.interpretation.caveat).toMatch(/proxy/);
+        expect(result.metrics.riskFreeRate.tone).toBe('caution');
+        expect(result.metrics.riskFreeRate.meta.status).toBe('proxy');
+      });
+      test('invalid portfolios give N/A with a reason: no weight, too little history, too many assets', () => {
+        expect(analyse({ weights: [{ ticker: 'AAA', weight: 0 }] }).reason).toMatch(/weight above zero/);
+        expect(analyse({ assets: [] }).reason).toMatch(/at least one asset/);
+        expect(analyse({ minObservations: 30 }).reason).toMatch(/24 days/);
+        const many = Array.from({ length: 9 }, (_, i) => makeAsset({ ticker: `T${i}`, closes: pricesFrom(RET_A) }));
+        expect(portfolio.analyzePortfolio({ assets: many, weights: many.map((a) => ({ ticker: a.ticker, weight: 1 })), baseCurrency: 'USD', riskFree: RF }).reason).toMatch(/at most 8/);
+        const failed = analyse({ assets: [] });
+        for (const metric of Object.values(failed.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('only dates on which every asset traded are used', () => {
+        const shorter = makeAsset({ ticker: 'BBB', closes: assetB.series.close.slice(0, 20), dates: assetB.series.dates.slice(0, 20) });
+        const result = analyse({ assets: [assetA, shorter], minObservations: 10 });
+        expect(result.observations).toBe(19);
+        expect(result.period.to).toBe(shorter.series.dates[19]);
+        expect(analyse({ assets: [assetA, shorter] }).ok).toBeFalse(); // 19 is below the default of 20
+      });
+      test('a crypto-only portfolio annualises with 365 days', () => {
+        const coins = [makeAsset({ ticker: 'AAA', closes: assetA.series.close, assetClass: 'crypto' }), makeAsset({ ticker: 'BBB', closes: assetB.series.close, assetClass: 'crypto' })];
+        const result = analyse({ assets: coins });
+        expect(result.periodsPerYear).toBe(365);
+        expect(result.metrics.portfolioReturn.value).toBeCloseTo(0.005 * 365, 1e-9);
+      });
+      test('currency moves are part of the return when the base currency differs', () => {
+        // A USD asset held by an SGD investor while USD/SGD rises 0.1% a day:
+        // each daily return becomes (1 + r)(1.001) − 1, whose mean is 1.001 × 1.005 − 1.
+        const dates = assetA.series.dates;
+        const fx = { rate: 1.3, series: { dates, rates: dates.map((_, i) => 1.3 * 1.001 ** i) } };
+        const result = analyse({ assets: [assetA], weights: [{ ticker: 'AAA', weight: 1 }], baseCurrency: 'SGD', fx });
+        expect(result.fxMode).toBe('history');
+        expect(result.metrics.portfolioReturn.value).toBeCloseTo((1.001 * 1.005 - 1) * 252, 1e-9);
+        expect(result.metrics.portfolioReturn.trace.interpretation.caveat).toMatch(/currency moves are included/);
+      });
+      test('without FX history today\'s rate is applied to every day, and the trace says so', () => {
+        const result = analyse({ assets: [assetA], weights: [{ ticker: 'AAA', weight: 1 }], baseCurrency: 'SGD', fx: { rate: 1.3, series: { dates: [], rates: [] } } });
+        expect(result.fxMode).toBe('constant');
+        expect(result.metrics.portfolioReturn.value).toBeCloseTo(1.26, 1e-9); // unchanged by a constant rate
+        expect(result.metrics.portfolioReturn.trace.interpretation.caveat).toMatch(/NOT included/);
+        expect(analyse({ baseCurrency: 'SGD', fx: null }).reason).toMatch(/No USD\/SGD rate/);
+      });
+      test('an FX series with gaps is carried forward, and an SGD asset is divided into USD', () => {
+        const dates = assetA.series.dates;
+        const sparse = { rate: 1.25, series: { dates: dates.filter((_, i) => i % 2 === 0), rates: dates.filter((_, i) => i % 2 === 0).map(() => 1.25) } };
+        const sgdAsset = makeAsset({ ticker: 'SGA', closes: assetA.series.close, currency: 'SGD' });
+        const result = analyse({ assets: [sgdAsset], weights: [{ ticker: 'SGA', weight: 1 }], baseCurrency: 'USD', fx: sparse });
+        expect(result.ok).toBeTrue();
+        expect(result.metrics.portfolioReturn.value).toBeCloseTo(1.26, 1e-9); // a flat rate leaves returns unchanged
+        const converted = portfolio.alignPrices([sgdAsset], { baseCurrency: 'USD', fxSeries: sparse.series, fxRate: 1.25 });
+        expect(converted.prices[0][1]).toBeCloseTo(sgdAsset.series.close[1] / 1.25, 1e-9); // an odd day uses the previous rate
+      });
+      test('a currency other than USD or SGD is refused rather than guessed', () => {
+        const yen = makeAsset({ ticker: 'JPN', closes: assetA.series.close, currency: 'JPY' });
+        expect(analyse({ assets: [yen], weights: [{ ticker: 'JPN', weight: 1 }] }).reason).toMatch(/JPY/);
+      });
+      test('every portfolio metric satisfies the trace contract', () => {
+        const result = analyse();
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(findNonFinite(result)).toEqual([]);
+        expect(result.metrics.sharpeRatio.trace.dependsOn).toEqual(['portfolioReturn', 'riskFreeRate', 'portfolioVolatility']);
+      });
+      test('the sampled opportunity set is reproducible and long-only', () => {
+        const stats = analyse().stats;
+        const args = { means: stats.means, covariance: stats.covariance, tickers: ['AAA', 'BBB'], riskFree: 0.05, count: 500, seed: 7 };
+        const first = portfolio.sampleFrontier(args);
+        expect(first.count).toBe(2 + 1 + 500); // each single asset, equal weight, then the random draws
+        expect(first.risk).toEqual(portfolio.sampleFrontier(args).risk);
+        expect(JSON.stringify(first.risk) === JSON.stringify(portfolio.sampleFrontier({ ...args, seed: 8 }).risk)).toBeFalse();
+        for (const candidate of [first.maxSharpe, first.minVariance]) {
+          expect(candidate.weights.reduce((sum, weight) => sum + weight, 0)).toBeCloseTo(1, 1e-9);
+          if (candidate.weights.some((weight) => weight < 0)) fail('a sampled portfolio is short an asset');
+        }
+      });
+      test('the best of the sample is at least as good as the obvious candidates', () => {
+        const stats = analyse().stats;
+        const sample = portfolio.sampleFrontier({ means: stats.means, covariance: stats.covariance, tickers: ['AAA', 'BBB'], riskFree: 0.05, count: 500, seed: 7 });
+        // With ρ = −1 and equal volatilities the equal-weight mix has zero risk, and it is always a candidate.
+        expect(sample.minVariance.risk).toBeCloseTo(0, 1e-6);
+        expect(sample.minVariance.allocation.map((item) => item.weight)).toEqual([0.5, 0.5]);
+        expect(sample.maxSharpe.sharpe).toBeAtLeast((1.26 - 0.05) / SIGMA); // better than either asset alone
+        const noRate = portfolio.sampleFrontier({ means: stats.means, covariance: stats.covariance, tickers: ['AAA', 'BBB'], riskFree: null, count: 50, seed: 1 });
+        expect(noRate.maxSharpe).toBeNull();
+        expect(portfolio.sampleFrontier({ means: [0.1], covariance: [[0.04]], tickers: ['AAA'], riskFree: 0.05 }).count).toBe(1);
+      });
+      test('real assets: an equal-weight mixed-currency portfolio is analysed end to end', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const assets = snapshot.assets.slice(0, 4);
+        for (const base of ['USD', 'SGD']) {
+          const result = portfolio.analyzePortfolio({
+            assets, weights: assets.map((asset) => ({ ticker: asset.ticker, weight: 25 })), baseCurrency: base,
+            fx: { rate: snapshot.fx.rate, series: snapshot.fx.series }, riskFree: snapshot.macro.riskFree[base],
+          });
+          expect(result.ok).toBeTrue();
+          for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+          expect(findNonFinite(result)).toEqual([]);
+          expect(result.contributions.reduce((sum, item) => sum + item.riskShare, 0)).toBeCloseTo(1, 1e-9);
+          expect(result.metrics.diversificationRatio.value).toBeAtLeast(1 - 1e-9);
+        }
+      });
+    });
+
+    /* ================================================================== */
+    /* 15. Sentiment and forecast engines                                  */
+    /* ================================================================== */
+
+    suite('sentimentEngine: headline tone', () => {
+      const NOW = new Date('2026-01-10T12:00:00Z');
+      const story = (compound, hoursAgo, extra = {}) => ({
+        title: `Fixture story scoring ${compound}`, link: 'https://example.com/story',
+        publishedAt: new Date(NOW.getTime() - hoursAgo * 3600000).toISOString(),
+        firstSeenAt: new Date(NOW.getTime() - (hoursAgo + 1) * 3600000).toISOString(),
+        duplicates: 0,
+        scores: { compound, pos: Math.max(compound, 0), neu: 1 - Math.abs(compound), neg: Math.max(-compound, 0) },
+        label: sentiment.labelForCompound(compound),
+        ...extra,
+      });
+      const news = (stories, extra = {}) => ({
+        status: 'fresh', fetchedAt: NOW.toISOString(), headlineCount: 15, clusterCount: 9,
+        newestAt: stories.length ? stories[0].publishedAt : null,
+        sentiment: null, clusters: stories, note: null, ...extra,
+      });
+      const analyse = (block) => sentiment.analyzeSentiment(makeAsset({ ticker: 'NWS', news: block }), { now: NOW });
+
+      test('labels use the conventional ±0.05 cut-offs', () => {
+        expect(sentiment.labelForCompound(0.05)).toBe('positive');
+        expect(sentiment.labelForCompound(0.0499)).toBe('neutral');
+        expect(sentiment.labelForCompound(-0.0499)).toBe('neutral');
+        expect(sentiment.labelForCompound(-0.05)).toBe('negative');
+        expect(sentiment.labelForCompound(null)).toBeNull();
+      });
+      test('tone is the mean of the stories\' compound scores', () => {
+        const result = analyse(news([story(0.6, 1), story(-0.3, 5), story(0.0, 9)]));
+        const metric = result.metrics.headlineTone;
+        expect(metric.value).toBeCloseTo(0.1, 1e-12);
+        expect(metric.meta.label).toBe('positive');
+        expect(metric.meta.basis).toBe(3);
+        expect(metric.tone).toBe('healthy');
+        expect(result.stories.length).toBe(3);
+        expect(result.stories[0].ageHours).toBeCloseTo(1, 1e-9);
+        expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('negative and neutral wording are labelled and toned accordingly', () => {
+        expect(analyse(news([story(-0.5, 1), story(-0.2, 2)])).metrics.headlineTone.tone).toBe('caution');
+        const flat = analyse(news([story(0.02, 1), story(-0.02, 2)])).metrics.headlineTone;
+        expect(flat.meta.label).toBe('neutral');
+        expect(flat.tone).toBe('neutral');
+      });
+      test('stale news is never coloured as good or bad, and the caveat gives its age', () => {
+        const metric = analyse(news([story(0.8, 24 * 9)], { status: 'stale' })).metrics.headlineTone;
+        expect(metric.value).toBe(0.8);
+        expect(metric.tone).toBe('neutral');
+        expect(metric.meta.stale).toBeTrue();
+        expect(metric.trace.interpretation.caveat).toMatch(/9 days ago/);
+      });
+      test('the average is recomputed rather than trusted, and a mismatch is disclosed', () => {
+        const agree = analyse(news([story(0.4, 1), story(0.2, 2)], { sentiment: { compound: 0.3, label: 'positive', basis: 2 } })).metrics.headlineTone;
+        expect(agree.meta.agreesWithSnapshot).toBeTrue();
+        const differ = analyse(news([story(0.4, 1), story(0.2, 2)], { sentiment: { compound: -0.9, label: 'negative', basis: 2 } })).metrics.headlineTone;
+        expect(differ.value).toBeCloseTo(0.3, 1e-12);
+        expect(differ.meta.agreesWithSnapshot).toBeFalse();
+        expect(differ.trace.interpretation.caveat).toMatch(/recomputed/);
+      });
+      test('no news, or unscored headlines, give N/A with the reason', () => {
+        const none = analyse({ status: 'unavailable', clusters: [], sentiment: null, note: 'The news feed could not be reached.' });
+        expect(none.metrics.headlineTone.status).toBe('na');
+        expect(none.metrics.headlineTone.naReason).toBe('The news feed could not be reached.');
+        const unscored = analyse(news([story(0, 1, { scores: null, label: null })]));
+        expect(unscored.metrics.headlineTone.naReason).toMatch(/not scored/);
+        expect(unscored.stories.length).toBe(1); // the headline itself is still available to show
+        expect(sentiment.analyzeSentiment(makeAsset()).metrics.headlineTone.status).toBe('na'); // an asset with no news block at all
+      });
+      test('real snapshot: every asset yields a valid tone metric', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const result = sentiment.analyzeSentiment(asset, { now: new Date(raw.generatedAt) });
+          expect(tracer.validateTrace(result.metrics.headlineTone)).toEqual([]);
+          expect(findNonFinite(result)).toEqual([]);
+          if (result.metrics.headlineTone.status === 'ok') {
+            expect(result.metrics.headlineTone.value).toBeAtLeast(-1);
+            expect(result.metrics.headlineTone.value).toBeAtMost(1);
+          }
+        }
+      });
+    });
+
+    suite('forecastEngine: projection and its track record', () => {
+      const base = makeAsset({ ticker: 'FCT', closes: Array.from({ length: 260 }, (_, i) => 50 + i * (50 / 259)) }); // ends at exactly 100
+      const lastDate = base.quote.asOf;
+      const after = (days) => new Date(Date.parse(`${lastDate}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+      const block = (extra = {}) => ({
+        status: 'fresh', model: 'prophet', modelVersion: '1.5.0',
+        config: { target: 'log(close)', weeklySeasonality: true, yearlySeasonality: false, mcmcSamples: 0, intervalWidth: 0.8, levelGap: 0.02 },
+        trainedOn: { from: base.series.dates[0], to: lastDate, observations: 260 },
+        horizon: { calendarDays: 30, points: 2, weekdaysOnly: true },
+        backtest: { holdoutDays: 30, holdoutPoints: 21, mape: 0.03, naiveMape: 0.05, endError: -0.02, directionCorrect: true, coverage: 0.9, note: null },
+        series: { dates: [after(1), after(30)], yhat: [101, 110], lower: [99, 99], upper: [103, 121] },
+        note: null,
+        ...extra,
+      });
+      const analyse = (forecast) => forecasting.analyzeForecast({ ...base, forecast });
+
+      test('projected change = last projected price ÷ last close − 1', () => {
+        const result = analyse(block());
+        const metric = result.metrics.forecast30d;
+        expect(base.quote.lastClose).toBeCloseTo(100, 1e-9);
+        expect(metric.value).toBeCloseTo(0.10, 1e-9);
+        expect(metric.meta.lowerChange).toBeCloseTo(-0.01, 1e-9);
+        expect(metric.meta.upperChange).toBeCloseTo(0.21, 1e-9);
+        expect(metric.meta.endDate).toBe(after(30));
+        expect(result.status).toBe('fresh');
+        expect(result.series.yhat).toEqual([101, 110]);
+        expect(result.anchor).toEqual({ date: lastDate, close: base.quote.lastClose });
+      });
+      test('a projection is never coloured as good or bad', () => {
+        expect(analyse(block()).metrics.forecast30d.tone).toBe('neutral');
+        expect(analyse(block({ series: { dates: [after(1), after(30)], yhat: [99, 80], lower: [95, 70], upper: [101, 90] } })).metrics.forecast30d.tone).toBe('neutral');
+      });
+      test('track record: a model that beat "no change" is neutral, one that did not is a caution', () => {
+        const better = analyse(block()).metrics.forecastBacktest;
+        expect(better.value).toBe(0.03);
+        expect(better.meta.beatsNaive).toBeTrue();
+        expect(better.tone).toBe('neutral');
+        const worse = analyse(block({ backtest: { holdoutDays: 30, holdoutPoints: 21, mape: 0.07, naiveMape: 0.05, endError: 0.1, directionCorrect: false, coverage: 0.9, note: null } })).metrics.forecastBacktest;
+        expect(worse.meta.beatsNaive).toBeFalse();
+        expect(worse.tone).toBe('caution');
+        expect(worse.trace.interpretation.summary).toMatch(/added nothing/);
+      });
+      test('the projection\'s own caveat repeats its track record', () => {
+        expect(analyse(block()).metrics.forecast30d.trace.interpretation.caveat).toMatch(/slightly closer/);
+        const worse = block({ backtest: { holdoutDays: 30, holdoutPoints: 21, mape: 0.07, naiveMape: 0.05, endError: 0.1, directionCorrect: false, coverage: 0.9, note: null } });
+        expect(analyse(worse).metrics.forecast30d.trace.interpretation.caveat).toMatch(/WORSE/);
+        expect(analyse(block()).metrics.forecast30d.trace.dependsOn).toEqual(['forecastBacktest']);
+      });
+      test('a band that held far less often than promised is called too narrow', () => {
+        const narrow = block({ backtest: { holdoutDays: 30, holdoutPoints: 21, mape: 0.03, naiveMape: 0.05, endError: 0, directionCorrect: true, coverage: 0.4, note: null } });
+        expect(analyse(narrow).metrics.forecastBacktest.trace.interpretation.summary).toMatch(/too narrow/);
+        expect(analyse(block()).metrics.forecastBacktest.trace.interpretation.summary.includes('too narrow')).toBeFalse();
+      });
+      test('no forecast, or one that predates the latest candle, gives N/A', () => {
+        const none = analyse({ status: 'unavailable', series: { dates: [], yhat: [], lower: [], upper: [] }, note: 'The forecast model ran out of time.' });
+        expect(none.status).toBe('unavailable');
+        expect(none.metrics.forecast30d.naReason).toBe('The forecast model ran out of time.');
+        expect(none.series.dates).toEqual([]);
+        const old = analyse(block({ series: { dates: [lastDate, after(29)], yhat: [101, 110], lower: [99, 99], upper: [103, 121] } }));
+        expect(old.metrics.forecast30d.status).toBe('na');
+        expect(old.metrics.forecast30d.naReason).toMatch(/older prices/);
+        expect(forecasting.analyzeForecast(base).metrics.forecast30d.status).toBe('na'); // no forecast block at all
+      });
+      test('a carried-over forecast is flagged as stale', () => {
+        const carried = analyse(block({ status: 'stale' }));
+        expect(carried.status).toBe('stale');
+        expect(carried.metrics.forecast30d.meta.stale).toBeTrue();
+        expect(carried.metrics.forecast30d.trace.interpretation.caveat).toMatch(/not refreshed/);
+        const misaligned = analyse(block({ trainedOn: { from: base.series.dates[0], to: base.series.dates[250], observations: 251 } }));
+        expect(misaligned.aligned).toBeFalse();
+        expect(misaligned.status).toBe('stale');
+      });
+      test('a forecast without a backtest still projects, and says the record is missing', () => {
+        const result = analyse(block({ backtest: { holdoutDays: 30, holdoutPoints: 0, mape: null, naiveMape: null, endError: null, directionCorrect: null, coverage: null, note: 'Not enough history to hold out a test period.' } }));
+        expect(result.metrics.forecast30d.status).toBe('ok');
+        expect(result.metrics.forecastBacktest.status).toBe('na');
+        expect(result.metrics.forecastBacktest.naReason).toMatch(/Not enough history/);
+      });
+      test('forecast metrics satisfy the trace contract, on fixtures and on the real snapshot', async () => {
+        for (const metric of Object.values(analyse(block()).metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const result = forecasting.analyzeForecast(asset);
+          for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+          expect(findNonFinite(result)).toEqual([]);
+          if (result.status !== 'unavailable') {
+            expect(result.series.dates[0] > asset.quote.asOf).toBeTrue();
+            expect(result.series.dates.length).toBeAtMost(30);
+            // Anchored to the last close: the first projected day cannot be far from it.
+            expect(Math.abs(result.series.yhat[0] / asset.quote.lastClose - 1)).toBeAtMost(0.15);
+          }
+        }
+      });
+    });
+
+    /* ================================================================== */
+    /* 16. Math worker, worker service and the latest-wins job runner       */
+    /* ================================================================== */
+
+    suite('mathWorker and workerService: off-thread calculation', () => {
+      const asset = makeAsset({ ticker: 'WRK', closes: randomWalk(200, { seed: 21 }) });
+      const simulation = { asset, startPrice: asset.quote.lastClose, paths: 400 };
+      const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+      test('the job handler runs the same engine functions as a direct call', () => {
+        expect(mathWorker.handleRequest('ping', null)).toEqual({ pong: true });
+        expect(mathWorker.handleRequest('monteCarlo', simulation).horizons).toEqual(monteCarlo.runMonteCarlo(simulation).horizons);
+        let message = '';
+        try {
+          mathWorker.handleRequest('launchRockets', {});
+        } catch (error) {
+          message = error.message;
+        }
+        expect(message).toMatch(/Unknown job type/);
+      });
+      test('a portfolio job returns the analysis together with its sampled opportunity set', () => {
+        const other = makeAsset({ ticker: 'OTH', closes: randomWalk(200, { seed: 22 }) });
+        const { analysis, frontier } = mathWorker.handleRequest('portfolio', {
+          assets: [asset, other], weights: [{ ticker: 'WRK', weight: 60 }, { ticker: 'OTH', weight: 40 }],
+          baseCurrency: 'USD', riskFree: { yield: 0.04, status: 'fresh' }, frontierSamples: 200, frontierSeed: 3,
+        });
+        expect(analysis.ok).toBeTrue();
+        expect(frontier.count).toBe(203);
+        expect(frontier.minVariance.risk).toBeAtMost(analysis.metrics.portfolioVolatility.value + 1e-12);
+        const failed = mathWorker.handleRequest('portfolio', { assets: [], weights: [], baseCurrency: 'USD' });
+        expect(failed.analysis.ok).toBeFalse();
+        expect(failed.frontier).toBeNull();
+      });
+      test('a real module worker answers, and its result equals the main-thread result', async () => {
+        if (typeof Worker !== 'function') skip('this browser has no Web Workers');
+        const service = workerService.createWorkerService();
+        try {
+          const ping = await service.request('ping', null);
+          if (ping.mode !== 'worker') skip('module workers are not available here; the main-thread fallback was used');
+          expect(ping.result).toEqual({ pong: true });
+          const reply = await service.request('monteCarlo', simulation);
+          expect(reply.mode).toBe('worker');
+          expect(reply.result.horizons).toEqual(monteCarlo.runMonteCarlo(simulation).horizons);
+          expect(reply.result.metrics.monteCarlo.id).toBe('monteCarlo'); // traced metrics survive the structured clone
+          expect(tracer.validateTrace(reply.result.metrics.monteCarlo)).toEqual([]);
+        } finally {
+          service.terminate();
+        }
+      });
+      test('a job that throws inside the worker rejects with its message', async () => {
+        if (typeof Worker !== 'function') skip('this browser has no Web Workers');
+        const service = workerService.createWorkerService();
+        try {
+          await expectRejects(service.request('launchRockets', {}), (error) => expect(error.message).toMatch(/Unknown job type/));
+        } finally {
+          service.terminate();
+        }
+      });
+      test('if the worker cannot be created, the same job runs on the main thread', async () => {
+        const service = workerService.createWorkerService({ createWorker: () => { throw new Error('blocked by policy'); } });
+        const reply = await service.request('monteCarlo', simulation);
+        expect(reply.mode).toBe('main');
+        expect(service.getMode()).toBe('main');
+        expect(reply.result.horizons).toEqual(monteCarlo.runMonteCarlo(simulation).horizons);
+      });
+      test('a worker that never reports ready is abandoned for the main thread', async () => {
+        let terminated = false;
+        const silent = { postMessage() {}, terminate() { terminated = true; }, onmessage: null, onerror: null };
+        const service = workerService.createWorkerService({ createWorker: () => silent, readyTimeoutMs: 30 });
+        const reply = await service.request('ping', null);
+        expect(reply.mode).toBe('main');
+        expect(terminated).toBeTrue();
+      });
+      test('a worker that crashes mid-job has its waiting requests re-run on the main thread', async () => {
+        const fragile = {
+          onmessage: null, onerror: null, terminate() {},
+          postMessage() { setTimeout(() => this.onerror && this.onerror(new Event('error')), 5); },
+        };
+        const service = workerService.createWorkerService({ createWorker: () => fragile });
+        setTimeout(() => fragile.onmessage({ data: { ready: true } }), 0);
+        const reply = await service.request('ping', null);
+        expect(reply.result).toEqual({ pong: true });
+        expect(reply.mode).toBe('main');
+        expect(service.getMode()).toBe('main');
+      });
+      test('a request that outlives its timeout rejects, and the stuck worker is replaced', async () => {
+        let created = 0;
+        const make = () => {
+          created += 1;
+          const stuck = { onmessage: null, onerror: null, terminate() {}, postMessage() {} };
+          setTimeout(() => stuck.onmessage && stuck.onmessage({ data: { ready: true } }), 0);
+          return stuck;
+        };
+        const service = workerService.createWorkerService({ createWorker: make, requestTimeoutMs: 40 });
+        await expectRejects(service.request('ping', null), (error) => expect(error.message).toMatch(/did not finish/));
+        expect(service.getMode()).toBe('idle'); // the next request will start a fresh worker
+        const second = service.request('ping', null, { timeoutMs: 40 });
+        await expectRejects(second);
+        expect(created).toBe(2);
+        service.terminate();
+      });
+      test('equal inputs give equal job keys', () => {
+        expect(workerService.jobKey('AAPL', { riskPct: 1 }, 100)).toBe(workerService.jobKey('AAPL', { riskPct: 1 }, 100));
+        expect(workerService.jobKey('AAPL', 100) === workerService.jobKey('AAPL', 101)).toBeFalse();
+      });
+
+      /** A service whose replies are released by the test, to stage races deliberately. */
+      function controlledService() {
+        const calls = [];
+        return {
+          calls,
+          request(type, payload) {
+            return new Promise((resolve, reject) => {
+              calls.push({ type, payload, resolve: (result) => resolve({ result, ms: 1, mode: 'fake' }), reject });
+            });
+          },
+        };
+      }
+      const newRunner = () => {
+        const service = controlledService();
+        const store = storeModule.createStore(storeModule.createInitialState(''), { syncUrl: false });
+        const runner = workerService.createJobRunner({ service, store, actions: storeModule.actions });
+        return { service, store, runner, job: () => store.getState().compute.monteCarlo };
+      };
+
+      test('latest wins: a slow reply for old inputs never overwrites the newer request', async () => {
+        const { service, runner, job } = newRunner();
+        expect(runner.submit('monteCarlo', 'inputs-A', 'monteCarlo', { n: 'A' })).toBeTrue();
+        expect(job().status).toBe('running');
+        expect(job().key).toBe('inputs-A');
+        expect(runner.submit('monteCarlo', 'inputs-B', 'monteCarlo', { n: 'B' })).toBeTrue();
+        expect(job().key).toBe('inputs-B'); // the store now expects B
+        service.calls[0].resolve('result for A'); // A arrives late
+        await tick();
+        expect(job().result).toBeNull(); // and is discarded
+        expect(job().status).toBe('running');
+        expect(service.calls.length).toBe(2); // B started as soon as the worker was free
+        service.calls[1].resolve('result for B');
+        await tick();
+        expect(job().status).toBe('done');
+        expect(job().result).toBe('result for B');
+        expect(job().mode).toBe('fake');
+      });
+      test('while a job runs, only the most recent of the waiting requests is computed', async () => {
+        const { service, runner, job } = newRunner();
+        runner.submit('monteCarlo', 'k1', 'monteCarlo', { n: 1 });
+        for (const n of [2, 3, 4, 5]) runner.submit('monteCarlo', `k${n}`, 'monteCarlo', { n });
+        expect(service.calls.length).toBe(1);
+        service.calls[0].resolve('one');
+        await tick();
+        expect(service.calls.length).toBe(2);
+        expect(service.calls[1].payload).toEqual({ n: 5 }); // 2, 3 and 4 were never computed
+        service.calls[1].resolve('five');
+        await tick();
+        expect(job().result).toBe('five');
+        expect(runner.isBusy('monteCarlo')).toBeFalse();
+      });
+      test('identical inputs are not recomputed, and the old result stays visible while a new one runs', async () => {
+        const { service, runner, job } = newRunner();
+        runner.submit('monteCarlo', 'same', 'monteCarlo', {});
+        expect(runner.submit('monteCarlo', 'same', 'monteCarlo', {})).toBeFalse(); // already running
+        service.calls[0].resolve('first');
+        await tick();
+        expect(runner.submit('monteCarlo', 'same', 'monteCarlo', {})).toBeFalse(); // already answered
+        expect(service.calls.length).toBe(1);
+        runner.submit('monteCarlo', 'next', 'monteCarlo', {});
+        expect(job().status).toBe('running');
+        expect(job().result).toBe('first'); // shown dimmed by the UI until the new result lands
+      });
+      test('a failed job records its error; a stale failure is ignored', async () => {
+        const { service, runner, job } = newRunner();
+        runner.submit('monteCarlo', 'bad', 'monteCarlo', {});
+        service.calls[0].reject(new Error('worker exploded'));
+        await tick();
+        expect(job().status).toBe('error');
+        expect(job().error).toBe('worker exploded');
+        runner.submit('monteCarlo', 'old', 'monteCarlo', {});
+        runner.submit('monteCarlo', 'new', 'monteCarlo', {});
+        service.calls[1].reject(new Error('late failure for old inputs'));
+        await tick();
+        expect(job().status).toBe('running'); // "new" is still in flight and unaffected
+        expect(job().error).toBeNull();
+      });
+      test('jobs are independent: the portfolio and the simulation do not block each other', async () => {
+        const { service, store, runner } = newRunner();
+        runner.submit('monteCarlo', 'm', 'monteCarlo', {});
+        runner.submit('portfolio', 'p', 'portfolio', {});
+        expect(service.calls.length).toBe(2);
+        service.calls[1].resolve('portfolio result');
+        await tick();
+        expect(store.getState().compute.portfolio.status).toBe('done');
+        expect(store.getState().compute.monteCarlo.status).toBe('running');
+        let threw = false;
+        try {
+          runner.submit('nonsense', 'k', 'ping', {});
+        } catch (error) {
+          threw = true;
+        }
+        expect(threw).toBeTrue();
+      });
+    });
+
+    /* ================================================================== */
+    /* 17. Store: V2 slices (tabs, time range, portfolio, compute)          */
+    /* ================================================================== */
+
+    suite('store: tabs, time range, portfolio weights and compute state', () => {
+      const { actions, reduce, createInitialState, parseUrlState, serializeUrlState } = storeModule;
+      const tickers = ['AAPL', 'NVDA', 'MSFT', 'D05.SI', 'BTC-USD', 'JPM', 'O39.SI', 'GOOGL', 'AMZN', 'ETH-USD'];
+      const fakeSnapshot = {
+        assets: tickers.map((ticker) => ({ ticker })),
+        byTicker: Object.fromEntries(tickers.map((ticker) => [ticker, { ticker }])),
+        sectors: [],
+        fx: { rate: 1.29, asOf: '2026-01-02' },
+        macro: { riskFree: { USD: { yield: 0.05, status: 'fresh' }, SGD: { yield: 0.023, status: 'fresh' } } },
+      };
+      const loaded = (query = '') => reduce(createInitialState(query), actions.snapshotLoaded(fakeSnapshot));
+
+      test('tab, range and portfolio weights round-trip through the URL', () => {
+        const query = '?view=portfolio&range=3m&p=AAPL:40,D05.SI:35,BTC-USD:25';
+        const view = parseUrlState(query);
+        expect(view.view).toBe('portfolio');
+        expect(view.range).toBe('3m');
+        expect(view.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 40 }, { ticker: 'D05.SI', weight: 35 }, { ticker: 'BTC-USD', weight: 25 }]);
+        expect(serializeUrlState(view)).toBe(query);
+      });
+      test('defaults are omitted, so the default view still has an empty query string', () => {
+        const state = createInitialState('');
+        expect(state.view).toBe('compare');
+        expect(state.range).toBe('1y');
+        expect(state.portfolio.weights).toBeNull();
+        expect(serializeUrlState(state)).toBe('');
+        expect(serializeUrlState(reduce(state, actions.setView('leaderboard')))).toBe('?view=leaderboard');
+        expect(serializeUrlState(reduce(state, actions.setRange('6m')))).toBe('?range=6m');
+      });
+      test('malformed tab, range and weights fall back safely', () => {
+        const view = parseUrlState('?view=admin&range=10y&p=aapl:150,<x>:5,NVDA:abc,MSFT:-3,AAPL:9,JPM:12.345');
+        expect(view.view).toBe('compare');
+        expect(view.range).toBe('1y');
+        // 150 is capped at 100, the script tag and the non-number are dropped, −3 is floored at 0,
+        // the second AAPL is a duplicate, and 12.345 is rounded to two decimals.
+        expect(view.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 100 }, { ticker: 'MSFT', weight: 0 }, { ticker: 'JPM', weight: 12.35 }]);
+        expect(parseUrlState('?p=').portfolio.weights).toBeNull();
+        expect(parseUrlState('?p=garbage').portfolio.weights).toBeNull();
+      });
+      test('a URL can name at most eight portfolio assets', () => {
+        const query = `?p=${tickers.map((ticker) => `${ticker}:10`).join(',')}`;
+        expect(parseUrlState(query).portfolio.weights.length).toBe(8);
+      });
+      test('equal weights always add up to exactly 100', () => {
+        for (const count of [1, 2, 3, 6, 7, 8]) {
+          const weights = storeModule.equalWeights(tickers.slice(0, count));
+          const total = weights.reduce((sum, entry) => sum + entry.weight, 0);
+          expect(Math.round(total * 100) / 100).toBe(100);
+        }
+        expect(storeModule.equalWeights(['A', 'B', 'C']).map((entry) => entry.weight)).toEqual([33.33, 33.33, 33.34]);
+      });
+      test('with no explicit weights the portfolio follows the compared assets, equally', () => {
+        const state = loaded();
+        expect(storeModule.hasCustomPortfolio(state)).toBeFalse();
+        expect(storeModule.selectPortfolioWeights(state).map((entry) => entry.ticker)).toEqual(['AAPL', 'D05.SI', 'BTC-USD']);
+        const fewer = reduce(state, actions.toggleTicker('BTC-USD'));
+        expect(storeModule.selectPortfolioWeights(fewer).map((entry) => entry.weight)).toEqual([50, 50]);
+      });
+      test('changing one weight makes the portfolio explicit and puts it in the URL', () => {
+        const state = reduce(loaded(), actions.setPortfolioWeight('AAPL', 60));
+        expect(storeModule.hasCustomPortfolio(state)).toBeTrue();
+        expect(state.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 60 }, { ticker: 'D05.SI', weight: 33.33 }, { ticker: 'BTC-USD', weight: 33.34 }]);
+        expect(serializeUrlState(state)).toBe('?p=AAPL:60,D05.SI:33.33,BTC-USD:33.34');
+        expect(reduce(state, actions.setPortfolioWeight('AAPL', 60))).toBe(state); // no change, same object
+        expect(reduce(state, actions.setPortfolioWeight('AAPL', 'abc'))).toBe(state);
+        expect(reduce(state, actions.setPortfolioWeight('TSLA', 10))).toBe(state); // not in the portfolio
+        expect(reduce(state, actions.setPortfolioWeight('AAPL', 250)).portfolio.weights[0].weight).toBe(100);
+      });
+      test('a new asset joins at 0% so the existing allocation is untouched', () => {
+        const state = reduce(reduce(loaded(), actions.setPortfolioWeight('AAPL', 60)), actions.addPortfolioAsset('nvda'));
+        expect(state.portfolio.weights[3]).toEqual({ ticker: 'NVDA', weight: 0 });
+        expect(state.portfolio.weights[0].weight).toBe(60);
+        expect(reduce(state, actions.addPortfolioAsset('NVDA'))).toBe(state); // already there
+        expect(reduce(state, actions.addPortfolioAsset('TSLA'))).toBe(state); // not in the watchlist
+        const removed = reduce(state, actions.removePortfolioAsset('D05.SI'));
+        expect(removed.portfolio.weights.map((entry) => entry.ticker)).toEqual(['AAPL', 'BTC-USD', 'NVDA']);
+      });
+      test('a portfolio holds at most eight assets; a ninth raises a notice', () => {
+        let state = loaded();
+        for (const ticker of ['NVDA', 'MSFT', 'JPM', 'O39.SI', 'GOOGL']) state = reduce(state, actions.addPortfolioAsset(ticker));
+        expect(state.portfolio.weights.length).toBe(8);
+        const full = reduce(state, actions.addPortfolioAsset('AMZN'));
+        expect(full.portfolio.weights.length).toBe(8);
+        expect(full.notice.text).toMatch(/up to 8/);
+      });
+      test('normalise scales any weights to exactly 100, equalise splits evenly, reset follows the selection again', () => {
+        let state = loaded();
+        state = reduce(state, actions.setPortfolioWeight('AAPL', 50));
+        state = reduce(state, actions.setPortfolioWeight('D05.SI', 50));
+        state = reduce(state, actions.setPortfolioWeight('BTC-USD', 50)); // total 150
+        const normalised = reduce(state, actions.normalisePortfolio());
+        expect(normalised.portfolio.weights.map((entry) => entry.weight)).toEqual([33.34, 33.33, 33.33]);
+        expect(Math.round(normalised.portfolio.weights.reduce((sum, entry) => sum + entry.weight, 0) * 100) / 100).toBe(100);
+        expect(reduce(normalised, actions.normalisePortfolio())).toBe(normalised); // already 100
+        expect(reduce(state, actions.equalisePortfolio()).portfolio.weights.map((entry) => entry.weight)).toEqual([33.33, 33.33, 33.34]);
+        const reset = reduce(state, actions.resetPortfolio());
+        expect(reset.portfolio.weights).toBeNull();
+        expect(serializeUrlState(reset)).toBe('');
+      });
+      test('portfolio tickers that are not in the snapshot are dropped when it loads', () => {
+        const state = loaded('?p=AAPL:50,FAKE:30,NVDA:20');
+        expect(state.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 50 }, { ticker: 'NVDA', weight: 20 }]);
+        expect(loaded('?p=FAKE:100').portfolio.weights).toBeNull();
+      });
+      test('weights are percentages: no amount of money can reach the URL through the portfolio', () => {
+        let state = reduce(loaded(), actions.setAccount('equity', 987654));
+        state = reduce(state, actions.setPortfolioWeight('AAPL', 70));
+        expect(serializeUrlState(state).includes('987654')).toBeFalse();
+        for (const entry of state.portfolio.weights) expect(entry.weight).toBeAtMost(100);
+      });
+      test('the risk-free rate follows the display currency', () => {
+        const state = loaded();
+        expect(storeModule.selectRiskFree(state).yield).toBe(0.05);
+        expect(storeModule.selectRiskFree(reduce(state, actions.setCurrency('SGD'))).yield).toBe(0.023);
+        expect(storeModule.selectRiskFree(createInitialState(''))).toBeNull();
+      });
+      test('compute reducer: a reply is accepted only for the key that is currently running', () => {
+        let state = createInitialState('');
+        expect(state.compute.monteCarlo).toEqual({ key: null, status: 'idle', result: null, error: null, ms: null, mode: null });
+        state = reduce(state, actions.computeStarted('monteCarlo', 'k1'));
+        expect(reduce(state, actions.computeFinished('monteCarlo', 'k0', 'stale'))).toBe(state);
+        expect(reduce(state, actions.computeFailed('monteCarlo', 'k0', 'stale failure'))).toBe(state);
+        state = reduce(state, actions.computeFinished('monteCarlo', 'k1', 'fresh', 12, 'worker'));
+        expect(state.compute.monteCarlo).toEqual({ key: 'k1', status: 'done', result: 'fresh', error: null, ms: 12, mode: 'worker' });
+        expect(reduce(state, actions.computeFinished('monteCarlo', 'k1', 'duplicate reply'))).toBe(state); // already done
+        expect(reduce(state, actions.computeStarted('nonsense', 'k'))).toBe(state);
+        expect(state.compute.portfolio.status).toBe('idle'); // the other job is untouched
+      });
+      test('changing tab, range or weights updates the address bar; compute state never does', () => {
+        const store = storeModule.createStore(loaded(), { syncUrl: false });
+        let viewNotifications = 0;
+        store.subscribe(() => { viewNotifications += 1; }, (state) => serializeUrlState(state));
+        store.dispatch(actions.computeStarted('portfolio', 'k'));
+        store.dispatch(actions.computeFinished('portfolio', 'k', { big: 'result' }));
+        expect(viewNotifications).toBe(0);
+        store.dispatch(actions.setView('portfolio'));
+        store.dispatch(actions.setRange('1m'));
+        store.dispatch(actions.setPortfolioWeight('AAPL', 10));
+        expect(viewNotifications).toBe(3);
+        expect(serializeUrlState(store.getState()).includes('result')).toBeFalse();
+      });
+    });
+
+    /* ================================================================== */
+    /* 18. Time-range slicing                                              */
+    /* ================================================================== */
+
+    suite('snapshotService: time-range slicing', () => {
+      const dates = isoDates(400, '2025-01-01');
+      const series = { dates, open: dates.map((_, i) => i), high: dates.map((_, i) => i + 1), low: dates.map((_, i) => i - 1), close: dates.map((_, i) => i + 0.5), volume: dates.map(() => 10) };
+      const cutoffFor = (days) => new Date(Date.parse(`${dates[399]}T00:00:00Z`) - days * 86400000).toISOString().slice(0, 10);
+
+      test('each range keeps the candles from that many calendar days before the last one', () => {
+        for (const [range, days] of [['1m', 30], ['3m', 91], ['6m', 182]]) {
+          const sliced = snapshotService.sliceSeries(series, range);
+          expect(sliced.dates[0]).toBe(cutoffFor(days));
+          expect(sliced.dates.length).toBe(days + 1); // daily data: the cut-off day through the last day
+          expect(sliced.dates[sliced.dates.length - 1]).toBe(dates[399]);
+          expect(sliced.close.length).toBe(sliced.dates.length);
+          expect(sliced.close[sliced.close.length - 1]).toBe(399.5);
+        }
+      });
+      test('"1y" and unknown ranges return the series unchanged, and the input is never mutated', () => {
+        expect(snapshotService.sliceSeries(series, '1y')).toBe(series);
+        expect(snapshotService.sliceSeries(series, 'forever')).toBe(series);
+        snapshotService.sliceSeries(series, '1m');
+        expect(series.dates.length).toBe(400);
+        expect(snapshotService.sliceSeries(null, '1m')).toBeNull();
+      });
+      test('weekday-only data keeps fewer candles than daily data over the same span', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const month = snapshotService.sliceSeries(asset.series, '1m');
+          expect(month.dates.length).toBeAtMost(31);
+          expect(month.dates.length).toBeAtLeast(asset.assetClass === 'crypto' ? 30 : 15);
+          expect(month.dates[month.dates.length - 1]).toBe(asset.quote.asOf);
+          expect(snapshotService.sliceSeries(asset.series, '6m').dates.length).toBeGreaterThan(month.dates.length);
+        }
+      });
+    });
+
+    /* ================================================================== */
     /* Runner and report                                                   */
     /* ================================================================== */
 
@@ -1757,6 +2765,7 @@
     }
 
     async function runAll() {
+      window.__quantlensStarted = true;
       resultsRoot.replaceChildren();
       summary.dataset.result = 'running';
       headline.textContent = 'Running tests…';
@@ -1799,8 +2808,9 @@
         : `${totals.failed} of ${totals.total} tests failed`;
       meta.textContent = `${suites.length} suites · ${totals.total} tests · ${totals.skipped ? `${totals.skipped} skipped · ` : ''}${totals.durationMs} ms`;
       document.title = `${passedAll ? '✓' : '✗'} ${passedAll ? totals.passed : totals.failed} ${passedAll ? 'passed' : 'failed'} · QuantLens engine tests`;
-      // For automation: read this object from the console or a headless browser.
+      // For automation: read this object from the console, or let the CI runner collect it.
       window.__QUANTLENS_TESTS__ = Object.freeze(totals);
+      window.__quantlensReport(totals);
       return totals;
     }
 

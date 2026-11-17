@@ -1,0 +1,14 @@
+# Dependencies of scripts/fetch_fundamentals.py (the browser needs none).
+#
+#   pip install -r scripts/requirements.txt
+#
+# yfinance is deliberately NOT pinned to an exact version. When Yahoo changes its
+# endpoints the fix ships in a new yfinance release, and a stale pin would break
+# the daily refresh. A lower bound keeps the API this script was written against;
+# schema validation and the browser test gate catch any drift in what it returns.
+yfinance>=1.8
+
+# Pinned: these define what the stored numbers mean. A different lexicon or model
+# version would silently change sentiment scores and forecasts between runs.
+vaderSentiment==3.3.2
+prophet==1.5.0

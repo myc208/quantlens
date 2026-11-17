@@ -422,6 +422,66 @@ const ENTRIES = {
     healthy: 'With zero drift and a 2R target, roughly two in three paths that reach a level hit the stop first. That is expected.',
     risky: 'Much higher than that suggests the stop is too tight for this asset\'s volatility.',
   },
+
+  /* ---------------- News and forecast (context, never part of the verdict) ---------------- */
+  headlineTone: {
+    term: 'Headline tone',
+    what: 'The average wording of the three most recent unique news stories, from −1 (very negative) to +1 (very positive). Syndicated copies of the same story are counted once.',
+    why: 'It tells you whether the latest coverage reads as good or bad news, so you know to go and read it. It is context, not a signal.',
+    healthy: '+0.05 or more: the recent headlines use positive language.',
+    risky: '−0.05 or less: negative language. A general word list scores it, so financial phrases are often misread and many headlines score zero.',
+  },
+  forecast30d: {
+    term: '30-day projection',
+    what: 'Where the price would be in 30 calendar days if its recent trend and weekly pattern simply continued, with a band the model expects most outcomes to fall in.',
+    why: 'It makes the current trend concrete. It is an extrapolation, not a prediction: the model sees only past prices and knows nothing about news, earnings or rates.',
+    healthy: 'A projection whose track record beats "the price will not move" is at least adding a little information.',
+    risky: 'A projection that did no better than assuming no change should be ignored. Always read it next to its track record.',
+  },
+  forecastBacktest: {
+    term: 'Projection track record',
+    what: 'How wrong the same model was over the last 30 days: it is refitted with those days hidden, and its projection is compared with what actually happened.',
+    why: 'A forecast without a measured error is just a line. This shows the size of the model\'s recent miss next to the miss from simply assuming no change.',
+    healthy: 'An error below the "no change" error.',
+    risky: 'An error at or above the "no change" error: the model added nothing. One 30-day test is a small sample either way.',
+  },
+
+  /* ---------------- Portfolio ---------------- */
+  portfolioReturn: {
+    term: 'Historical return (annualised)',
+    what: 'The average daily return of the portfolio at your weights over the selected period, scaled up to one year.',
+    why: 'It shows what this mix would have earned. It is a description of the past, not an expectation: one year of returns is a very noisy guide to the next.',
+    healthy: 'Comfortably above the risk-free rate.',
+    risky: 'Below the risk-free rate: government bonds would have paid more with far less risk.',
+  },
+  portfolioVolatility: {
+    term: 'Portfolio volatility',
+    what: 'How widely the portfolio\'s yearly return would typically swing, calculated from each asset\'s own volatility and from how the assets move together.',
+    why: 'It is the portfolio\'s risk in one number. When assets do not move in step it is lower than the weighted average of their individual volatilities; that gap is diversification.',
+    healthy: 'Below about 15% a year.',
+    risky: 'Above about 30% a year: large swings in both directions are normal.',
+  },
+  sharpeRatio: {
+    term: 'Sharpe ratio',
+    what: 'The portfolio\'s return above the risk-free rate, divided by its volatility: how much extra return was earned for each unit of risk.',
+    why: 'It lets you compare portfolios with different amounts of risk on one scale. A higher return is only better if it was not bought with proportionally more risk.',
+    healthy: '1.0 or more is strong; 0.5 to 1.0 is acceptable.',
+    risky: 'Below 0: the portfolio returned less than government bonds. Built on one year of history, the ratio can change sharply from month to month.',
+  },
+  diversificationRatio: {
+    term: 'Diversification ratio',
+    what: 'The weighted average of the assets\' individual volatilities divided by the portfolio\'s volatility.',
+    why: 'It measures how much risk combining these assets removed. At exactly 1 the assets move as one and combining them achieved nothing.',
+    healthy: '1.2 or more: the mix removes a meaningful share of risk.',
+    risky: 'Close to 1: effectively a single bet, however many names it holds.',
+  },
+  riskFreeRate: {
+    term: 'Risk-free rate',
+    what: 'The yield on a 10-year government bond in the portfolio\'s currency: US Treasuries for USD, Singapore Government Securities for SGD.',
+    why: 'It is the return available for taking almost no risk, so it is the bar a risky portfolio has to clear. The Sharpe ratio measures return above it.',
+    healthy: 'A fresh value from today\'s data.',
+    risky: 'A value marked "proxy" is another country\'s yield standing in because the real one could not be fetched; the Sharpe ratio is then approximate.',
+  },
 };
 
 const FALLBACK = Object.freeze({
