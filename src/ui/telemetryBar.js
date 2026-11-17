@@ -1,7 +1,7 @@
 /**
  * telemetryBar.js: the sticky bar at the top of the page.
  *
- *   [brand] [BTC live] [ETH live] [feed status] [USD/SGD] [data age]   [USD|SGD] [Guided|Pro]
+ *   [brand] [BTC live] [ETH live] [feed status] [USD/SGD] [US 10Y] [SG 10Y] [data age]   [USD|SGD] [Guided|Pro]
  *
  * It tells the user, at all times, where every number is coming from: which
  * feed is live, which has fallen back, how old the daily snapshot is and which
@@ -132,6 +132,35 @@ export function mountTelemetryBar(root, app) {
       </span>`;
   }
 
+  /** The 10-year government yields used as the risk-free rate in the Sharpe ratio. */
+  function yieldTicks(state) {
+    const rates = state.snapshot.macro ? state.snapshot.macro.riskFree : null;
+    if (!rates) return '';
+    const labels = { USD: 'US 10Y', SGD: 'SG 10Y' };
+    const notes = {
+      fresh: 'Used as the risk-free rate for portfolios measured in this currency.',
+      stale: 'The latest reading could not be fetched, so an older one is shown and used.',
+      proxy: 'No reading was available for this currency, so the US 10-year yield stands in for it.',
+    };
+    return Object.entries(labels).map(([currency, label]) => {
+      const rate = rates[currency];
+      if (!rate || !isNum(rate.yield)) {
+        return `
+          <span class="tick" title="${h.esc(`No ${label} yield is available. The Sharpe ratio in ${currency} will show N/A.`)}">
+            <span class="tick__label">${label}</span>
+            <span class="tick__price">N/A</span>
+          </span>`;
+      }
+      const meta = [rate.status === 'proxy' ? 'US proxy' : rate.status === 'stale' ? 'older' : '', rate.asOf ? h.shortDate(rate.asOf) : ''].filter(Boolean).join(' · ');
+      return `
+        <span class="tick"${rate.status === 'fresh' ? '' : ' data-freshness="aging"'} title="${h.esc(`${rate.name ?? label}. ${notes[rate.status] ?? ''}`)}">
+          <span class="tick__label">${label}</span>
+          <span class="tick__price">${formatPercent(rate.yield, 2)}</span>
+          ${meta ? `<span class="tick__meta">${h.esc(meta)}</span>` : ''}
+        </span>`;
+    }).join('');
+  }
+
   function dataTick(state) {
     const { snapshot } = state;
     const generated = Date.parse(snapshot.generatedAt);
@@ -170,6 +199,7 @@ export function mountTelemetryBar(root, app) {
       ...crypto.map((asset) => cryptoTick(state, asset)),
       crypto.length ? feedMarkup(state) : '',
       fxTick(state),
+      yieldTicks(state),
       dataTick(state),
     ].join('');
   }

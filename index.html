@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>QuantLens · Multi-Asset Comparison Workstation</title>
-  <meta name="description" content="Compare up to three US stocks, Singapore stocks and crypto assets side by side, with every indicator, score and position size traced back to its arithmetic.">
+  <meta name="description" content="Compare US stocks, Singapore stocks and crypto side by side, rank a watchlist and test a portfolio allocation, with every indicator, score, ratio and position size traced back to its arithmetic.">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#fcfcfb" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1a1a19" media="(prefers-color-scheme: dark)">
@@ -16,7 +16,7 @@
   <link rel="stylesheet" href="./styles/guided.css">
 </head>
 <body data-mode="guided" data-status="loading" data-drawer="closed">
-  <a class="skip-link" href="#workspace">Skip to the comparison</a>
+  <a class="skip-link" href="#workspace">Skip to the main content</a>
 
   <!-- Telemetry bar: live crypto ticks, USD/SGD, data age, currency and mode switches. -->
   <header id="telemetry-bar" class="telemetry" aria-label="Market telemetry and display settings">
@@ -29,11 +29,14 @@
     </div>
   </header>
 
+  <!-- View tabs (Compare | Leaderboard | Portfolio), the time-range slicer and the command-palette button. -->
+  <nav id="app-tabs" class="app-tabs" aria-label="Views, time range and search"></nav>
+
   <div class="app-shell">
     <!-- Screener: filters and the asset list (pick up to three). -->
     <aside id="screener" class="screener" aria-label="Screener: filter and pick assets"></aside>
 
-    <!-- Workspace: status messages and the comparison matrix. -->
+    <!-- Workspace: status messages and one tab panel per view. -->
     <main id="workspace" class="workspace" tabindex="-1" aria-busy="true">
       <div id="app-status" class="app-status" role="status" aria-live="polite">
         <div class="status-card">
@@ -42,7 +45,9 @@
           <p class="status-card__text">Prices and fundamentals are read from a file that is refreshed once a day.</p>
         </div>
       </div>
-      <section id="comparison-matrix" class="matrix" aria-labelledby="matrix-title" hidden></section>
+      <section id="comparison-matrix" class="matrix view" role="tabpanel" aria-labelledby="tab-compare" tabindex="-1" hidden></section>
+      <section id="leaderboard" class="view" role="tabpanel" aria-labelledby="tab-leaderboard" tabindex="-1" hidden></section>
+      <section id="portfolio" class="view" role="tabpanel" aria-labelledby="tab-portfolio" tabindex="-1" hidden></section>
     </main>
   </div>
 
@@ -52,7 +57,8 @@
       Verdicts and position sizes are produced by fixed, published rules so that you can check every step. They do not know your circumstances.
     </p>
     <p class="app-footer__sources">
-      Daily candles and fundamentals: Yahoo Finance via yfinance, refreshed by GitHub Actions.
+      Daily candles, fundamentals, headlines and the US 10-year yield: Yahoo Finance, refreshed by GitHub Actions.
+      Singapore 10-year yield: MAS. Projections: Prophet, fitted in the same job and shown with their own track record.
       Live crypto: Binance public market data. USD/SGD: Frankfurter (ECB daily reference rate).
       Nothing you enter is stored or sent anywhere.
     </p>
@@ -64,6 +70,9 @@
 
   <!-- Risk sandbox: native modal dialog (focus trap and Esc handled by the browser). -->
   <dialog id="risk-sandbox" class="modal" aria-labelledby="sandbox-title"></dialog>
+
+  <!-- Command palette (Ctrl/Cmd + K): native modal dialog with a combobox and listbox inside. -->
+  <dialog id="command-palette" class="palette" aria-label="Command palette"></dialog>
 
   <!-- Transient notices (for example "You can compare up to 3 assets"). -->
   <div id="notice-region" class="notice-region" role="status" aria-live="polite" aria-atomic="true"></div>

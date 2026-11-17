@@ -742,6 +742,194 @@ function traceTechnicalScore(ctx, metrics) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Window statistics (the time slicer)                                 */
+/* ------------------------------------------------------------------ */
+
+const MIN_WINDOW_RETURNS = 10;
+
+/**
+ * Statistics for one time-range window: 1 month, 3 months, 6 months or 1 year.
+ *
+ * These describe the chosen window only and change with the time slicer.
+ * Moving averages, MACD, RSI, ATR and the verdict are NOT recomputed on a
+ * window: they need a warm-up that a short slice cannot give, so they always
+ * use the full history (see analyzeTechnicals).
+ *
+ *   Period return   Close(last) ÷ Close(first) − 1
+ *   Volatility      stdev of daily log returns × √252 (√365 for crypto)
+ *   Max drawdown    the largest fall from a running peak to a later low
+ *
+ * @param {object} asset normalised asset (ticker, currency, assetClass)
+ * @param {{dates:string[], close:number[]}} series the window, already sliced
+ * @param {string} [rangeLabel] human-readable name of the window, for traces
+ */
+export function analyzeWindow(asset, series, rangeLabel = '1 year') {
+  const close = series && Array.isArray(series.close) ? series.close : [];
+  const dates = series && Array.isArray(series.dates) ? series.dates : [];
+  const count = close.length;
+  const { currency } = asset;
+  const periods = TECH_CONFIG.annualisation[asset.assetClass] ?? TECH_CONFIG.annualisation.equity;
+  const first = close[0];
+  const last = close[count - 1];
+  const from = dates[0] ?? null;
+  const to = dates[count - 1] ?? null;
+  const meta = { range: rangeLabel, from, to, observations: count };
+  const metrics = {};
+
+  /* ---- period return ---- */
+  const periodReturn = count >= 2 ? safeDiv(last - first, first) : null;
+  if (periodReturn === null) {
+    metrics.periodReturn = notAvailable({ id: 'periodReturn', label: 'Period return', unit: 'pct', meta, formula: 'Return = Last close ÷ First close − 1', reason: 'At least two candles are needed to measure a return.' });
+  } else {
+    metrics.periodReturn = traced({
+      id: 'periodReturn', label: 'Period return', value: periodReturn, unit: 'pct', meta,
+      tone: periodReturn > 0 ? 'healthy' : periodReturn < 0 ? 'caution' : 'neutral',
+      formula: 'Return = Last close ÷ First close − 1',
+      rawInputs: [
+        input('First close in the window', first, currency, 'candles', from),
+        input('Last close in the window', last, currency, 'candles', to),
+      ],
+      steps: [
+        step('Change over the window', `${fmtN(last)} − ${fmtN(first)}`, last - first),
+        step('As a share of the starting price', `${fmtN(last - first)} ÷ ${fmtN(first)}`, fmtPct(periodReturn)),
+      ],
+      interpretation: interpretation(
+        `Over the last ${rangeLabel} (${from} to ${to}) the price ${periodReturn >= 0 ? 'rose' : 'fell'} ${fmtPct(Math.abs(periodReturn))}.`,
+        [threshold('Above 0%', 'Gained over the window', 'healthy'), threshold('Below 0%', 'Lost over the window', 'caution')],
+        'Prices are adjusted for splits and dividends, so this is close to a total return. A different window can tell a very different story.',
+      ),
+    });
+  }
+
+  /* ---- volatility ---- */
+  const returns = logReturns(close);
+  const daily = returns && returns.length >= MIN_WINDOW_RETURNS ? stdev(returns) : null;
+  const volatility = isNum(daily) ? daily * Math.sqrt(periods) : null;
+  if (volatility === null) {
+    metrics.periodVolatility = notAvailable({
+      id: 'periodVolatility', label: 'Volatility (annualised)', unit: 'pct', meta,
+      formula: `Volatility = standard deviation of daily log returns × √${periods}`,
+      reason: `At least ${MIN_WINDOW_RETURNS} daily returns are needed; this window has ${returns ? returns.length : 0}.`,
+    });
+  } else {
+    let tone = 'caution';
+    if (volatility < 0.25) tone = 'healthy';
+    else if (volatility >= 0.5) tone = 'risky';
+    metrics.periodVolatility = traced({
+      id: 'periodVolatility', label: 'Volatility (annualised)', value: volatility, unit: 'pct', tone,
+      meta: { ...meta, dailyVolatility: daily, returns: returns.length },
+      formula: `Volatility = standard deviation of daily log returns × √${periods}`,
+      rawInputs: [
+        input('Daily log returns in the window', returns.length, 'observations', `ln(Cₜ ÷ Cₜ₋₁) for ${from} to ${to}`, to),
+        input('Trading periods per year', periods, 'days', asset.assetClass === 'crypto' ? 'crypto trades every day' : 'stock-market convention'),
+      ],
+      steps: [
+        step('Sample standard deviation of the daily log returns', `stdev(${returns.length} returns)`, fmtPct(daily, 3)),
+        step('Scale from one day to one year', `${fmtPct(daily, 3)} × √${periods}`, fmtPct(volatility)),
+      ],
+      interpretation: interpretation(
+        `Over the last ${rangeLabel} the price moved at a pace equal to about ${fmtPct(volatility, 0)} a year.`,
+        [threshold('Below 25%', 'Stable', 'healthy'), threshold('25% – 50%', 'Elevated', 'caution'), threshold('Above 50%', 'High', 'risky')],
+        returns.length < 40
+          ? `Estimated from only ${returns.length} days, so it is a rough figure. Volatility also clusters: calm and violent stretches both tend to persist.`
+          : 'Volatility clusters: calm stretches and violent stretches both tend to persist.',
+      ),
+    });
+  }
+
+  /* ---- maximum drawdown ---- */
+  if (count < 2 || !close.every((price) => isNum(price) && price > 0)) {
+    metrics.maxDrawdown = notAvailable({ id: 'maxDrawdown', label: 'Maximum drawdown', unit: 'pct', meta, formula: 'Drawdown = (Low − Earlier peak) ÷ Earlier peak, at its worst', reason: 'At least two candles are needed to measure a drawdown.' });
+  } else {
+    let peakIndex = 0;
+    let worst = 0;
+    let worstPeak = 0;
+    let worstTrough = 0;
+    for (let i = 1; i < count; i += 1) {
+      if (close[i] > close[peakIndex]) peakIndex = i;
+      const drawdown = close[i] / close[peakIndex] - 1;
+      if (drawdown < worst) {
+        worst = drawdown;
+        worstPeak = peakIndex;
+        worstTrough = i;
+      }
+    }
+    let tone = 'risky';
+    if (worst >= -0.1) tone = 'healthy';
+    else if (worst >= -0.25) tone = 'caution';
+    const recovery = worst < 0 ? 1 / (1 + worst) - 1 : 0;
+    metrics.maxDrawdown = traced({
+      id: 'maxDrawdown', label: 'Maximum drawdown', value: worst, unit: 'pct', tone,
+      meta: { ...meta, peakDate: dates[worstPeak], troughDate: dates[worstTrough], peak: close[worstPeak], trough: close[worstTrough], currency },
+      formula: 'Drawdown = (Low − Earlier peak) ÷ Earlier peak, at its worst over the window',
+      rawInputs: worst < 0
+        ? [
+          input('Peak before the fall', close[worstPeak], currency, 'highest close so far', dates[worstPeak]),
+          input('Lowest close after that peak', close[worstTrough], currency, 'candles', dates[worstTrough]),
+        ]
+        : [input('Closes in the window', count, 'candles', `${from} to ${to}`, to)],
+      steps: worst < 0
+        ? [
+          step('Track the highest close so far on each day, and the fall from it', 'Close ÷ running peak − 1', `${count} days`),
+          step('The largest fall', `${fmtN(close[worstTrough])} ÷ ${fmtN(close[worstPeak])} − 1`, fmtPct(worst)),
+          step('Gain needed from the low to get back to the peak', `1 ÷ (1 − ${fmtPct(Math.abs(worst))}) − 1`, fmtPct(recovery)),
+        ]
+        : [step('The close never fell below an earlier close in this window', 'Close ÷ running peak − 1', fmtPct(0))],
+      interpretation: interpretation(
+        worst < 0
+          ? `The worst fall in the last ${rangeLabel} was ${fmtPct(Math.abs(worst))}, from ${dates[worstPeak]} to ${dates[worstTrough]}. A holder who bought at that peak needed a ${fmtPct(recovery)} gain to break even.`
+          : `The price made no fall from a previous high during the last ${rangeLabel}.`,
+        [threshold('0% to −10%', 'Shallow', 'healthy'), threshold('−10% to −25%', 'Significant', 'caution'), threshold('Worse than −25%', 'Severe', 'risky')],
+        'Drawdown is what volatility feels like to a holder. It uses daily closes, so falls within a single day are not captured.',
+      ),
+    });
+  }
+
+  /* ---- position within the window's own range ---- */
+  const rangeFormula = 'Position = (Last close − Lowest close) ÷ (Highest close − Lowest close)';
+  let lowIndex = 0;
+  let highIndex = 0;
+  for (let i = 1; i < count; i += 1) {
+    if (close[i] < close[lowIndex]) lowIndex = i;
+    if (close[i] > close[highIndex]) highIndex = i;
+  }
+  const position = count >= 2 ? safeDiv(last - close[lowIndex], close[highIndex] - close[lowIndex]) : null;
+  if (position === null) {
+    metrics.periodRange = notAvailable({ id: 'periodRange', label: 'Position in period range', unit: 'pct', meta, formula: rangeFormula, reason: 'The price did not move within this window, so a position within its range is undefined.' });
+  } else {
+    let tone = 'caution';
+    if (position >= 0.5) tone = 'healthy';
+    else if (position < 0.25) tone = 'risky';
+    metrics.periodRange = traced({
+      id: 'periodRange', label: 'Position in period range', value: position, unit: 'pct', tone,
+      meta: { ...meta, currency, high: close[highIndex], low: close[lowIndex], highDate: dates[highIndex], lowDate: dates[lowIndex] },
+      formula: rangeFormula,
+      rawInputs: [
+        input('Last close', last, currency, 'last candle', to),
+        input('Highest close in the window', close[highIndex], currency, `${from} to ${to}`, dates[highIndex]),
+        input('Lowest close in the window', close[lowIndex], currency, `${from} to ${to}`, dates[lowIndex]),
+      ],
+      steps: [
+        step('Distance above the low', `${fmtN(last)} − ${fmtN(close[lowIndex])}`, last - close[lowIndex]),
+        step('Width of the range', `${fmtN(close[highIndex])} − ${fmtN(close[lowIndex])}`, close[highIndex] - close[lowIndex]),
+        step('Position within the range', `${fmtN(last - close[lowIndex])} ÷ ${fmtN(close[highIndex] - close[lowIndex])}`, fmtPct(position)),
+      ],
+      interpretation: interpretation(
+        `The price sits ${fmtPct(position, 0)} of the way from its lowest close (${fmtN(close[lowIndex])}) to its highest close (${fmtN(close[highIndex])}) of the last ${rangeLabel}.`,
+        [
+          threshold('50% – 100%', 'Upper half of the range', 'healthy'),
+          threshold('25% – 50%', 'Lower half', 'caution'),
+          threshold('0% – 25%', 'Near the lows of the window', 'risky'),
+        ],
+        'This uses daily closes inside the selected time range. The 52-week range position in the Technical section always uses the full year, and it is the one that feeds the verdict.',
+      ),
+    });
+  }
+
+  return { ticker: asset.ticker, range: rangeLabel, from, to, observations: count, metrics };
+}
+
+/* ------------------------------------------------------------------ */
 /* Public entry point                                                  */
 /* ------------------------------------------------------------------ */
 

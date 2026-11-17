@@ -29,7 +29,7 @@ import {
 import { mulberry32 } from './monteCarloEngine.js';
 
 export const PORTFOLIO_CONFIG = Object.freeze({
-  minObservations: 20,
+  minObservations: 15, // a 1-month window of a stock has about 20 daily returns
   maxAssets: 8,
   annualisation: Object.freeze({ equity: 252, crypto: 365 }),
   frontierSamples: 2000,
@@ -369,7 +369,7 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
         SHARPE_THRESHOLDS,
         riskFree.status === 'proxy'
           ? 'The risk-free rate is a US proxy for Singapore, which understates this ratio. And like the return it is built on, the ratio describes the past, not the future.'
-          : 'Built on one year of history, this ratio can change sharply from one month to the next. It rewards smoothness, and says nothing about rare large losses.',
+          : `Built on only ${observations} days of history, this ratio can change sharply from one month to the next${observations < 120 ? ', and a short window exaggerates it: a few good weeks annualise into a very large number' : ''}. It rewards smoothness, and says nothing about rare large losses.`,
       ),
       dependsOn: sharpeDependsOn,
     });

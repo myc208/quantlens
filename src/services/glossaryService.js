@@ -423,6 +423,36 @@ const ENTRIES = {
     risky: 'Much higher than that suggests the stop is too tight for this asset\'s volatility.',
   },
 
+  /* ---------------- Time-range window (follows the time slicer) ---------------- */
+  periodReturn: {
+    term: 'Period return',
+    what: 'How much the price changed from the first to the last day of the selected time range.',
+    why: 'It is the plainest answer to "how has this done lately?". Changing the range shows how much that answer depends on where you start counting.',
+    healthy: 'Positive over several ranges, not only the shortest.',
+    risky: 'Negative over the longer ranges: the weakness is not just a recent dip.',
+  },
+  periodVolatility: {
+    term: 'Volatility (selected range)',
+    what: 'How widely daily returns scattered over the selected time range, scaled to one year so that ranges can be compared.',
+    why: 'Risk is not constant. Comparing 1 month with 1 year shows whether the asset has recently become calmer or rougher.',
+    healthy: 'Below about 25% a year for a stock.',
+    risky: 'Above about 50%, or much higher over the short range than the long one. Short ranges give a rough estimate.',
+  },
+  periodRange: {
+    term: 'Position in period range',
+    what: 'Where the latest close sits between the lowest and highest close of the selected time range: 0% is the low, 100% is the high.',
+    why: 'It shows at a glance whether the price is near the top or the bottom of its recent range. It changes with the time range you pick; the verdict never does.',
+    healthy: 'In the upper half of the range.',
+    risky: 'In the bottom quarter, close to the lows of the window.',
+  },
+  maxDrawdown: {
+    term: 'Maximum drawdown',
+    what: 'The largest fall from a high to a later low within the selected time range.',
+    why: 'It is the loss a holder actually sat through at the worst moment, which is what tests whether you would have held on. A 50% fall needs a 100% gain to recover.',
+    healthy: 'Shallower than about −10%.',
+    risky: 'Deeper than about −25%. It uses daily closes, so intraday falls were larger.',
+  },
+
   /* ---------------- News and forecast (context, never part of the verdict) ---------------- */
   headlineTone: {
     term: 'Headline tone',

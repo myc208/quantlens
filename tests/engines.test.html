@@ -187,6 +187,9 @@
     import * as forecasting from '../src/engines/forecastEngine.js';
     import * as mathWorker from '../src/workers/mathWorker.js';
     import * as workerService from '../src/services/workerService.js';
+    import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
+    import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
+    import { roundAllocation } from '../src/ui/portfolioSandbox.js';
 
     /* ================================================================== */
     /* A minimal test harness: suite(), test(), expect(), skip()           */
@@ -1861,6 +1864,8 @@
         Object.keys(sentiment.analyzeSentiment(anyAsset).metrics).forEach((id) => ids.add(id));
         Object.keys(forecasting.analyzeForecast(anyAsset).metrics).forEach((id) => ids.add(id));
         Object.keys(portfolio.analyzePortfolio({ assets: [], weights: [], baseCurrency: 'USD' }).metrics).forEach((id) => ids.add(id));
+        // Batch 6: the statistics of the selected time range.
+        Object.keys(technical.analyzeWindow(anyAsset, anyAsset.series).metrics).forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -2065,7 +2070,14 @@
         const result = analyse({ assets: [assetA, shorter], minObservations: 10 });
         expect(result.observations).toBe(19);
         expect(result.period.to).toBe(shorter.series.dates[19]);
-        expect(analyse({ assets: [assetA, shorter] }).ok).toBeFalse(); // 19 is below the default of 20
+        // 19 overlapping returns clear the default minimum of 15, so a one-month window can be analysed...
+        expect(portfolio.PORTFOLIO_CONFIG.minObservations).toBe(15);
+        expect(analyse({ assets: [assetA, shorter] }).ok).toBeTrue();
+        // ...and 11 do not: the analysis refuses and says how many it found and how many it needs.
+        const tiny = makeAsset({ ticker: 'BBB', closes: assetB.series.close.slice(0, 12), dates: assetB.series.dates.slice(0, 12) });
+        const refused = analyse({ assets: [assetA, tiny] });
+        expect(refused.ok).toBeFalse();
+        expect(refused.reason).toMatch(/Only 11 days.*at least 15/);
       });
       test('a crypto-only portfolio annualises with 365 days', () => {
         const coins = [makeAsset({ ticker: 'AAA', closes: assetA.series.close, assetClass: 'crypto' }), makeAsset({ ticker: 'BBB', closes: assetB.series.close, assetClass: 'crypto' })];
@@ -2717,6 +2729,355 @@
           expect(month.dates[month.dates.length - 1]).toBe(asset.quote.asOf);
           expect(snapshotService.sliceSeries(asset.series, '6m').dates.length).toBeGreaterThan(month.dates.length);
         }
+      });
+    });
+
+    /* ================================================================== */
+    /* 20. Time range: window statistics, correlation and simulation        */
+    /* ================================================================== */
+
+    suite('technicalEngine: statistics of the selected time range', () => {
+      const windowOf = (closes, extra = {}) => {
+        const asset = makeAsset({ ticker: 'WIN', closes, ...extra });
+        return technical.analyzeWindow(asset, asset.series, '3 months');
+      };
+
+      test('return, drawdown and range position of a hand-checked series', () => {
+        // 100 -> 120 -> 90 -> 108: up 8% overall, a 25% fall from the 120 peak, and 60% of the way from 90 to 120.
+        const result = windowOf([100, 120, 90, 108]);
+        expect(result.metrics.periodReturn.value).toBeCloseTo(0.08, 1e-12);
+        expect(result.metrics.periodReturn.tone).toBe('healthy');
+        expect(result.metrics.maxDrawdown.value).toBeCloseTo(-0.25, 1e-12);
+        expect(result.metrics.maxDrawdown.tone).toBe('caution');
+        expect(result.metrics.maxDrawdown.meta.peak).toBe(120);
+        expect(result.metrics.maxDrawdown.meta.trough).toBe(90);
+        expect(result.metrics.periodRange.value).toBeCloseTo(0.6, 1e-12);
+        expect(result.observations).toBe(4);
+        expect(result.range).toBe('3 months');
+      });
+      test('the drawdown trace states the gain needed to recover', () => {
+        const { maxDrawdown } = windowOf([100, 120, 90, 108]).metrics;
+        // A 25% fall needs a 33.33% gain: 1 / (1 - 0.25) - 1.
+        expect(maxDrawdown.trace.steps[2].result).toMatch(/33\.33%/);
+        expect(maxDrawdown.trace.interpretation.summary).toMatch(/was 25%.*needed a 33\.33% gain/);
+      });
+      test('the worst drawdown is measured from the peak before it, not from the highest close', () => {
+        // Falls 20% (100 -> 80), recovers to a new high of 150, then dips only 10% (150 -> 135).
+        const { maxDrawdown } = windowOf([100, 80, 150, 135]).metrics;
+        expect(maxDrawdown.value).toBeCloseTo(-0.2, 1e-12);
+        expect(maxDrawdown.meta.peak).toBe(100);
+        expect(maxDrawdown.meta.trough).toBe(80);
+      });
+      test('a series that only rises has no drawdown and sits at the top of its range', () => {
+        const result = windowOf([10, 11, 12, 13]);
+        expect(result.metrics.maxDrawdown.value).toBe(0);
+        expect(result.metrics.maxDrawdown.tone).toBe('healthy');
+        expect(result.metrics.periodRange.value).toBe(1);
+        expect(result.metrics.periodReturn.value).toBeCloseTo(0.3, 1e-12);
+      });
+      test('volatility is the sample standard deviation of log returns, annualised by asset class', () => {
+        const closes = randomWalk(31, { seed: 11, sigma: 0.015 });
+        const daily = pm.stdev(pm.logReturns(closes));
+        const stock = windowOf(closes).metrics.periodVolatility;
+        expect(stock.value).toBeCloseTo(daily * Math.sqrt(252), 1e-12);
+        expect(stock.meta.returns).toBe(30);
+        expect(stock.trace.interpretation.caveat).toMatch(/only 30 days/);
+        const coin = windowOf(closes, { assetClass: 'crypto' }).metrics.periodVolatility;
+        expect(coin.value).toBeCloseTo(daily * Math.sqrt(365), 1e-12);
+      });
+      test('too few candles give N/A with the reason, never a number or an exception', () => {
+        const short = windowOf([100, 120, 90, 108]).metrics.periodVolatility;
+        expect(short.status).toBe('na');
+        expect(short.naReason).toMatch(/At least 10 daily returns.*this window has 3/);
+        const single = windowOf([100]).metrics;
+        for (const id of ['periodReturn', 'periodVolatility', 'maxDrawdown', 'periodRange']) expect(single[id].status).toBe('na');
+        const flat = windowOf([50, 50, 50, 50]).metrics;
+        expect(flat.periodReturn.value).toBe(0);
+        expect(flat.periodReturn.tone).toBe('neutral');
+        expect(flat.periodRange.status).toBe('na');
+        expect(flat.maxDrawdown.value).toBe(0);
+      });
+      test('every window metric satisfies the trace contract', () => {
+        for (const closes of [[100, 120, 90, 108], [100], randomWalk(60, { seed: 3 })]) {
+          for (const metric of Object.values(windowOf(closes).metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        }
+      });
+      test('the window never touches the indicators behind the verdict', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const asset = snapshot.assets[0];
+        const before = technical.analyzeTechnicals(asset).metrics.technicalScore.value;
+        for (const range of ['1m', '3m', '6m']) {
+          const sliced = snapshotService.sliceSeries(asset.series, range);
+          const result = technical.analyzeWindow(asset, sliced, range);
+          expect(result.observations).toBe(sliced.close.length);
+          for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        }
+        expect(asset.series.close.length).toBeGreaterThan(200); // slicing did not mutate the asset
+        expect(technical.analyzeTechnicals(asset).metrics.technicalScore.value).toBe(before);
+      });
+    });
+
+    suite('correlationEngine and monteCarloEngine: shorter time ranges', () => {
+      const a = makeAsset({ ticker: 'AAA', closes: randomWalk(31, { seed: 21 }) });
+      const b = makeAsset({ ticker: 'BBB', closes: randomWalk(31, { seed: 22 }) });
+
+      test('the full-year rule still refuses 30 overlapping returns', () => {
+        const metric = correlation.correlatePair(a, b);
+        expect(metric.status).toBe('na');
+        expect(metric.naReason).toMatch(/Only 30 overlapping daily returns.*at least 60/);
+      });
+      test('a shorter range is allowed a lower minimum and says the figure is rough', () => {
+        const metric = correlation.correlatePair(a, b, { minOverlap: correlation.CORR_CONFIG.minWindowOverlap, windowLabel: 'month' });
+        expect(metric.status).toBe('ok');
+        expect(metric.meta.overlap).toBe(30);
+        expect(metric.meta.window).toBe('month');
+        expect(metric.trace.interpretation.caveat).toMatch(/only 30 pairs of daily returns/);
+        expect(metric.trace.interpretation.caveat).toMatch(/past month/);
+        expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('the lower minimum is still a minimum', () => {
+        const few = (ticker, seed) => makeAsset({ ticker, closes: randomWalk(12, { seed }) });
+        const metric = correlation.correlatePair(few('AAA', 1), few('BBB', 2), { minOverlap: 15, windowLabel: 'month' });
+        expect(metric.status).toBe('na');
+        expect(metric.naReason).toMatch(/at least 15/);
+      });
+      test('analyzeCorrelation passes the range options to every pair', () => {
+        const c = makeAsset({ ticker: 'CCC', closes: randomWalk(31, { seed: 23 }) });
+        expect(correlation.analyzeCorrelation([a, b, c]).overall.level).toBe('unknown');
+        const windowed = correlation.analyzeCorrelation([a, b, c], { minOverlap: 15, windowLabel: 'month' });
+        expect(Object.values(windowed.pairs).every((metric) => metric.status === 'ok')).toBeTrue();
+        expect(windowed.meanByTicker.AAA).toBeCloseTo((windowed.matrix[0][1] + windowed.matrix[0][2]) / 2, 1e-12);
+      });
+      test('a one-month window is enough to simulate, and the trace says the volatility is rough', () => {
+        const closes = randomWalk(21, { seed: 5, sigma: 0.02 });
+        const asset = makeAsset({ ticker: 'MC', closes });
+        const result = monteCarlo.runMonteCarlo({ asset, startPrice: closes[20], historyLabel: 'month', paths: 400 });
+        expect(result.ok).toBeTrue();
+        expect(result.params.observations).toBe(20);
+        expect(result.metrics.monteCarlo.trace.interpretation.caveat).toMatch(/only 20 days/);
+        expect(JSON.stringify(result.metrics.monteCarlo.trace.rawInputs)).toMatch(/Mean daily log return \(past month\)/);
+        // Fewer than the minimum of 15 returns is still refused.
+        const tiny = makeAsset({ ticker: 'MC', closes: closes.slice(0, 12) });
+        expect(monteCarlo.runMonteCarlo({ asset: tiny, startPrice: 100 }).ok).toBeFalse();
+      });
+    });
+
+    /* ================================================================== */
+    /* 21. Batch 6 view helpers: palette ranking, leaderboard order, mixes  */
+    /* ================================================================== */
+
+    suite('commandPalette: ranking', () => {
+      const commands = [
+        { id: 'view:compare', title: 'Compare', keywords: ['matrix', 'view'] },
+        { id: 'view:leaderboard', title: 'Leaderboard', keywords: ['ranking', 'view'] },
+        { id: 'view:portfolio', title: 'Portfolio', keywords: ['allocation', 'sharpe', 'view'] },
+        { id: 'asset:AAPL', title: 'AAPL', keywords: ['Apple Inc.', 'Technology', 'US'] },
+        { id: 'asset:D05.SI', title: 'D05.SI', keywords: ['DBS Group Holdings Ltd', 'Financial Services', 'SG'] },
+        { id: 'asset:BTC-USD', title: 'BTC-USD', keywords: ['Bitcoin', 'Crypto'] },
+        { id: 'action:reset', title: 'Reset the portfolio', keywords: ['weights'] },
+      ];
+      const ids = (query, options) => rankCommands(commands, query, options).map((command) => command.id);
+
+      test('an empty query lists everything in its original order', () => {
+        expect(ids('')).toEqual(commands.map((command) => command.id));
+        expect(ids('   ')).toEqual(commands.map((command) => command.id));
+      });
+      test('a ticker, a company name and a sector all find the asset', () => {
+        expect(ids('aapl')[0]).toBe('asset:AAPL');
+        expect(ids('apple')).toEqual(['asset:AAPL']);
+        expect(ids('dbs')).toEqual(['asset:D05.SI']);
+        expect(ids('bitcoin')).toEqual(['asset:BTC-USD']);
+        expect(ids('BTC')[0]).toBe('asset:BTC-USD'); // case-insensitive, matches the start of the ticker
+      });
+      test('a title match outranks a keyword match', () => {
+        // "port" starts the title "Portfolio" and a word of "Reset the portfolio".
+        expect(ids('port')).toEqual(['view:portfolio', 'action:reset']);
+        expect(scoreCommand(commands[2], 'portfolio')).toBeGreaterThan(scoreCommand(commands[6], 'portfolio'));
+        // "view" is only a keyword of the three views: they keep their original order.
+        expect(ids('view')).toEqual(['view:compare', 'view:leaderboard', 'view:portfolio']);
+      });
+      test('every word of the query must match', () => {
+        expect(ids('reset port')).toEqual(['action:reset']);
+        expect(ids('reset zzz')).toEqual([]);
+        expect(scoreCommand(commands[0], 'compare nothing')).toBe(0);
+      });
+      test('a typo-tolerant subsequence match is a last resort and needs three letters', () => {
+        expect(ids('ldrbrd')).toEqual(['view:leaderboard']);
+        expect(ids('zq')).toEqual([]);
+        expect(scoreCommand(commands[1], 'ldrbrd')).toBeAtMost(scoreCommand(commands[1], 'ranking'));
+      });
+      test('limit caps the list, and odd input is harmless', () => {
+        expect(ids('', { limit: 2 })).toEqual(['view:compare', 'view:leaderboard']);
+        expect(rankCommands(null, 'x')).toEqual([]);
+        expect(rankCommands([{ title: 'No keywords' }], 'key').length).toBe(1);
+      });
+    });
+
+    suite('leaderboardView: sorting', () => {
+      const rows = [
+        { ticker: 'CCC', values: { compositeScore: 50, periodVolatility: 0.4, ticker: 'CCC', price: null } },
+        { ticker: 'AAA', values: { compositeScore: 80, periodVolatility: 0.2, ticker: 'AAA', price: 10 } },
+        { ticker: 'DDD', values: { compositeScore: null, periodVolatility: null, ticker: 'DDD', price: 5 } },
+        { ticker: 'BBB', values: { compositeScore: 50, periodVolatility: Number.NaN, ticker: 'BBB', price: 7 } },
+      ];
+      const order = (key, direction) => sortRows(rows, key, direction).map((row) => row.ticker);
+
+      test('the default ranking is Composite score, best first', () => {
+        expect(DEFAULT_SORT).toEqual({ key: 'compositeScore', direction: 'descending' });
+        expect(order(DEFAULT_SORT.key, DEFAULT_SORT.direction)).toEqual(['AAA', 'BBB', 'CCC', 'DDD']);
+      });
+      test('equal values are ordered by ticker, in both directions', () => {
+        expect(order('compositeScore', 'ascending')).toEqual(['BBB', 'CCC', 'AAA', 'DDD']);
+      });
+      test('assets with no value sink to the bottom whichever way the column is sorted', () => {
+        expect(order('compositeScore', 'descending')[3]).toBe('DDD');
+        expect(order('compositeScore', 'ascending')[3]).toBe('DDD');
+        // NaN and null are both "no value": they come last, in ticker order.
+        expect(order('periodVolatility', 'ascending')).toEqual(['AAA', 'CCC', 'BBB', 'DDD']);
+        expect(order('periodVolatility', 'descending')).toEqual(['CCC', 'AAA', 'BBB', 'DDD']);
+        expect(order('price', 'descending')).toEqual(['AAA', 'BBB', 'DDD', 'CCC']);
+      });
+      test('text columns sort alphabetically and the input is never mutated', () => {
+        expect(order('ticker', 'ascending')).toEqual(['AAA', 'BBB', 'CCC', 'DDD']);
+        expect(order('ticker', 'descending')).toEqual(['DDD', 'CCC', 'BBB', 'AAA']);
+        expect(rows.map((row) => row.ticker)).toEqual(['CCC', 'AAA', 'DDD', 'BBB']);
+      });
+      test('every column names a real metric, a tier and a first sort direction', () => {
+        const columnIds = BOARD_COLUMNS.map((column) => column.id);
+        expect(new Set(columnIds).size).toBe(columnIds.length);
+        expect(columnIds).toContain(DEFAULT_SORT.key);
+        for (const column of BOARD_COLUMNS) {
+          expect(['a', 'b', 'c']).toContain(column.tier);
+          expect(['ascending', 'descending']).toContain(column.first);
+          if (column.metric && !glossary.hasExplainer(column.metric)) fail(`column "${column.id}" has no explainer`);
+        }
+        // Lower volatility is better, so its first click sorts ascending.
+        expect(BOARD_COLUMNS.find((column) => column.id === 'periodVolatility').first).toBe('ascending');
+      });
+    });
+
+    suite('portfolioSandbox: applying a suggested mix', () => {
+      const total = (mix) => mix.reduce((sum, entry) => sum + entry.weight, 0);
+
+      test('fractions become whole percentages that total exactly 100', () => {
+        const thirds = roundAllocation([{ ticker: 'A', weight: 1 / 3 }, { ticker: 'B', weight: 1 / 3 }, { ticker: 'C', weight: 1 / 3 }]);
+        expect(thirds).toEqual([{ ticker: 'A', weight: 34 }, { ticker: 'B', weight: 33 }, { ticker: 'C', weight: 33 }]);
+        const uneven = roundAllocation([{ ticker: 'A', weight: 0.886 }, { ticker: 'B', weight: 0.004 }, { ticker: 'C', weight: 0.11 }]);
+        expect(total(uneven)).toBe(100);
+        expect(uneven).toEqual([{ ticker: 'A', weight: 89 }, { ticker: 'B', weight: 0 }, { ticker: 'C', weight: 11 }]);
+      });
+      test('the largest remainders receive the spare points', () => {
+        // 12.6 / 12.6 / 74.8: the floors total 98. The .8 remainder gets the first spare point, the earlier .6 the second.
+        const mix = roundAllocation([{ ticker: 'A', weight: 0.126 }, { ticker: 'B', weight: 0.126 }, { ticker: 'C', weight: 0.748 }]);
+        expect(mix).toEqual([{ ticker: 'A', weight: 13 }, { ticker: 'B', weight: 12 }, { ticker: 'C', weight: 75 }]);
+      });
+      test('weights that do not total 1 are scaled first', () => {
+        expect(roundAllocation([{ ticker: 'A', weight: 2 }, { ticker: 'B', weight: 6 }])).toEqual([{ ticker: 'A', weight: 25 }, { ticker: 'B', weight: 75 }]);
+      });
+      test('empty, all-zero and malformed input give an empty mix', () => {
+        expect(roundAllocation([])).toEqual([]);
+        expect(roundAllocation(null)).toEqual([]);
+        expect(roundAllocation([{ ticker: 'A', weight: 0 }])).toEqual([]);
+        expect(roundAllocation([{ ticker: 'A', weight: Number.NaN }, { ticker: 'B', weight: -1 }])).toEqual([]);
+      });
+      test('a random sample\'s best mix can be applied through the store and survives the URL', () => {
+        const assets = [makeAsset({ ticker: 'AAA', closes: randomWalk(120, { seed: 31 }) }), makeAsset({ ticker: 'BBB', closes: randomWalk(120, { seed: 32 }) }), makeAsset({ ticker: 'CCC', closes: randomWalk(120, { seed: 33 }) })];
+        const analysis = portfolio.analyzePortfolio({ assets, weights: assets.map((asset) => ({ ticker: asset.ticker, weight: 1 })), baseCurrency: 'USD', riskFree: { yield: 0.03, status: 'fresh' } });
+        const frontier = portfolio.sampleFrontier({ means: analysis.stats.means, covariance: analysis.stats.covariance, tickers: analysis.tickers, riskFree: 0.03, count: 500, seed: 9 });
+        const mix = roundAllocation(frontier.maxSharpe.allocation);
+        expect(total(mix)).toBe(100);
+
+        let state = storeModule.createInitialState('?t=AAA,BBB,CCC');
+        state = storeModule.reduce(state, storeModule.actions.setPortfolioWeights(mix));
+        expect(storeModule.selectPortfolioWeights(state)).toEqual(mix);
+        expect(storeModule.hasCustomPortfolio(state)).toBeTrue();
+        const reloaded = storeModule.createInitialState(storeModule.serializeUrlState(state));
+        expect(storeModule.selectPortfolioWeights(reloaded)).toEqual(mix);
+      });
+    });
+
+    suite('store: replacing the whole allocation', () => {
+      const base = storeModule.createInitialState('');
+      const set = (weights, state = base) => storeModule.reduce(state, storeModule.actions.setPortfolioWeights(weights));
+
+      test('a valid list replaces the allocation, whatever was there before', () => {
+        const first = set([{ ticker: 'AAPL', weight: 60 }, { ticker: 'NVDA', weight: 40 }]);
+        expect(first.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 60 }, { ticker: 'NVDA', weight: 40 }]);
+        const second = set([{ ticker: 'BTC-USD', weight: 100 }], first);
+        expect(second.portfolio.weights).toEqual([{ ticker: 'BTC-USD', weight: 100 }]);
+      });
+      test('duplicates and malformed entries are dropped; a negative weight is clamped to zero', () => {
+        const state = set([
+          { ticker: 'aapl', weight: 50 }, { ticker: 'AAPL', weight: 10 }, { ticker: '<script>', weight: 10 },
+          { ticker: 'NVDA', weight: -5 }, { ticker: 'MSFT', weight: 'abc' }, null, { ticker: 'JPM', weight: 25 },
+        ]);
+        expect(state.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 50 }, { ticker: 'NVDA', weight: 0 }, { ticker: 'JPM', weight: 25 }]);
+      });
+      test('a list with nothing usable leaves the state untouched', () => {
+        expect(set([])).toBe(base);
+        expect(set(null)).toBe(base);
+        expect(set([{ ticker: '', weight: 10 }])).toBe(base);
+      });
+      test('the list is capped at the portfolio limit', () => {
+        const many = Array.from({ length: 12 }, (_, i) => ({ ticker: `T${i}`, weight: 5 }));
+        expect(set(many).portfolio.weights.length).toBe(storeModule.MAX_PORTFOLIO_ASSETS);
+      });
+      test('tickers that are not on the loaded watchlist are ignored', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const ready = storeModule.reduce(base, storeModule.actions.snapshotLoaded(snapshot, []));
+        const known = snapshot.assets[0].ticker;
+        const state = set([{ ticker: known, weight: 70 }, { ticker: 'NOPE', weight: 30 }], ready);
+        expect(state.portfolio.weights).toEqual([{ ticker: known, weight: 70 }]);
+      });
+    });
+
+    suite('integration: time ranges and the portfolio over the committed snapshot', () => {
+      test('every asset has valid statistics for every time range', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          let previous = Infinity;
+          for (const range of ['1y', '6m', '3m', '1m']) {
+            const sliced = snapshotService.sliceSeries(asset.series, range);
+            const result = technical.analyzeWindow(asset, sliced, range);
+            for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+            expect(result.metrics.periodReturn.status).toBe('ok');
+            expect(result.metrics.maxDrawdown.value).toBeAtMost(0);
+            expect(result.observations).toBeAtMost(previous); // a shorter range never has more candles
+            previous = result.observations;
+          }
+        }
+      });
+      test('the three default assets form a measurable three-month portfolio through the worker entry point', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const tickers = storeModule.DEFAULT_SELECTED.filter((ticker) => snapshot.byTicker[ticker]);
+        if (tickers.length < 2) skip('the default assets are not all on the watchlist');
+        const assets = tickers.map((ticker) => {
+          const asset = snapshot.byTicker[ticker];
+          const series = snapshotService.sliceSeries(asset.series, '3m');
+          return { ticker, currency: asset.currency, assetClass: asset.assetClass, series: { dates: series.dates, close: series.close } };
+        });
+        // Exactly the payload main.js posts to the worker.
+        const { analysis, frontier } = mathWorker.handleRequest('portfolio', {
+          assets,
+          weights: storeModule.equalWeights(tickers),
+          baseCurrency: 'USD',
+          fx: { rate: snapshot.fx.rate, series: snapshot.fx.series },
+          riskFree: snapshot.macro.riskFree.USD,
+          frontierSamples: 300,
+          frontierSeed: 7,
+        });
+        expect(analysis.ok).toBeTrue();
+        expect(analysis.observations).toBeAtLeast(40);
+        for (const metric of Object.values(analysis.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(analysis.contributions.reduce((sum, row) => sum + row.riskShare, 0)).toBeCloseTo(1, 1e-9);
+        expect(frontier.count).toBe(300 + tickers.length + 1);
+        // No sampled mix can be less volatile than the sample's own minimum.
+        expect(Math.min(...frontier.risk)).toBeCloseTo(frontier.minVariance.risk, 1e-12);
+        expect(analysis.metrics.portfolioVolatility.value).toBeAtLeast(frontier.minVariance.risk - 1e-12);
       });
     });
 

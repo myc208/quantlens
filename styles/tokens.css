@@ -103,6 +103,8 @@
 
   /* Layout */
   --telemetry-h: 52px; /* kept in sync by telemetryBar.js */
+  --tabs-h: 0px; /* kept in sync by appTabs.js; 0 while the tab bar is not sticky */
+  --chrome-h: calc(var(--telemetry-h) + var(--tabs-h)); /* everything sticky sits below this */
   --screener-w: 288px;
   --drawer-w: 420px;
   --content-max: 1680px;
@@ -115,6 +117,7 @@
 
   /* Layers */
   --z-sticky: 10;
+  --z-tabs: 25;
   --z-telemetry: 30;
   --z-scrim: 40;
   --z-drawer: 50;

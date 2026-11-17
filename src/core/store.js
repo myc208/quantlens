@@ -266,6 +266,7 @@ export const actions = Object.freeze({
   setView: (view) => ({ type: 'SET_VIEW', view }),
   setRange: (range) => ({ type: 'SET_RANGE', range }),
   setPortfolioWeight: (ticker, weight) => ({ type: 'SET_PORTFOLIO_WEIGHT', ticker, weight }),
+  setPortfolioWeights: (weights) => ({ type: 'SET_PORTFOLIO_WEIGHTS', weights }),
   addPortfolioAsset: (ticker) => ({ type: 'ADD_PORTFOLIO_ASSET', ticker }),
   removePortfolioAsset: (ticker) => ({ type: 'REMOVE_PORTFOLIO_ASSET', ticker }),
   equalisePortfolio: () => ({ type: 'EQUALISE_PORTFOLIO' }),
@@ -393,6 +394,19 @@ export function reduce(state, action) {
       if (weight === null || index < 0 || (Array.isArray(state.portfolio.weights) && current[index].weight === weight)) return state;
       const weights = current.map((entry, position) => (position === index ? { ticker: entry.ticker, weight } : entry));
       return { ...state, portfolio: { weights } };
+    }
+    case 'SET_PORTFOLIO_WEIGHTS': {
+      // Replace the whole allocation at once (used when applying a suggested mix).
+      const weights = [];
+      for (const entry of Array.isArray(action.weights) ? action.weights : []) {
+        const ticker = String((entry && entry.ticker) || '').toUpperCase();
+        const weight = cleanWeight(entry ? entry.weight : null);
+        if (!TICKER_PATTERN.test(ticker) || weight === null || weights.some((item) => item.ticker === ticker)) continue;
+        if (state.snapshot && !state.snapshot.byTicker[ticker]) continue;
+        weights.push({ ticker, weight });
+        if (weights.length === MAX_PORTFOLIO_ASSETS) break;
+      }
+      return weights.length ? { ...state, portfolio: { weights } } : state;
     }
     case 'ADD_PORTFOLIO_ASSET': {
       const ticker = String(action.ticker || '').toUpperCase();

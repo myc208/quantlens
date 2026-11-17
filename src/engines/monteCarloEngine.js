@@ -29,7 +29,7 @@ import {
 export const MC_CONFIG = Object.freeze({
   paths: 1000,
   horizons: Object.freeze([21, 63, 126]),
-  minReturns: 30,
+  minReturns: 15, // enough for a 1-month window; the trace says when the estimate is rough
   annualisation: Object.freeze({ equity: 252, crypto: 365 }),
 });
 
@@ -112,12 +112,13 @@ function unavailable(asset, reason) {
  * @param {number} [args.paths]
  * @param {number[]} [args.horizons] ascending day counts
  * @param {number} [args.seed] override the deterministic seed
+ * @param {string} [args.historyLabel] the period the closes cover ("year", "3 months"), for the explanation
  * @returns {{ ticker, ok, metrics, fan, horizons, outcomes, params }}
  *   fan = { days, p05, p25, p50, p75, p95 } with one entry per day from 0 to the longest horizon
  */
 export function runMonteCarlo({
   asset, startPrice, stop = null, target = null, useHistoricalDrift = false,
-  paths = MC_CONFIG.paths, horizons = MC_CONFIG.horizons, seed,
+  paths = MC_CONFIG.paths, horizons = MC_CONFIG.horizons, seed, historyLabel = 'year',
 }) {
   if (!isNum(startPrice) || startPrice <= 0) return unavailable(asset, 'No valid starting price is available.');
   const pathCount = Number.isInteger(paths) ? Math.min(20000, Math.max(100, paths)) : MC_CONFIG.paths;
@@ -195,14 +196,14 @@ export function runMonteCarlo({
     rawInputs: [
       input('Starting price', startPrice, currency, 'live tick or last daily close', asset.quote.asOf),
       input('Daily volatility σ', sigma, 'fraction', `stdev of ${observations} daily log returns`, asset.quote.asOf),
-      input('Mean daily log return (past year)', meanLogReturn, 'fraction', useHistoricalDrift ? 'used as the drift' : 'shown for reference; not used with zero drift', asset.quote.asOf),
+      input(`Mean daily log return (past ${historyLabel})`, meanLogReturn, 'fraction', useHistoricalDrift ? 'used as the drift' : 'shown for reference; not used with zero drift', asset.quote.asOf),
       input('Paths', pathCount, 'simulations', 'fixed'),
       input('Random seed', usedSeed, '', 'hash of the ticker and snapshot date, so results are reproducible'),
     ],
     steps: [
       step(`Estimate daily volatility from ${observations} daily log returns`, `stdev(ln(Cₜ ÷ Cₜ₋₁))`, fmtPct(sigma, 3)),
       useHistoricalDrift
-        ? step('Daily log drift: the mean daily log return of the past year', 'mean(ln(Cₜ ÷ Cₜ₋₁))', fmtPct(drift, 4))
+        ? step(`Daily log drift: the mean daily log return of the past ${historyLabel}`, 'mean(ln(Cₜ ÷ Cₜ₋₁))', fmtPct(drift, 4))
         : step('Daily log drift for a zero expected return', `−(${fmtN(sigma, 6)})² ÷ 2`, fmtPct(drift, 4)),
       step(`Simulate ${fmtN(pathCount, 0)} paths of ${maxDays} daily steps`, 'S × exp(d + σ × Z) repeated each day', `${fmtN(pathCount * maxDays, 0)} random steps`),
       ...horizonRows.map((row) => step(
@@ -223,7 +224,7 @@ export function runMonteCarlo({
         threshold('Median', 'Half of the paths end above, half below', 'neutral'),
         threshold('95th percentile', 'A good but plausible outcome', 'healthy'),
       ],
-      'The model assumes constant volatility and no sudden jumps. Real markets have fatter tails, so extreme outcomes are more likely than shown.',
+      `${observations < 40 ? `Volatility was estimated from only ${observations} days, so the width of this fan is a rough figure. ` : ''}The model assumes constant volatility and no sudden jumps. Real markets have fatter tails, so extreme outcomes are more likely than shown.`,
     ),
     dependsOn: ['volatility'],
   });
