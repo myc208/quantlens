@@ -887,6 +887,23 @@ class TelegramBriefing(unittest.TestCase):
         self.assertIn("the signals below are from it", text)
         self.assertIn("Top BUY signals", text)
 
+    def test_earnings_within_30_days_are_listed_nearest_first(self):
+        rows = [dict(row) for row in self.SIGNALS]
+        rows[0].update(nextEarnings={"date": "2026-12-17", "days": 26}, typicalMove=0.058, worstMove=-0.162)
+        rows[1].update(nextEarnings={"date": "2026-12-01", "days": 10}, typicalMove=None, worstMove=None)
+        rows[3].update(nextEarnings={"date": "2027-02-01", "days": 72}, typicalMove=0.02, worstMove=-0.03)
+        text = self.build(signals=rows, markdown=False)
+        self.assertIn("Earnings in the next 30 days", text)
+        first, second = text.index("D05.SI ~1 Dec (in 10 days)"), text.index("MU ~17 Dec (in 26 days)")
+        self.assertLess(first, second)
+        self.assertIn("typical move \u00b15.8%, worst \u221216.2%", text)
+        self.assertIn("too few past releases to size the move", text)
+        self.assertNotIn("in 72 days", text)
+        self.assertNotIn("Earnings in the next", self.build(markdown=False))  # nothing upcoming: no section
+        markdown = self.build(signals=rows)
+        self.assertIn("`MU`", markdown)
+        self.assertIn("\\(in 26 days\\)", markdown)
+
     def test_the_message_stays_inside_telegrams_limit(self):
         many = [{"ticker": f"T{i}", "name": "N" * 200, "verdict": "BUY", "composite": 90 - i % 40, "confidence": "High"} for i in range(400)]
         shifts = [{"ticker": f"S{i}", "from": "positive", "to": "negative", "before": 0.5, "after": -0.5, "delta": -1.0,
@@ -932,6 +949,11 @@ class TelegramBriefing(unittest.TestCase):
         for row in signals:
             if by_class[row["ticker"]] in {"etf", "index", "crypto"}:
                 self.assertEqual(row["confidence"], "Low", row["ticker"])  # technical only, by construction
+        upcoming = [row for row in signals if row["nextEarnings"]]
+        self.assertTrue(upcoming)  # the event layer reaches the briefing
+        for row in upcoming:
+            self.assertEqual(by_class[row["ticker"]], "equity")
+            self.assertGreaterEqual(row["nextEarnings"]["days"], 0)
 
 
 class SchemaV3History(unittest.TestCase):

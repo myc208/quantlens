@@ -188,6 +188,7 @@
     import * as mathWorker from '../src/workers/mathWorker.js';
     import * as workerService from '../src/services/workerService.js';
     import * as risk from '../src/engines/riskEngine.js';
+    import * as eventsEngine from '../src/engines/eventEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -1870,6 +1871,8 @@
         // V3: risk measures of the window and the tail risk of a sized position.
         Object.keys(risk.analyzeRisk(anyAsset, anyAsset.series).metrics).forEach((id) => ids.add(id));
         Object.keys(risk.positionTailRisk({ sizing: null, risk: null, accountCurrency: 'USD' })).forEach((id) => ids.add(id));
+        Object.keys(eventsEngine.analyzeEvents(anyAsset).metrics).forEach((id) => ids.add(id));
+        ids.add(eventsEngine.gapRisk({ sizing: null, events: null, accountCurrency: 'USD' }).id);
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -3511,6 +3514,123 @@
         const metric = correlation.correlatePair(voo, cspx);
         expect(metric.meta.frequency).toBe('weekly');
         expect(metric.value).toBeGreaterThan(0.85);
+      });
+    });
+
+    /* ================================================================== */
+    /* 25. V3 events: earnings, ex-dividend dates and gap risk              */
+    /* ================================================================== */
+
+    suite('eventEngine: earnings dates, earnings-day moves and gap risk', () => {
+      const weekdaySeries = (start, closes) => {
+        const dates = [];
+        let time = Date.parse(`${start}T00:00:00Z`);
+        while (dates.length < closes.length) {
+          const day = new Date(time).getUTCDay();
+          if (day !== 0 && day !== 6) dates.push(new Date(time).toISOString().slice(0, 10));
+          time += 86400000;
+        }
+        return { dates, close: closes };
+      };
+      const eventsBlock = (overrides = {}) => ({
+        status: 'fresh', fetchedAt: '2026-11-21T22:30:00Z', note: null, nextEarnings: null, nextExDividend: null, earnings: [], ...overrides,
+      });
+
+      test('trading days count weekdays; crypto counts every day', () => {
+        expect(eventsEngine.tradingDaysBetween('2026-11-20', '2026-11-23')).toBe(1); // Friday to Monday
+        expect(eventsEngine.tradingDaysBetween('2026-11-21', '2026-11-28')).toBe(5);
+        expect(eventsEngine.tradingDaysBetween('2026-11-21', '2026-11-28', 'crypto')).toBe(7);
+        expect(eventsEngine.tradingDaysBetween('2026-11-21', '2026-11-21')).toBe(0);
+      });
+      test('the reaction session follows the release timing', () => {
+        // Mon 5 Jan 100, Tue 101, Wed 110, Thu 111, Fri 112.
+        const series = weekdaySeries('2026-01-05', [100, 101, 110, 111, 112]);
+        const move = (date, timing) => eventsEngine.earningsReaction(series, { date, timing });
+        expect(move('2026-01-07', 'before-open').move).toBeCloseTo(110 / 101 - 1, 1e-12);   // Wed vs Tue
+        expect(move('2026-01-07', 'during-session').move).toBeCloseTo(110 / 101 - 1, 1e-12);
+        expect(move('2026-01-06', 'after-close').move).toBeCloseTo(110 / 101 - 1, 1e-12);   // Wed vs Tue
+        expect(move('2026-01-07', 'unknown').move).toBeCloseTo(111 / 101 - 1, 1e-12);       // Thu vs Tue: both sessions
+        expect(move('2026-01-09', 'after-close')).toBeNull();                                  // the reaction has not happened yet
+        expect(move('2026-01-05', 'before-open')).toBeNull();                                  // no session before it
+      });
+      test('earnings inside the sizing horizon are flagged, one more day is not', () => {
+        const today = '2026-11-23'; // a Monday
+        const dateAfter = (sessions) => {
+          let time = Date.parse(`${today}T00:00:00Z`);
+          let count = 0;
+          while (count < sessions) {
+            time += 86400000;
+            const day = new Date(time).getUTCDay();
+            if (day !== 0 && day !== 6) count += 1;
+          }
+          return new Date(time).toISOString().slice(0, 10);
+        };
+        const asset = (date) => ({ ...makeAsset({ ticker: 'EV' }), events: eventsBlock({ nextEarnings: { date, dateTo: null, timing: 'after-close' } }) });
+        const inside = eventsEngine.analyzeEvents(asset(dateAfter(21)), { now: today }).metrics.nextEarnings;
+        expect(inside.meta.tradingDays).toBe(21);
+        expect(inside.unit).toBe('days'); // a known unit, so the page shows "27 days" and not "27.00"
+        expect(inside.meta.insideSizing).toBeTrue();
+        expect(inside.meta.insideSimulation).toEqual([true, true, true]);
+        expect(inside.tone).toBe('caution');
+        const outside = eventsEngine.analyzeEvents(asset(dateAfter(22)), { now: today }).metrics.nextEarnings;
+        expect(outside.meta.insideSizing).toBeFalse();
+        expect(outside.meta.insideSimulation).toEqual([false, true, true]);
+        const passed = eventsEngine.analyzeEvents(asset('2026-11-01'), { now: today }).metrics.nextEarnings;
+        expect(passed.status).toBe('na');
+        expect(passed.naReason).toMatch(/has passed/);
+      });
+      test('the typical earnings move is the median absolute reaction, with the worst one kept', () => {
+        // Four releases, each after the close, with known next-day moves of +10%, −20%, +5% and −4%.
+        const closes = [100];
+        const jumps = { 3: 0.10, 8: -0.20, 13: 0.05, 18: -0.04 };
+        for (let i = 1; i < 24; i += 1) closes.push(closes[i - 1] * (1 + (jumps[i] ?? 0.001)));
+        const series = weekdaySeries('2026-01-05', closes);
+        const releases = [18, 13, 8, 3].map((i) => ({ date: series.dates[i - 1], timing: 'after-close' }));
+        const asset = { ...makeAsset({ ticker: 'EV' }), longSeries: series, events: eventsBlock({ earnings: releases }) };
+        const move = eventsEngine.analyzeEvents(asset, { now: '2026-02-10' }).metrics.earningsMove;
+        expect(move.meta.count).toBe(4);
+        expect(move.value).toBeCloseTo(0.075, 1e-12); // median of 4%, 5%, 10%, 20%
+        expect(move.meta.worst).toBeCloseTo(-0.2, 1e-12);
+        expect(move.meta.ratio).toBeGreaterThan(50); // ordinary days move 0.1%
+        expect(tracer.validateTrace(move)).toEqual([]);
+        const few = { ...asset, events: eventsBlock({ earnings: releases.slice(0, 3) }) };
+        expect(eventsEngine.analyzeEvents(few, { now: '2026-02-10' }).metrics.earningsMove.naReason).toMatch(/Only 3 past releases/);
+      });
+      test('the next ex-dividend date is Yahoo\'s when known, otherwise estimated from the payment rhythm', () => {
+        const quarterly = { dates: ['2025-02-10', '2025-05-12', '2025-08-11', '2025-11-10', '2026-02-09', '2026-05-11', '2026-08-10'], amounts: [1, 1, 1, 1, 1, 1, 1.1] };
+        const confirmed = eventsEngine.nextExDividendDate({ nextExDividend: { date: '2026-12-01' } }, quarterly, '2026-11-21');
+        expect(confirmed).toEqual({ date: '2026-12-01', estimated: false, gapDays: null });
+        const estimated = eventsEngine.nextExDividendDate({ nextExDividend: null }, quarterly, '2026-11-21');
+        expect(estimated.estimated).toBeTrue();
+        expect(estimated.gapDays).toBe(91);
+        expect(estimated.date >= '2026-11-21').toBeTrue(); // 2026-11-09 has passed, so it steps forward once
+        expect(eventsEngine.nextExDividendDate(null, { dates: ['2026-01-01', '2026-02-01'], amounts: [1, 1] }, '2026-11-21')).toBeNull();
+        const asset = { ...makeAsset({ ticker: 'EV' }), events: eventsBlock(), dividends: quarterly };
+        const metric = eventsEngine.analyzeEvents(asset, { now: '2026-11-21' }).metrics.nextExDividend;
+        expect(metric.meta.dropFraction).toBeCloseTo(1.1 / asset.quote.lastClose, 1e-12);
+        expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('gap risk compares the worst earnings fall with the amount at risk', () => {
+        const move = tracer.traced({ id: 'earningsMove', label: 'm', value: 0.06, unit: 'pct', formula: 'f', meta: { worst: -0.15, worstDate: '2026-01-01' } });
+        const next = tracer.traced({ id: 'nextEarnings', label: 'n', value: 10, unit: 'days', formula: 'f', meta: { insideSizing: true, date: '2026-12-01' } });
+        const sizing = { ok: true, summary: { units: 10, positionValue: 2000, amountAtRisk: 100 } };
+        const metric = eventsEngine.gapRisk({ sizing, events: { metrics: { earningsMove: move, nextEarnings: next } }, accountCurrency: 'USD' });
+        expect(metric.value).toBeCloseTo(300, 1e-9); // 2,000 × 15%
+        expect(metric.meta.beyondStop).toBeTrue();
+        expect(metric.tone).toBe('risky');
+        expect(eventsEngine.gapRisk({ sizing: { ok: true, summary: { units: 0 } }, events: null, accountCurrency: 'USD' }).status).toBe('na');
+      });
+      test('real snapshot: every asset gets valid event metrics, and only stocks have earnings', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        let measured = 0;
+        for (const asset of snapshot.assets) {
+          const { metrics } = eventsEngine.analyzeEvents(asset, { now: raw.generatedAt });
+          for (const metric of Object.values(metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+          if (asset.assetClass !== 'equity') expect(metrics.nextEarnings.status).toBe('na');
+          if (metrics.earningsMove.status === 'ok') measured += 1;
+        }
+        expect(measured).toBeGreaterThan(10);
       });
     });
 

@@ -688,7 +688,7 @@ Most dashboards output a number and ask for trust. QuantLens makes the derivatio
   "id": "rsi14",
   "label": "RSI (14)",
   "value": 60.9028,              // finite number, or a label such as "BUY", or null
-  "unit": "index",               // index | ratio | pct | currency | score | shares | label
+  "unit": "index",               // index | ratio | pct | currency | score | shares | label | days
   "status": "ok",                // ok | na
   "naReason": null,              // plain-English reason when status is "na"
   "tone": "healthy",             // healthy | neutral | caution | risky | null

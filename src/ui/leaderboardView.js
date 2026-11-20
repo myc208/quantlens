@@ -139,10 +139,13 @@ export function mountLeaderboardView(root, app) {
   function assetCell(row) {
     const { asset } = row;
     const market = asset.market === 'CRYPTO' ? 'Crypto' : asset.market;
+    const earnings = app.trace(asset.ticker, 'nextEarnings');
+    const soon = earnings && earnings.status === 'ok' && earnings.meta.insideForecast
+      ? `<span class="chip chip--event" title="${esc(`Earnings around ${earnings.meta.date}: ${earnings.meta.tradingDays} trading days away`)}">Earnings ${esc(h.formatNumber(earnings.value, 0))}d</span>` : '';
     return `
       <th scope="row">
         <div class="board__asset">
-          <span class="board__ticker">${esc(asset.ticker)}<span class="chip">${esc(market)}</span></span>
+          <span class="board__ticker">${esc(asset.ticker)}<span class="chip">${esc(market)}</span>${soon}</span>
           <span class="board__name" title="${esc(asset.name)}">${esc(asset.name)}</span>
         </div>
       </th>`;

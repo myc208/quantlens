@@ -216,6 +216,8 @@ TELEGRAM_TIMEOUT = 10.0
 TELEGRAM_MAX_CHARS = 3800        # Telegram's hard limit is 4096 characters
 BRIEFING_TOP_SIGNALS = 5         # BUY and SELL signals listed in the briefing
 BRIEFING_MAX_SHIFTS = 5
+BRIEFING_EARNINGS_DAYS = 30      # list earnings releases this many calendar days ahead
+BRIEFING_MAX_EARNINGS = 5
 SENTIMENT_SHIFT_MIN = 0.25       # a move in headline tone at least this large is notable
 SIGNALS_SCRIPT = REPO_ROOT / "scripts" / "signals.mjs"
 SIGNALS_TIMEOUT = 60.0
@@ -2145,8 +2147,15 @@ def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
         composite = row.get("composite") if is_finite_number(row.get("composite")) else None
         confidence = row.get("confidence") if row.get("confidence") in {"High", "Medium", "Low"} else None
         name = row.get("name") if isinstance(row.get("name"), str) else row["ticker"]
+        upcoming = row.get("nextEarnings")
+        next_earnings = None
+        if (isinstance(upcoming, dict) and is_iso_date(upcoming.get("date")) and isinstance(upcoming.get("days"), int)
+                and not isinstance(upcoming.get("days"), bool) and upcoming["days"] >= 0):
+            next_earnings = {"date": upcoming["date"], "days": upcoming["days"]}
         signals.append({"ticker": row["ticker"], "name": name, "verdict": verdict,
-                        "composite": composite, "confidence": confidence})
+                        "composite": composite, "confidence": confidence, "nextEarnings": next_earnings,
+                        "typicalMove": row.get("typicalMove") if is_finite_number(row.get("typicalMove")) else None,
+                        "worstMove": row.get("worstMove") if is_finite_number(row.get("worstMove")) else None})
     return signals
 
 
@@ -2253,6 +2262,17 @@ def build_briefing(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]
                 confidence = f" · {row['confidence']} confidence" if row["confidence"] else ""
                 lines.append(fmt.text(f"{position}. ") + fmt.code(row["ticker"])
                              + fmt.text(f" {row['name'][:32]} · {row['composite']:.0f}/100{confidence}"))
+        upcoming = sorted((row for row in signals if row.get("nextEarnings") and row["nextEarnings"]["days"] <= BRIEFING_EARNINGS_DAYS),
+                          key=lambda row: (row["nextEarnings"]["days"], row["ticker"]))
+        if upcoming:
+            lines += ["", fmt.bold(f"Earnings in the next {BRIEFING_EARNINGS_DAYS} days")]
+            for row in upcoming[:BRIEFING_MAX_EARNINGS]:
+                when = f" ~{short_date(row['nextEarnings']['date'])} (in {row['nextEarnings']['days']} days)"
+                if row.get("typicalMove") is not None and row.get("worstMove") is not None:
+                    size = f" \u00b7 typical move \u00b1{row['typicalMove'] * 100:.1f}%, worst {signed(row['worstMove'] * 100, 1)}%"
+                else:
+                    size = " \u00b7 too few past releases to size the move"
+                lines.append(fmt.text("\u26a0 ") + fmt.code(row["ticker"]) + fmt.text(when + size))
         tally = {verdict: sum(1 for row in signals if row["verdict"] == verdict) for verdict in ("BUY", "HOLD", "SELL")}
         lines += ["", fmt.text(f"All verdicts: {tally['BUY']} BUY · {tally['HOLD']} HOLD · {tally['SELL']} SELL")]
     elif outcome != "failed" or failed_step in {"data refresh", "commit"}:

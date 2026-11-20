@@ -37,6 +37,7 @@ import { getExplainer } from './services/glossaryService.js';
 import { createWorkerService, createJobRunner, jobKey } from './services/workerService.js';
 import { analyzeTechnicals, analyzeWindow } from './engines/technicalEngine.js';
 import { analyzeRisk, positionTailRisk } from './engines/riskEngine.js';
+import { analyzeEvents, gapRisk } from './engines/eventEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
 import { advise } from './engines/advisorEngine.js';
@@ -177,6 +178,7 @@ function formatMetric(metric, { withCurrency = false, native = false } = {}) {
     case 'index': return formatNumber(value, 1);
     case 'pct': return SIGNED_IDS.has(metric.id) ? signedPercent(value, 1) : formatPercent(value, 1);
     case 'shares': return formatUnits(value);
+    case 'days': return `${formatNumber(value, 0)} ${value === 1 ? 'day' : 'days'}`;
     case 'currency': {
       const sourceCurrency = metric.meta ? metric.meta.currency : null;
       const shown = native ? { value, currency: sourceCurrency } : money(value, sourceCurrency);
@@ -248,7 +250,9 @@ function analyseAsset(asset, fxRate, now) {
   // Context only: neither of these ever reaches the verdict.
   const sentiment = analyzeSentiment(asset, { now });
   const forecast = analyzeForecast(asset);
-  return { asset, technical, fundamental, advisor, sentiment, forecast };
+  // Scheduled events: earnings and ex-dividend dates, and the typical earnings-day move.
+  const events = analyzeEvents(asset, { now });
+  return { asset, technical, fundamental, advisor, sentiment, forecast, events };
 }
 
 function verdicts() {
@@ -415,7 +419,11 @@ function comparison() {
   // One-day 95% VaR and CVaR of each suggested position, from the selected range's returns.
   const tailRisks = {};
   for (const asset of assets) {
-    tailRisks[asset.ticker] = positionTailRisk({ sizing: sizings[asset.ticker], risk: windowFor(asset.ticker, info.id).risk, accountCurrency: state.currency });
+    tailRisks[asset.ticker] = {
+      ...positionTailRisk({ sizing: sizings[asset.ticker], risk: windowFor(asset.ticker, info.id).risk, accountCurrency: state.currency }),
+      // An earnings gap can open below the stop: the loss of a gap like the worst one on record.
+      gapRisk: gapRisk({ sizing: sizings[asset.ticker], events: analyses.get(asset.ticker).events, accountCurrency: state.currency }),
+    };
   }
   const value = { assets, tickers: assets.map((asset) => asset.ticker), fx, sizings, sizingList, tailRisks, correlation, heat, range: info };
   comparisonMemo = { key, value };
@@ -580,7 +588,7 @@ function traceIndex(ticker) {
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
   const index = buildTraceIndex(
-    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics] : null,
+    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics] : null,
     view ? view.metrics : null,
     view ? view.risk.metrics : null,
     sizing ? sizing.metrics : null,
