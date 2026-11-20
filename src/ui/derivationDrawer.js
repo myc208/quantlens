@@ -15,7 +15,7 @@
  * ({ open, ticker, traceId, trail }) and asks the app for the trace index.
  */
 
-const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'banks', REIT: 'REITs', CRYPTO: 'crypto' });
+const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'financial companies', REIT: 'REITs', ETF: 'ETFs', INDEX: 'indices', CRYPTO: 'crypto' });
 
 // Metrics that belong to the portfolio as a whole rather than to one asset or one pair.
 const PORTFOLIO_METRICS = new Set(['portfolioReturn', 'portfolioVolatility', 'sharpeRatio', 'diversificationRatio', 'riskFreeRate']);

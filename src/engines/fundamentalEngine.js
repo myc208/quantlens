@@ -8,8 +8,12 @@
  *   CORPORATE  EV/EBITDA 25 · Operating margin 20 · FCF yield 20 ·
  *              Debt/Equity 15 · ROE 10 · Forward P/E 10
  *   FINANCIAL  ROE 35 · Price-to-Book 30 · Net margin 20 · Trailing P/E 15
+ *              (banks, insurers and asset managers: Yahoo's "Financial Services" sector)
  *   REIT       Price-to-Book 35 · Dividend yield 30 · Gearing 25 · Operating margin 10
- *   CRYPTO     no fundamentals, no score
+ *   ETF        no score: a basket of companies has no accounts of its own
+ *              (its distribution yield is shown for context)
+ *   INDEX      no score: a calculated level, not a business or a fund
+ *   CRYPTO     no fundamentals, no score (market cap shown for context)
  *
  * Each metric maps to a 0..100 sub-score by straight-line interpolation
  * between anchor points. A metric that cannot be computed is dropped and the
@@ -29,6 +33,8 @@ import {
 } from '../core/derivationTracer.js';
 
 const CRYPTO_REASON = 'Crypto assets have no earnings, balance sheet or cash flow, so this measure does not exist.';
+const ETF_REASON = 'An ETF holds a basket of companies and has no earnings, balance sheet or cash flow of its own, so this company measure does not apply.';
+const INDEX_REASON = 'An index is a calculated level, not a company or a fund: it has no earnings, balance sheet or cash flow, so this measure does not exist.';
 
 export const PROFILES = Object.freeze({
   CORPORATE: Object.freeze({
@@ -45,7 +51,7 @@ export const PROFILES = Object.freeze({
     allNotApplicable: null,
   }),
   FINANCIAL: Object.freeze({
-    label: 'Bank / financial',
+    label: 'Financial',
     scoring: Object.freeze([
       Object.freeze({ id: 'roe', weight: 35, anchors: [[0.05, 0], [0.10, 50], [0.16, 100]] }),
       Object.freeze({ id: 'priceToBook', weight: 30, anchors: [[0.8, 100], [1.5, 60], [2.5, 20], [3.5, 0]] }),
@@ -53,15 +59,15 @@ export const PROFILES = Object.freeze({
       Object.freeze({ id: 'trailingPE', weight: 15, anchors: [[8, 100], [12, 70], [18, 30], [25, 0]] }),
     ]),
     notApplicable: Object.freeze({
-      evEbitda: 'Not meaningful for banks: interest is their core business, so "earnings before interest" (EBITDA) is not reported.',
-      operatingMargin: 'Not meaningful for banks: they do not report a conventional operating income line. Net margin is used instead.',
-      fcfYield: 'Not meaningful for banks: deposit and loan flows dominate cash flow, so free cash flow does not measure owner earnings.',
-      debtToEquity: 'Not meaningful for banks: deposits and borrowings are a bank\'s raw material, not a sign of stress. Regulators use capital ratios instead.',
-      gearing: 'Not meaningful for banks: almost all of a bank\'s assets are funded by deposits and borrowings by design.',
-      ebit: 'Banks do not report EBIT: interest is their core business, not a financing cost.',
-      ebitda: 'Banks do not report EBITDA: interest income and expense are their core business.',
-      operatingIncome: 'Banks do not report a conventional operating income line.',
-      freeCashFlow: 'Not meaningful for banks: loan and deposit flows swamp the figure, so it says little about owner earnings.',
+      evEbitda: 'Not used for financial companies: for banks and insurers, interest and investment income are the core business, so "earnings before interest" (EBITDA) does not separate operations from financing.',
+      operatingMargin: 'Not used for financial companies: banks and insurers do not report a conventional operating income line. Net margin is used instead.',
+      fcfYield: 'Not used for financial companies: at banks and insurers, deposit, loan and premium flows dominate cash flow, so free cash flow does not measure owner earnings.',
+      debtToEquity: 'Not used for financial companies: for banks and insurers, deposits, borrowings and policy reserves are raw material, not a sign of stress. Regulators use capital ratios instead.',
+      gearing: 'Not used for financial companies: banks and insurers fund most of their assets with deposits, borrowings or reserves by design.',
+      ebit: 'Not used for financial companies: for banks and insurers, interest is part of the business, not a financing cost.',
+      ebitda: 'Not used for financial companies: for banks and insurers, interest income and expense are part of the business.',
+      operatingIncome: 'Not used for financial companies: banks and insurers do not report a conventional operating income line.',
+      freeCashFlow: 'Not used for financial companies: at banks and insurers, loan, deposit and premium flows swamp the figure, so it says little about owner earnings.',
     }),
     allNotApplicable: null,
   }),
@@ -76,11 +82,29 @@ export const PROFILES = Object.freeze({
     notApplicable: Object.freeze({}),
     allNotApplicable: null,
   }),
+  ETF: Object.freeze({
+    label: 'ETF',
+    scoring: Object.freeze([]),
+    notApplicable: Object.freeze({}),
+    allNotApplicable: ETF_REASON,
+    contextOnly: Object.freeze(['dividendYield']),
+    noScoreReason: 'An ETF is a basket of companies with no accounts of its own to score. The verdict uses price behaviour only.',
+  }),
+  INDEX: Object.freeze({
+    label: 'Index',
+    scoring: Object.freeze([]),
+    notApplicable: Object.freeze({}),
+    allNotApplicable: INDEX_REASON,
+    contextOnly: Object.freeze([]),
+    noScoreReason: 'An index is a calculated level with no accounts to score. The verdict uses price behaviour only.',
+  }),
   CRYPTO: Object.freeze({
     label: 'Crypto',
     scoring: Object.freeze([]),
     notApplicable: Object.freeze({}),
     allNotApplicable: CRYPTO_REASON,
+    contextOnly: Object.freeze(['marketCap']),
+    noScoreReason: 'Crypto assets have no earnings, balance sheet or cash flow to score. The verdict uses price behaviour only.',
   }),
 });
 
@@ -119,7 +143,7 @@ function scoringRule(profileKey, id) {
 
 function profileBlock(ctx, id) {
   const profile = PROFILES[ctx.profile];
-  if (profile.allNotApplicable && id !== 'marketCap') return profile.allNotApplicable;
+  if (profile.allNotApplicable && !(profile.contextOnly ?? []).includes(id)) return profile.allNotApplicable;
   return profile.notApplicable[id] ?? null;
 }
 
@@ -145,7 +169,9 @@ function scoreMetric(ctx, id, value, unit) {
       steps: [],
       meta: { scored: false, weight: 0, subScore: null },
       tone: reference ? scoreTone(reference.score) : null,
-      sentence: `Shown for context: it is not part of the ${profileLabel} score.`,
+      sentence: PROFILES[ctx.profile].scoring.length
+        ? `Shown for context: it is not part of the ${profileLabel} score.`
+        : `Shown for context only: there is no fundamental score for this kind of asset (${profileLabel}).`,
       thresholds: REFERENCE_ANCHORS[id] ? anchorThresholds(REFERENCE_ANCHORS[id], unit) : [],
     };
   }
@@ -490,7 +516,7 @@ function buildFundamentalScore(ctx, metrics) {
     return notAvailable({
       id, label, unit: 'score', meta: { profile: ctx.profile, coverage: 0 },
       formula: 'No fundamental score for this asset class',
-      reason: 'Crypto assets have no earnings, balance sheet or cash flow to score. The verdict uses price behaviour only.',
+      reason: profile.noScoreReason ?? 'There are no accounts to score for this asset. The verdict uses price behaviour only.',
     });
   }
   const components = profile.scoring.map((rule) => ({

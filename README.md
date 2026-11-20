@@ -1,6 +1,6 @@
 # QuantLens
 
-**A multi-asset comparison workstation that shows its working.** Compare US stocks, Singapore stocks and crypto side by side, rank a watchlist, and test a portfolio allocation. Every indicator, score, ratio, verdict and position size can be opened to reveal the formula, the raw inputs and the arithmetic, step by step.
+**A multi-asset comparison workstation that shows its working.** Compare US and Singapore stocks, REITs, ETFs, market indices and crypto side by side, rank a watchlist, and test a portfolio allocation. Every indicator, score, ratio, verdict and position size can be opened to reveal the formula, the raw inputs and the arithmetic, step by step.
 
 [![Update market data and deploy](https://github.com/myc208/quantlens/actions/workflows/update-market-data.yml/badge.svg)](https://github.com/myc208/quantlens/actions/workflows/update-market-data.yml)
 
@@ -10,7 +10,7 @@
 
 > QuantLens is an educational tool. Its verdicts, position sizes and portfolio statistics come from fixed, published rules so that they can be checked. They are not financial advice.
 
-**What V2 adds:** three views (Compare, Leaderboard, Portfolio), a time-range slicer, a `Ctrl/Cmd + K` command palette, Modern Portfolio Theory maths in a Web Worker, de-duplicated news with headline tone, a 30-day Prophet projection that is always shown beside its own track record, 10-year government yields as the risk-free rate, and a CI gate that runs the whole test suite in a headless browser before anything is deployed.
+**What V2 adds:** three views (Compare, Leaderboard, Portfolio), a time-range slicer, a `Ctrl/Cmd + K` command palette, Modern Portfolio Theory maths in a Web Worker, de-duplicated news with headline tone, a 30-day Prophet projection that is always shown beside its own track record, 10-year government yields as the risk-free rate, a CI gate that runs the whole test suite in a headless browser before anything is deployed, and an optional daily briefing on Telegram.
 
 ---
 
@@ -26,16 +26,17 @@
 8. [News de-duplication and headline tone](#news-de-duplication-and-headline-tone)
 9. [Prophet forecasting and its limits](#prophet-forecasting-and-its-limits)
 10. [CI/CD and the testing gates](#cicd-and-the-testing-gates)
-11. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
-12. [The Derivation Tracer](#the-derivation-tracer)
-13. [The mathematics](#the-mathematics)
-14. [Numerical safety](#numerical-safety)
-15. [Testing](#testing)
-16. [Accessibility and responsive design](#accessibility-and-responsive-design)
-17. [Deployment](#deployment)
-18. [Changing the watchlist](#changing-the-watchlist)
-19. [Design decisions and known limitations](#design-decisions-and-known-limitations)
-20. [Interview talking points](#interview-talking-points)
+11. [Daily Telegram briefing](#daily-telegram-briefing)
+12. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
+13. [The Derivation Tracer](#the-derivation-tracer)
+14. [The mathematics](#the-mathematics)
+15. [Numerical safety](#numerical-safety)
+16. [Testing](#testing)
+17. [Accessibility and responsive design](#accessibility-and-responsive-design)
+18. [Deployment](#deployment)
+19. [Changing the watchlist](#changing-the-watchlist)
+20. [Design decisions and known limitations](#design-decisions-and-known-limitations)
+21. [Interview talking points](#interview-talking-points)
 
 ---
 
@@ -49,14 +50,25 @@
 | **Time range** | `1M` `3M` `6M` `1Y`. Slices the series behind the charts, period statistics, correlation, the simulation's volatility and the portfolio maths. It never changes the verdict. |
 | **Command palette** | `Ctrl/Cmd + K` finds any asset by ticker, name or sector and runs any command: switch view, change range, currency or mode, open the risk sandbox, copy the share link. |
 | **Screener** | Filter by asset class, market, sector and verdict; tick up to three assets. No market data is ever typed in. |
-| **Sector-aware scoring** | Corporates, banks and REITs are each scored on the measures that apply to them. A bank is never judged on EV/EBITDA. |
+| **Sector-aware scoring** | Corporates, financial companies and REITs are each scored on the measures that apply to them. A bank is never judged on EV/EBITDA. ETFs, indices and crypto have no accounts, so their verdict rests on price behaviour alone. |
 | **Derivation drawer** | Click any value to see its formula, raw inputs, numbered arithmetic and thresholds, then drill into the numbers it is built from. |
 | **Guided and Pro modes** | Guided explains every metric in plain language. Pro is the same data at higher density, with extra rows. |
 | **News and forecast** | Three recent, de-duplicated headlines per asset with the tone of their wording, and a 30-day trend projection with its measured miss rate. Context only: neither is part of the verdict. |
 | **Risk sandbox** | Change account size, risk per trade, stop distance and position cap, and watch the position and a Monte Carlo fan of outcomes respond. |
 | **Telemetry bar** | Live crypto ticks, USD/SGD, the US and Singapore 10-year yields and the age of the daily data, each labelled with its source and fallback state. |
+| **Daily briefing** | Optional. After each scheduled refresh, a short Telegram message with the top BUY and SELL signals, notable shifts in headline tone, and whether the run passed its checks. |
 
-The default watchlist: `AAPL` `NVDA` `MSFT` `GOOGL` `AMZN` `JPM` `D05.SI` `O39.SI` `Z74.SI` `C38U.SI` `BTC-USD` `ETH-USD`. It is designed for up to about 30 tickers.
+The watchlist (23 assets, designed for up to about 30):
+
+| Class | Tickers |
+|---|---|
+| Crypto | `BTC-USD` `ETH-USD` `AVAX-USD` |
+| US equities | `BLK` `SNDK` `MU` `AMD` `ORCL` `BRK-B` `TSLA` `CCJ` |
+| Singapore equities and REITs | `D05.SI` `U11.SI` `C6L.SI` `AJBU.SI` `A17U.SI` `J69U.SI` |
+| ETFs | `VOO` (NYSE Arca) · `CSPX.L` (London, quoted in USD) |
+| Indices | `^IXIC` `^GSPC` `^DJI` `^STI` |
+
+The comparison opens on `AMD`, `D05.SI` and `BTC-USD`: one corporate, one bank, one coin.
 
 ---
 
@@ -78,6 +90,12 @@ pip install -r scripts/requirements.txt
 
 ```bash
 python scripts/fetch_fundamentals.py
+```
+
+To preview the Telegram briefing without sending anything, leave the two `TELEGRAM_*` variables unset: the command does nothing and exits 0. With them set it sends one message.
+
+```bash
+python scripts/fetch_fundamentals.py --notify
 ```
 
 To run the same two gates that CI runs:
@@ -107,7 +125,11 @@ flowchart LR
     ML -->|"sanitise and validate"| GATE{"Gate 1: unit tests. Gate 2: browser tests"}
     GATE -->|"pass: commit"| SNAP[("data/market_snapshot.json")]
     GATE -->|"fail"| KEEP["nothing committed, nothing deployed"]
+    SNAP --> SIG["scripts/signals.mjs: the site's engines in Node"]
+    GATE -.->|"status, pass or fail"| TG["--notify: daily briefing"]
+    SIG --> TG
   end
+  TG --> TELE[("Telegram Bot API")]
 
   subgraph WEB["Browser: static site on GitHub Pages"]
     direction TB
@@ -146,8 +168,10 @@ flowchart LR
 ```
 .github/workflows/update-market-data.yml   refresh, two test gates, deploy to Pages
 scripts/watchlist.json                     the assets to track
-scripts/fetch_fundamentals.py              prices, statements, news, yields, forecasts -> validated JSON
-scripts/test_fetch_fundamentals.py         66 unit tests for the pipeline (Gate 1)
+scripts/fetch_fundamentals.py              prices, statements, news, yields, forecasts -> validated JSON;
+                                           --notify sends the Telegram briefing
+scripts/signals.mjs                        runs the site's engines in Node.js for the briefing's signals
+scripts/test_fetch_fundamentals.py         91 unit tests for the pipeline (Gate 1)
 scripts/run_browser_tests.py               headless Chrome/Edge runner for the test page (Gate 2)
 scripts/requirements.txt                   yfinance, vaderSentiment, prophet (pipeline only)
 data/market_snapshot.json                  schema v2 snapshot (committed)
@@ -163,7 +187,7 @@ src/engines/   technicalEngine.js  fundamentalEngine.js  correlationEngine.js  a
 src/ui/        telemetryBar.js  appTabs.js  commandPalette.js  screenerPanel.js
                comparisonMatrix.js  leaderboardView.js  portfolioSandbox.js
                derivationDrawer.js  riskSandboxModal.js
-tests/engines.test.html                    266 browser-run tests in 30 suites, zero dependencies
+tests/engines.test.html                    275 browser-run tests in 31 suites, zero dependencies
 ```
 
 ---
@@ -192,18 +216,18 @@ That one decision buys clean first loads, links that reproduce a view exactly, c
 
 | Parameter | Meaning | Values | Default (omitted from the URL) |
 |---|---|---|---|
-| `t` | Compared tickers, comma-separated, at most 3 | any watchlist ticker | `AAPL,D05.SI,BTC-USD` |
+| `t` | Compared tickers, comma-separated, at most 3 | any watchlist ticker (`^GSPC` may be written `%5EGSPC`) | `AMD,D05.SI,BTC-USD` |
 | `ccy` | Display, account and portfolio base currency | `USD` `SGD` | `USD` |
 | `mode` | Explanation level | `guided` `pro` | `guided` |
 | `view` | Active tab | `compare` `leaderboard` `portfolio` | `compare` |
 | `range` | Time range | `1m` `3m` `6m` `1y` | `1y` |
-| `p` | Portfolio allocation as `TICKER:percent` pairs, at most 8 | `AAPL:40,D05.SI:35,BTC-USD:25` | the compared assets at equal weights |
-| `class` | Asset-class filter | `equity` `crypto` | all |
-| `mkt` | Market filter | `US` `SG` `CRYPTO` | all |
+| `p` | Portfolio allocation as `TICKER:percent` pairs, at most 8 | `AMD:40,D05.SI:35,BTC-USD:25` | the compared assets at equal weights |
+| `class` | Asset-class filter | `equity` `etf` `index` `crypto` | all |
+| `mkt` | Market filter | `US` `SG` `UK` `CRYPTO` | all |
 | `sector` | Sector filter | any sector in the snapshot | all |
 | `verdict` | Verdict filter | `buy` `hold` `sell` | all |
 
-Example: `?t=NVDA,MSFT&ccy=SGD&mode=pro&view=portfolio&range=6m&p=NVDA:25,MSFT:25,D05.SI:50`
+Example: `?t=MU,AMD&ccy=SGD&mode=pro&view=portfolio&range=6m&p=MU:25,AMD:25,D05.SI:50`
 
 How it works:
 
@@ -333,14 +357,16 @@ flowchart TD
 | **Flaky source** | Up to 3 attempts per call with exponential backoff and jitter, never past the ticker's deadline. |
 | **Partial failure** | A failed asset keeps its previous entry, marked `stale`. Failed news or a failed forecast keeps the previous block, marked `stale`. If more than half the watchlist is not fresh, or validation fails, nothing is written. |
 
-A full run for the 12-asset watchlist takes about 40 seconds, of which the 24 model fits take about 7.
+A full run for the 23-asset watchlist takes about 60 seconds, of which the 46 model fits take about 12.
 
 ### Data hygiene
 
 | Concern | Handling |
 |---|---|
 | **`NaN` and `Infinity`** | `clean_number` converts anything that is not a finite number to `null`. The JSON encoder runs with `allow_nan=False` as a backstop. |
-| **In-progress sessions** | A candle dated today is kept only after that market's close; the current UTC day is always dropped for crypto. |
+| **In-progress sessions** | A candle dated today is kept only after that market's close, in the exchange's own time zone (New York 16:00, Singapore 17:00, London 16:30, plus 20 minutes); the current UTC day is always dropped for crypto. |
+| **Assets without accounts** | ETFs, indices and crypto get no statements request at all (fewer calls, nothing to misread). Their fundamentals are `null`, except crypto's market cap and an ETF's trailing distribution yield, kept for context. |
+| **Implausible Price-to-Book** | If Yahoo's P/B differs from market cap ÷ book equity by more than a factor of two (same currency only), the computed value is used and logged. Yahoo has reported Berkshire Hathaway B at 0.001; the check corrects it to about 1.6. |
 | **Bad ticks** | High and low are repaired so that `high ≥ max(open, close)` and `low ≤ min(open, close)`; rows with missing prices are dropped. |
 | **Period consistency** | Revenue, operating income, EBIT, EBITDA and net income are all taken from the *same* period. Trailing twelve months is preferred. |
 | **Gaps in statements** | A TTM figure is summed only from contiguous quarters (or halves, for semi-annual reporters). A missing quarter is never mistaken for semi-annual reporting, and an implausible sum is rejected; the latest fiscal year is used instead and labelled, for example `FY2025`. |
@@ -370,12 +396,12 @@ A full run for the 12-asset watchlist takes about 40 seconds, of which the 24 mo
   "forecastFields": ["date", "yhat", "lower", "upper"],
   "assets": [
     {
-      "ticker": "AAPL", "name": "Apple Inc.",
-      "assetClass": "equity",            // equity | crypto
-      "market": "US",                    // US | SG | CRYPTO
+      "ticker": "AMD", "name": "Advanced Micro Devices, Inc.",
+      "assetClass": "equity",            // equity | etf | index | crypto
+      "market": "US",                    // US | SG | UK | CRYPTO
       "currency": "USD", "financialCurrency": "USD",
       "sector": "Technology", "industry": "Consumer Electronics",
-      "scoringProfile": "CORPORATE",     // CORPORATE | FINANCIAL | REIT | CRYPTO
+      "scoringProfile": "CORPORATE",     // CORPORATE | FINANCIAL | REIT (equities) | ETF | INDEX | CRYPTO
       "lotSize": 1, "binanceSymbol": null,
       "status": "fresh", "statusNote": null,
       "fundamentalsPeriod": "TTM",       // TTM | FY2025
@@ -457,7 +483,8 @@ Each stored story's headline is scored with **VADER** (`vaderSentiment` 3.3.2, p
 - VADER is a general-purpose word list. It does not know that "beats estimates" is good or "cuts guidance" is bad, and many financial headlines score exactly zero.
 - It reads headlines only, never article bodies, and three stories is a small sample.
 - Coverage is uneven: US large caps have fresh news daily, some Singapore names have headlines that are weeks old. Those are marked `stale` (newest older than 7 days) and shown in neutral tone with "old headlines".
-- In the committed snapshot the feed arrived already de-duplicated (159 headlines, 159 stories). The clustering is insurance, and its behaviour is established by tests rather than by today's data.
+- Live feeds are mostly unique already. In the 20 November 2026 snapshot, 278 headlines formed 276 stories: one syndicated copy each was folded in for `BTC-USD` and `^DJI`. The boundaries themselves are established by tests rather than by the day's data.
+- Two feeds are empty: Yahoo publishes no headlines for `^STI` or `CSPX.L`, so those assets show "no recent headlines" rather than borrowing another symbol's news.
 - **Tone is context only. It is not an input to any score or to the verdict.**
 
 Headlines are rendered as links only when they are `http(s)` URLs, open in a new tab with `rel="noopener noreferrer"`, and pass through the same HTML escaping as every other dynamic string.
@@ -497,12 +524,14 @@ Measured across three separate 30-day holdout windows and all 12 assets while bu
 
 - Model mean error **about 5.3%**; "no change" mean error **about 4.4%**.
 
-In the committed snapshot (17 November 2026):
+In the 12-asset snapshot of 17 November 2026: mean miss **6.6%** against **4.7%** for assuming no change; better than "no change" for **2 of 12** assets; direction right for **5 of 12**; the 80% band held on **58%** of days.
 
-- Mean miss **6.6%** against **4.7%** for assuming no change.
-- The model beat "no change" for **2 of 12** assets.
-- It called the direction correctly for **5 of 12**: worse than a coin.
-- Its 80% band contained the actual price on **58%** of days. The band is too narrow.
+In the 23-asset snapshot of 20 November 2026, a month that included a broad sell-off:
+
+- Mean miss **9.7%** against **7.8%** for assuming no change.
+- The model beat "no change" for **7 of 23** assets.
+- It called the direction correctly for **8 of 23**: worse than a coin.
+- Its 80% band contained the actual price on **42%** of days. The band is far too narrow when markets turn.
 
 **The honest summary: over one month, this model does not beat assuming the price stays where it is.** That is the expected result for a trend-extrapolating model on liquid assets, and it is why the feature is built the way it is:
 
@@ -538,7 +567,9 @@ flowchart LR
   D --> REF
   P --> TEST["test"]
   PR --> TEST
-  REF --> V["validate snapshot"] --> G1["Gate 1: 66 pipeline unit tests"] --> G2["Gate 2: 266 browser tests in headless Chrome"] --> C["commit snapshot"]
+  REF --> V["validate snapshot"] --> G1["Gate 1: 91 pipeline unit tests"] --> G2["Gate 2: 275 browser tests in headless Chrome"] --> C["commit snapshot"]
+  C --> TG["Telegram briefing, always runs, never fails the job"]
+  V -.->|"any failure"| TG
   TEST --> V2["validate, Gate 1, Gate 2"]
   C --> DEP["deploy to Pages"]
   V2 -->|"never on a pull request"| DEP
@@ -546,11 +577,11 @@ flowchart LR
 
 | Job | Runs on | What it does |
 |---|---|---|
-| `refresh` | schedule, manual dispatch | Fetch → validate the schema → **Gate 1** → **Gate 2 against the new data** → commit. If any step fails, nothing is committed. |
+| `refresh` | schedule, manual dispatch | Fetch → validate the schema → **Gate 1** → **Gate 2 against the new data** → commit → Telegram briefing. If any check fails, nothing is committed; the briefing still runs and reports the failure. |
 | `test` | every push and pull request | Validate the committed snapshot → Gate 1 → Gate 2. |
 | `deploy` | after a successful `refresh` or `test`, never on a pull request | Publish the static site to GitHub Pages. |
 
-**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 66 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, and snapshot validation.
+**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 91 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API.
 
 **Gate 2: the browser suite, headless** (`python scripts/run_browser_tests.py --min-tests 100`). The runner starts a local web server, launches headless Chrome or Edge at `tests/engines.test.html`, and waits for the page to report its results to a one-time same-origin URL. It uses only the Python standard library.
 
@@ -568,8 +599,65 @@ Other properties:
 
 - **Why the workflow deploys Pages itself.** A commit pushed with the built-in `GITHUB_TOKEN` does not start other workflows. Deploying in the same run guarantees a data commit is always published.
 - **Least privilege.** The default token permission is read-only; `contents: write` is granted to the refresh job alone and `pages: write` to the deploy job alone.
+- **Node.js 22** is set up in both the refresh and test jobs. It runs `scripts/signals.mjs` for the briefing, and Gate 1 tests that bridge over the committed snapshot.
 - **Dependencies.** `prophet` and `vaderSentiment` are pinned because they define what stored numbers mean. `yfinance` has a lower bound only: when Yahoo changes an endpoint the fix ships in a new release, and the gates catch any drift in what it returns.
 - **Self-sustaining.** GitHub disables scheduled workflows in repositories with no activity for 60 days; the daily data commit counts as activity. Scheduled runs are best-effort on GitHub's side, and manual dispatch covers a skipped day.
+
+---
+
+## Daily Telegram briefing
+
+After each scheduled refresh, a short message arrives in a Telegram chat. It is optional and off until two repository secrets exist.
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy its token.
+2. Send the bot one message, then find your chat id (for example from `https://api.telegram.org/bot<token>/getUpdates`).
+3. In the repository: **Settings → Secrets and variables → Actions → New repository secret**, add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+
+Nothing else is configured. The next scheduled or manually dispatched refresh sends the first briefing.
+
+### What it says
+
+```
+QuantLens daily briefing
+Fri 20 Nov 2026
+
+✅ Every check passed. 23 assets, 23 fresh. The site redeploys with this data.
+
+Top BUY signals
+1. C6L.SI Singapore Airlines Limited · 70/100 · High confidence
+
+Top SELL signals
+1. ^STI Straits Times Index · 13/100 · Low confidence
+2. BTC-USD Bitcoin · 14/100 · Low confidence
+...
+
+All verdicts: 1 BUY · 8 HOLD · 14 SELL
+
+Headline tone shifts
+• TSLA neutral → negative (+0.02 → −0.41)
+   Tesla recalls ...
+
+Open QuantLens · Run log
+Rule-based signals for learning, not financial advice.
+```
+
+(The signals are the 20 November 2026 snapshot's; the tone shift is illustrative.)
+
+| Part | Rule |
+|---|---|
+| **Signals** | Up to five BUYs by Composite score, best first, and up to five SELLs, worst first, with each verdict's confidence. Then the count of every verdict. |
+| **Headline tone shifts** | Assets whose headline tone flipped between positive and negative, or whose mean VADER score moved by at least 0.25 since the previous snapshot. Fresh news only, largest move first, at most five, each with its newest headline. |
+| **Status** | Which of the five steps (refresh, schema validation, Gate 1, Gate 2, commit) failed first, if any. A failed refresh reports the last good snapshot's signals and says so. A failed check withholds the signals entirely, because that data was not published. |
+
+### How it is built
+
+- **One source of truth for the signals.** The verdicts come from the site's own JavaScript engines, run in Node.js by `scripts/signals.mjs` over the same snapshot. Re-implementing the scoring in Python would create a second copy that could quietly disagree with the site.
+- **No new dependencies.** The message is sent with Python's `urllib.request` to the Bot API's `sendMessage`, formatted as MarkdownV2 with every special character escaped. If Telegram rejects the formatting, the same content is resent as plain text.
+- **The status is real.** The briefing is the last step of the refresh job and runs whatever happened before it (`if: always()`). Each earlier step's outcome is passed in as an environment variable, so the message reports the gates and the commit, not just the fetch.
+- **Least exposure.** The two secrets are given to the briefing step only, not to the steps that run third-party data code. The token never appears in a log line: every warning is redacted.
+- **It can never break the pipeline.** Missing secrets (local runs, pull requests, forks) skip it silently. An unreachable API, a bad token or an unexpected error is a warning; network errors and server errors get one retry. The command always exits 0, and the step is also marked `continue-on-error`, so the deployment never waits on Telegram.
 
 ---
 
@@ -712,7 +800,7 @@ Volatility is deliberately not scored: it already shrinks the position through t
 | ROE | 10% | ≤0%→0, 10%→50, ≥25%→100 |
 | Forward P/E | 10% | ≤12→100, 20→60, 35→20, ≥50→0 |
 
-**Bank / financial** (sector = Financial Services)
+**Financial** (sector = Financial Services: banks, insurers and asset managers such as `BLK` and `BRK-B`)
 
 | Metric | Weight | Anchors |
 |---|---|---|
@@ -721,7 +809,7 @@ Volatility is deliberately not scored: it already shrinks the position through t
 | Net margin | 20% | ≤10%→0, 20%→50, ≥35%→100 |
 | Trailing P/E | 15% | ≤8→100, 12→70, 18→30, ≥25→0 |
 
-EV/EBITDA, operating margin, FCF yield and Debt/Equity are `N/A` for banks, with the reason shown: deposits and borrowings are a bank's raw material, and interest is its core business rather than a financing cost.
+EV/EBITDA, operating margin, FCF yield and Debt/Equity are not used for financial companies, with the reason shown: for banks and insurers, deposits, borrowings and reserves are raw material, and interest is part of the business rather than a financing cost.
 
 **REIT** (sector = Real Estate)
 
@@ -732,7 +820,7 @@ EV/EBITDA, operating margin, FCF yield and Debt/Equity are `N/A` for banks, with
 | Gearing (debt ÷ assets) | 25% | ≤30%→100, 40%→50, ≥50%→0 (50% is the MAS leverage cap) |
 | Operating margin | 10% | ≤30%→0, ≥65%→100 |
 
-**Crypto** has no earnings, balance sheet or cash flow, so it has no fundamental score.
+**ETF**, **Index** and **Crypto** have no accounts of their own, so they have no fundamental score, and every company measure is `N/A` with a reason that names the asset class. An ETF is a basket of companies (its trailing distribution yield is shown for context); an index is a calculated level; crypto has no earnings, balance sheet or cash flow (its market cap is shown for context).
 
 Rules common to all profiles:
 
@@ -742,7 +830,7 @@ Rules common to all profiles:
 
 ### Verdict
 
-- **Composite:** stocks `0.5 × Technical + 0.5 × Fundamental`; crypto, or a stock with no fundamental score, Technical only.
+- **Composite:** stocks and REITs `0.5 × Technical + 0.5 × Fundamental`; ETFs, indices, crypto, or a stock with no fundamental score, Technical only.
 - **Bands:** ≥ 65 BUY · 45 to < 65 HOLD · < 45 SELL.
 - **Guardrails** (each caps a BUY at HOLD and appears as a step in the trace): close below SMA200 while MACD is below its signal; RSI above 80; Fundamental score below 30.
 - **Confidence:** High when the two scores are within 20 points and data coverage is at least 80%; Medium within 35 points; Low otherwise, and always Low for a Technical-only verdict.
@@ -761,6 +849,8 @@ Inputs: account equity `A`, risk per trade `r`, entry `E`, ATR multiple `m`.
 7. `Units = raw × haircut × multiplier`, rounded **down** to the lot size (100 on SGX, 1 in the US, 0.000001 for crypto)
 8. Cap: position value ≤ maximum position % of the account
 9. Outputs: units, position value, amount at risk, 2R target (`E + 2R`)
+
+An **index** is never sized: it cannot be bought directly, and the sizing table says so and points to a fund that tracks it. ETFs are sized in shares, like stocks.
 
 **Why the haircut has that shape.** Take `n` equally sized positions, each with risk `σ`, and average pairwise correlation `ρ̄`. Their combined variance is `σ²(n + n(n − 1)ρ̄)`, against `σ²n` if they were independent. Scaling each position by `1 ÷ √(1 + (n − 1)ρ̄)` brings the combined variance back to `σ²n`. Three assets at `ρ̄ = 0.8` are each cut to 62% of their size. Negative correlation is floored at zero: a hedge never increases a position.
 
@@ -805,9 +895,9 @@ Portfolio mathematics is described under [Web Worker and portfolio maths](#web-w
 
 Two suites, both run in CI as deployment gates.
 
-**`tests/engines.test.html`: 266 tests in 30 suites**, a zero-dependency test page. Open it in a browser and it runs in about five seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
+**`tests/engines.test.html`: 275 tests in 31 suites**, a zero-dependency test page. Open it in a browser and it runs in about five seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
 
-**`scripts/test_fetch_fundamentals.py`: 66 tests** of the Python pipeline, standard-library `unittest`.
+**`scripts/test_fetch_fundamentals.py`: 91 tests** of the Python pipeline, standard-library `unittest`.
 
 Every formula is verified against an independent source of truth:
 
@@ -831,7 +921,7 @@ The suite also asserts architectural promises: the default view has an empty que
 
 ## Accessibility and responsive design
 
-- **Semantics.** Real tables with row and column headers, native `<dialog>` for both modals (focus trap, Escape and focus return handled by the browser), `<fieldset>` radio groups for the switches and the time range, and every value a real `<button>` with a spoken label such as "RSI (14) for AAPL: 60.9, healthy. Show how it is calculated."
+- **Semantics.** Real tables with row and column headers, native `<dialog>` for both modals (focus trap, Escape and focus return handled by the browser), `<fieldset>` radio groups for the switches and the time range, and every value a real `<button>` with a spoken label such as "RSI (14) for AMD: 60.9, healthy. Show how it is calculated."
 - **Tabs.** The view switcher is a WAI-ARIA tablist with automatic activation: arrow keys, Home and End move between tabs, and each tab controls a labelled tab panel.
 - **Command palette.** The combobox pattern with a listbox popup. Focus never leaves the text box; the highlighted option is exposed through `aria-activedescendant`, results are grouped and labelled, and the number of results is announced in a polite live region. There is exactly one tab stop.
 - **Sortable table.** Column headers are buttons and the current order is exposed with `aria-sort`.
@@ -869,8 +959,10 @@ Edit `scripts/watchlist.json` and run the workflow. Each entry needs:
   "currency": "USD", "lotSize": 1, "binanceSymbol": null, "scoringProfile": null }
 ```
 
-- `scoringProfile: null` lets the script choose from the sector. Set it to override.
-- Crypto assets need `assetClass: "crypto"`, `market: "CRYPTO"`, `scoringProfile: "CRYPTO"` and a `binanceSymbol`.
+- `assetClass` is `equity` (stocks and REITs), `etf`, `index` or `crypto`. `market` is `US`, `SG`, `UK` or `CRYPTO`; it decides when a day's candle counts as complete.
+- For equities, `scoringProfile: null` lets the script choose from the sector (`CORPORATE`, `FINANCIAL` or `REIT`); set one of those to override. ETFs, indices and crypto always use `ETF`, `INDEX` and `CRYPTO`.
+- Crypto assets also need a `binanceSymbol` for the live feed (for example `AVAXUSDT`).
+- Index symbols keep Yahoo's leading caret (`^GSPC`). London listings end in `.L`; use one quoted in USD or SGD (`CSPX.L` is in USD), because other currencies cannot be converted.
 - Assets need at least 200 completed daily candles and must trade in a three-letter ISO currency. Display and portfolio conversion support USD and SGD.
 - Keep the list to about 30 tickers. Each one costs a pause, a handful of requests and two model fits; 30 stays comfortably inside the time budget.
 
@@ -891,14 +983,18 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 | **Position sizes change with the time range.** | The haircut uses the same correlation the card displays. Two different correlations on one screen would be worse. |
 | **Fundamental thresholds are absolute and lean towards value.** | With a small watchlist there is no meaningful peer group for relative scoring. Fast-growing companies score low on valuation, and the trace says so. |
 | **The weak-business guardrail cannot fire under 50/50 weights.** | A Fundamental score below 30 caps the composite just under 65, so it can never be a BUY anyway. The rule is kept as a safety net if the weights change, and a test documents this. |
-| **Cross-market correlations are understated.** | US and Singapore closes are hours apart. The trace flags these pairs as a lower bound rather than applying an unprincipled adjustment. |
+| **Cross-market correlations are understated.** | US, London and Singapore closes are hours apart. `VOO` and `CSPX.L` hold the same index, yet their daily closes correlate at 0.71 over the year, against 0.998 for `VOO` and `^GSPC`. The trace flags these pairs as a lower bound rather than applying an unprincipled adjustment. |
+| **Index levels are shown in their quote currency.** | Yahoo quotes `^GSPC` in USD and `^STI` in SGD, so an index level is labelled and converted like a price. It is a level, not something you can pay, which is why indices are never sized. |
+| **Financial companies share one profile.** | Yahoo's "Financial Services" sector covers banks, insurers and asset managers, so `BLK` is scored like `D05.SI`. That is reasonable on ROE, P/B, net margin and P/E, but an asset manager does report a meaningful EBITDA that the profile leaves out. The watchlist can override the profile per ticker. |
+| **Some companies report in a third currency.** | `CCJ` trades in USD but reports in CAD. Ratios that mix market value with statement figures need a conversion that does not exist here, so they are `N/A` with that reason. |
+| **The briefing needs Node.js.** | Running the site's engines guarantees the message matches the site. If Node is missing the briefing still goes out, with its status and tone shifts but without signals, and says so. |
 | **Stocks are end-of-day only.** | No free, key-less, CORS-enabled intraday equity feed exists. Rather than fake it, the interface labels stock prices as the last daily close. |
 | **Crypto is quoted against USDT.** | Binance's public feed uses USDT, which normally trades within a fraction of a percent of the US dollar. The price trace states this. |
 | **Yahoo Finance is an unofficial source.** | It can rate-limit or change shape. Polite pacing, deadlines, keep-last-good, schema validation and the two gates mean the site degrades to slightly older data instead of breaking. |
 | **Leaderboard sort order is not in the URL.** | It resets to Composite on reload. Everything that changes *what* is shown is in the URL; the order of one table was judged not worth another parameter. |
 | **ES modules with no build step.** | Nothing to install, nothing to go stale, and the deployed code is the code in the repository. The cost is more HTTP requests, which HTTP/2 on Pages absorbs. |
 | **Rendering by template strings.** | A framework would add a build and a dependency. All dynamic text, including third-party headlines, passes through one escape function. |
-| **Only USD and SGD are converted.** | These are the two currencies of the watchlist. Any other pair returns `N/A` rather than a guess. |
+| **Only USD and SGD are converted.** | These are the two trading currencies of the watchlist. Any other pair returns `N/A` rather than a guess. |
 | **Manual browser testing was done in Chromium-based browsers.** | Desktop and phone widths, with the suite also run headlessly in Edge and in Chrome on CI. The code uses widely supported standards (`<dialog>`, `inert`, `color-mix`, container queries, module workers), but Safari and Firefox were not exercised. |
 
 ---
@@ -911,7 +1007,7 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 
 **Why a Web Worker for maths that takes 10 ms?** Because the cost is not one run, it is a slider firing sixty. The interesting part is not the worker but the concurrency rule around it: requests are keyed by their inputs and the reducer drops any reply whose key is no longer current. Correctness comes from the data model, not from timing. And because the engines are pure, the worker, the main-thread fallback and the tests all import the same file.
 
-**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 332 tests comparing engines with hand calculations, a published example, closed-form results and independent recomputation.
+**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 366 tests comparing engines with hand calculations, a published example, closed-form results and independent recomputation.
 
 **Tell me about the forecast.** I measured it before I drew it. Across three holdout windows the model's error was about 5.3% against 4.4% for assuming no change, so it does not earn a place in the verdict. The interesting engineering decision was to ship it anyway *with its record attached*: dotted line, never coloured, miss rate in the next row. A feature that reports its own failure is more useful than one that hides it.
 
@@ -920,6 +1016,8 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 **What does the CI gate actually protect?** The code is static but the inputs change daily, so every refresh is effectively a deployment. The headless run executes all the engines over the *new* snapshot before it is committed. A provider-side change that would break the page fails the gate, nothing is committed, and yesterday's site stays up.
 
 **What is an example of domain logic changing the design?** Banks. EV/EBITDA and Debt/Equity are meaningless for a bank, so scoring became profile-driven, with weights and anchors as data rather than code. Adding the REIT profile was then a table, not a rewrite.
+
+**How do you add notifications without making them a liability?** Make them the last step, give them the secrets alone, and make failure impossible to propagate: missing credentials do nothing, API errors are warnings, the command always exits 0, and the step is `continue-on-error`. And never compute the content twice: the briefing runs the site's own engines in Node rather than a Python copy of the scoring.
 
 **What would you do next?** Walk-forward backtests of the scoring rules; peer-relative valuation as the watchlist grows; a proper mean-variance solver with constraints, shown next to the random sample so its sensitivity is visible; and a service worker so the last snapshot works offline.
 

@@ -6,13 +6,17 @@ name: Update market data and deploy
 #            pipeline unit tests and the browser test suite against the NEW
 #            snapshot, and only then commits it. If any step fails the job stops:
 #            nothing is committed, nothing is deployed, and the site keeps serving
-#            yesterday's data.
+#            yesterday's data. Last, whatever happened, it sends the daily
+#            Telegram briefing (top signals, headline-tone shifts, run status).
+#            The briefing can never fail the job or block the deployment.
 #   test     Pushes and pull requests. Runs the same two test suites against the
 #            code as pushed.
 #   deploy   Publishes to GitHub Pages. Runs only after a successful refresh, or
 #            after a successful test on a push to the default branch.
 #
 # One-time setup: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+# Optional: repository secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID turn on the
+# daily briefing. Without them the briefing step does nothing.
 
 on:
   schedule:
@@ -39,6 +43,8 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
+  # Runs the site's own engines for the briefing's signals (scripts/signals.mjs).
+  NODE_VERSION: "22"
 
 jobs:
   refresh:
@@ -63,22 +69,35 @@ jobs:
           cache: pip
           cache-dependency-path: scripts/requirements.txt
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
       - name: Install pipeline dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r scripts/requirements.txt
 
+      - name: Keep the previous snapshot for the briefing
+        run: cp data/market_snapshot.json "$RUNNER_TEMP/previous_snapshot.json" || true
+
       - name: Fetch candles, fundamentals, news and macro data
+        id: fetch
         run: python scripts/fetch_fundamentals.py
 
       - name: Validate the snapshot schema
+        id: validate
         run: python scripts/fetch_fundamentals.py --validate-only
 
       - name: "Gate 1: pipeline unit tests"
+        id: gate1
         run: python -m unittest discover -s scripts -p "test_*.py"
 
       - name: "Gate 2: browser test suite against the new snapshot"
+        id: gate2
         run: python scripts/run_browser_tests.py --min-tests 100
 
       - name: Commit the refreshed snapshot
+        id: commit
         env:
           BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -92,6 +111,23 @@ jobs:
           git commit -m "data: refresh market snapshot ($(date -u +%Y-%m-%d))"
           git pull --rebase origin "$BRANCH"
           git push origin "HEAD:$BRANCH"
+
+      # Runs whatever happened above, so a failed run is reported too. The secrets are
+      # given to this step alone, never to the steps that run third-party data code.
+      # The script always exits 0, and continue-on-error is the second line of defence.
+      - name: Send the daily Telegram briefing
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          QUANTLENS_FETCH: ${{ steps.fetch.outcome }}
+          QUANTLENS_VALIDATE: ${{ steps.validate.outcome }}
+          QUANTLENS_GATE1: ${{ steps.gate1.outcome }}
+          QUANTLENS_GATE2: ${{ steps.gate2.outcome }}
+          QUANTLENS_COMMIT: ${{ steps.commit.outcome }}
+        run: python scripts/fetch_fundamentals.py --notify --previous "$RUNNER_TEMP/previous_snapshot.json"
 
   test:
     name: Test
@@ -110,6 +146,11 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: scripts/requirements.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: Install pipeline dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r scripts/requirements.txt

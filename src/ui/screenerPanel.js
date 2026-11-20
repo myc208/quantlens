@@ -12,8 +12,8 @@
 import { MAX_SELECTED, FILTER_OPTIONS, filterAssets, hasActiveFilters } from '../core/store.js';
 import { valueOf } from '../core/derivationTracer.js';
 
-const CLASS_LABELS = Object.freeze({ all: 'All classes', equity: 'Stocks', crypto: 'Crypto' });
-const MARKET_LABELS = Object.freeze({ all: 'All markets', US: 'United States', SG: 'Singapore', CRYPTO: 'Crypto' });
+const CLASS_LABELS = Object.freeze({ all: 'All classes', equity: 'Stocks and REITs', etf: 'ETFs', index: 'Indices', crypto: 'Crypto' });
+const MARKET_LABELS = Object.freeze({ all: 'All markets', US: 'United States', SG: 'Singapore', UK: 'United Kingdom', CRYPTO: 'Crypto' });
 const VERDICT_LABELS = Object.freeze({ all: 'Any verdict', buy: 'Buy', hold: 'Hold', sell: 'Sell' });
 const VERDICT_TONES = Object.freeze({ BUY: 'healthy', HOLD: 'neutral', SELL: 'risky' });
 
