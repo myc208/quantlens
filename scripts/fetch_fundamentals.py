@@ -2,7 +2,7 @@
 """QuantLens market-data pipeline (snapshot schema v2).
 
 Reads ``scripts/watchlist.json`` and writes ``data/market_snapshot.json`` with,
-for every asset:
+for every asset (stocks, REITs, ETFs, indices and crypto):
 
 * one year of daily candles and fundamentals (Yahoo Finance via ``yfinance``),
 * the three most recent *unique* news stories with a sentiment score
@@ -13,6 +13,11 @@ for every asset:
 
 plus two macro inputs: the US and Singapore 10-year government yields, used as
 risk-free rates, and one year of daily USD/SGD closes.
+
+With ``--notify`` it instead sends a short daily briefing about the snapshot to
+Telegram (top BUY and SELL signals, notable shifts in headline tone, and the
+pipeline's status). It never fails: missing credentials skip it silently, and
+an unreachable API is a warning.
 
 Design rules
 ------------
@@ -41,6 +46,7 @@ Usage
     pip install -r scripts/requirements.txt
     python scripts/fetch_fundamentals.py
     python scripts/fetch_fundamentals.py --validate-only
+    python scripts/fetch_fundamentals.py --notify --previous old_snapshot.json
 """
 
 from __future__ import annotations
@@ -58,6 +64,8 @@ import multiprocessing
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -107,9 +115,13 @@ CLUSTER_KEYS = ["title", "link", "publishedAt", "firstSeenAt", "duplicates", "sc
 FORECAST_KEYS = ["status", "model", "modelVersion", "config", "trainedOn", "horizon", "backtest", "points", "note"]
 RISK_FREE_KEYS = ["name", "symbol", "yield", "asOf", "source", "status"]
 
-ASSET_CLASSES = {"equity", "crypto"}
-MARKETS = {"US", "SG", "CRYPTO"}
-PROFILES = {"CORPORATE", "FINANCIAL", "REIT", "CRYPTO"}
+ASSET_CLASSES = {"equity", "crypto", "etf", "index"}
+MARKETS = {"US", "SG", "UK", "CRYPTO"}
+PROFILES = {"CORPORATE", "FINANCIAL", "REIT", "CRYPTO", "ETF", "INDEX"}
+EQUITY_PROFILES = {"CORPORATE", "FINANCIAL", "REIT"}
+# Asset classes with no company accounts of their own. Each has a fixed profile with
+# no fundamental score, and no financial statements are requested for them.
+CLASS_PROFILES = {"crypto": "CRYPTO", "etf": "ETF", "index": "INDEX"}
 STATUSES = {"fresh", "stale"}
 SECTION_STATUSES = {"fresh", "stale", "unavailable"}
 RISK_FREE_STATUSES = {"fresh", "stale", "proxy", "unavailable"}
@@ -117,10 +129,14 @@ SENTIMENT_LABELS = {"positive", "neutral", "negative"}
 
 # Local session close per market. A candle dated "today" is only kept once the
 # session has closed (plus a buffer for Yahoo's delayed quotes).
-SESSION_CLOSE = {"US": dtime(16, 0), "SG": dtime(17, 0)}
+SESSION_CLOSE = {"US": dtime(16, 0), "SG": dtime(17, 0), "UK": dtime(16, 30)}
 CLOSE_BUFFER_MINUTES = 20
 
 SECTOR_PROFILES = {"Financial Services": "FINANCIAL", "Real Estate": "REIT"}
+
+# Yahoo's Price-to-Book is replaced by market cap / book equity when the two differ by
+# more than this factor (it has reported Berkshire Hathaway B at 0.001).
+PRICE_TO_BOOK_TOLERANCE = 2.0
 
 INCOME_ROWS = {
     "totalRevenue": ["Total Revenue", "Operating Revenue"],
@@ -172,7 +188,26 @@ MONTHS = {name: number for number, name in enumerate(
 
 USER_AGENT = "Mozilla/5.0 (compatible; quantlens-data-pipeline)"
 
-TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-=^]{0,14}$")
+# --- Daily briefing (Telegram) ---------------------------------------------------------
+TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_TIMEOUT = 10.0
+TELEGRAM_MAX_CHARS = 3800        # Telegram's hard limit is 4096 characters
+BRIEFING_TOP_SIGNALS = 5         # BUY and SELL signals listed in the briefing
+BRIEFING_MAX_SHIFTS = 5
+SENTIMENT_SHIFT_MIN = 0.25       # a move in headline tone at least this large is notable
+SIGNALS_SCRIPT = REPO_ROOT / "scripts" / "signals.mjs"
+SIGNALS_TIMEOUT = 60.0
+# The refresh job's steps, in order, with the environment variable carrying each outcome.
+PIPELINE_STEPS = (
+    ("QUANTLENS_FETCH", "data refresh"),
+    ("QUANTLENS_VALIDATE", "schema validation"),
+    ("QUANTLENS_GATE1", "Gate 1 (pipeline unit tests)"),
+    ("QUANTLENS_GATE2", "Gate 2 (browser tests)"),
+    ("QUANTLENS_COMMIT", "commit"),
+)
+
+# Yahoo symbols: AAPL, BRK-B, D05.SI, CSPX.L, BTC-USD, and indices with a leading caret (^GSPC).
+TICKER_RE = re.compile(r"^\^?[A-Z0-9][A-Z0-9.\-=]{0,14}$")
 CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -601,11 +636,33 @@ def build_fundamentals(info: dict[str, Any], statements: dict[str, pd.DataFrame]
 
 
 def resolve_profile(entry: dict[str, Any], sector: str | None) -> str:
+    if entry["assetClass"] in CLASS_PROFILES:
+        return CLASS_PROFILES[entry["assetClass"]]
     if entry.get("scoringProfile"):
         return entry["scoringProfile"]
-    if entry["assetClass"] == "crypto":
-        return "CRYPTO"
     return SECTOR_PROFILES.get(sector or "", "CORPORATE")
+
+
+def checked_price_to_book(symbol: str, fundamentals: dict[str, Any], currency: str,
+                          financial_currency: str) -> float | int | None:
+    """Yahoo's Price-to-Book, unless it disagrees wildly with market cap / book equity.
+
+    Both sides of the check must be in the same currency (market cap is in the
+    trading currency, equity in the reporting currency). A reported value that is
+    missing, zero or negative is left alone: the engine explains those cases.
+    """
+    reported = fundamentals.get("priceToBook")
+    market_cap = fundamentals.get("marketCap")
+    equity = fundamentals.get("totalEquity")
+    if (reported is None or reported <= 0 or currency != financial_currency
+            or not market_cap or not equity or market_cap <= 0 or equity <= 0):
+        return reported
+    computed = market_cap / equity
+    if 1 / PRICE_TO_BOOK_TOLERANCE <= reported / computed <= PRICE_TO_BOOK_TOLERANCE:
+        return reported
+    LOG.info("  %s: reported Price-to-Book %g disagrees with market cap / book equity (%.2f); using the latter",
+             symbol, reported, computed)
+    return clean_number(computed, digits=4)
 
 
 def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings: argparse.Namespace,
@@ -616,7 +673,9 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
     are attached afterwards by the caller, so they can never cost an asset its prices.
     """
     symbol = entry["ticker"]
-    is_crypto = entry["assetClass"] == "crypto"
+    asset_class = entry["assetClass"]
+    has_accounts = asset_class == "equity"  # crypto, ETFs and indices publish no company statements
+    pays_out = asset_class in {"equity", "etf"}
     ticker = yf.Ticker(symbol)
 
     history = with_retry(
@@ -627,34 +686,41 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
     if len(candles) < MIN_CANDLES:
         raise FetchError(f"{symbol} has only {len(candles)} completed candles (minimum {MIN_CANDLES})")
     last_close = candles[-1][4]
-    dividend_yield = None if is_crypto else trailing_dividend_yield(history, last_close)
+    dividend_yield = trailing_dividend_yield(history, last_close) if pays_out else None
 
     status, status_note = "fresh", None
     try:
         info = with_retry(f"{symbol} profile", lambda: fetch_info(ticker, symbol),
                           settings.max_retries, settings.retry_delay, deadline)
-        if is_crypto:
-            fundamentals, period = empty_fundamentals(), None
-            fundamentals["marketCap"] = clean_number(info.get("marketCap"))
-        else:
-            statements = fetch_statements(ticker, symbol, settings, deadline)
-            fundamentals, period = build_fundamentals(info, statements, dividend_yield)
         currency = info.get("currency") or entry["currency"]
         if currency != entry["currency"]:
             warn(f"{symbol}: Yahoo reports currency {currency}, watchlist says {entry['currency']}")
+        financial_currency = info.get("financialCurrency") or currency
+        if has_accounts:
+            statements = fetch_statements(ticker, symbol, settings, deadline)
+            fundamentals, period = build_fundamentals(info, statements, dividend_yield)
+            fundamentals["priceToBook"] = checked_price_to_book(symbol, fundamentals, currency, financial_currency)
+        else:
+            # Nothing to score. Crypto keeps its market cap and an ETF its trailing
+            # distribution yield, both shown for context only.
+            fundamentals, period = empty_fundamentals(), None
+            if asset_class == "crypto":
+                fundamentals["marketCap"] = clean_number(info.get("marketCap"))
+            if asset_class == "etf":
+                fundamentals["dividendYieldTTM"] = dividend_yield
         meta = {
             "name": entry.get("name") or info.get("longName") or info.get("shortName") or symbol,
             "currency": currency,
-            "financialCurrency": info.get("financialCurrency") or currency,
-            "sector": None if is_crypto else info.get("sector"),
-            "industry": None if is_crypto else info.get("industry"),
+            "financialCurrency": financial_currency,
+            "sector": info.get("sector") if has_accounts else None,
+            "industry": info.get("industry") if has_accounts else None,
         }
     except FetchError as exc:
         if previous is None:
             raise
         warn(f"{symbol}: fundamentals unavailable ({exc}); carrying them over from the previous snapshot")
         fundamentals = {key: previous["fundamentals"].get(key) for key in FUNDAMENTAL_KEYS}
-        if not is_crypto:
+        if pays_out:
             fundamentals["dividendYieldTTM"] = dividend_yield
         period = previous.get("fundamentalsPeriod")
         meta = {key: previous.get(key) for key in ("name", "currency", "financialCurrency", "sector", "industry")}
@@ -1437,13 +1503,13 @@ def validate_asset(asset: Any) -> list[str]:
             err(f"{key} must be a 3-letter ISO code (got {asset[key]!r})")
     if asset["scoringProfile"] not in PROFILES:
         err(f"scoringProfile must be one of {sorted(PROFILES)}")
-    if asset["assetClass"] == "crypto":
-        if asset["scoringProfile"] != "CRYPTO":
-            err("crypto assets must use the CRYPTO scoring profile")
-        if not isinstance(asset["binanceSymbol"], str) or not asset["binanceSymbol"]:
-            err("crypto assets need a binanceSymbol")
-    elif asset["scoringProfile"] == "CRYPTO":
-        err("only crypto assets may use the CRYPTO scoring profile")
+    required = CLASS_PROFILES.get(asset["assetClass"])
+    if required is not None and asset["scoringProfile"] != required:
+        err(f"{asset['assetClass']} assets must use the {required} scoring profile")
+    if asset["assetClass"] == "equity" and asset["scoringProfile"] not in EQUITY_PROFILES:
+        err(f"equities must use one of the {sorted(EQUITY_PROFILES)} scoring profiles")
+    if asset["assetClass"] == "crypto" and (not isinstance(asset["binanceSymbol"], str) or not asset["binanceSymbol"]):
+        err("crypto assets need a binanceSymbol")
     for key in ("sector", "industry", "statusNote", "fundamentalsPeriod", "binanceSymbol"):
         if asset[key] is not None and not isinstance(asset[key], str):
             err(f"{key} must be a string or null")
@@ -1617,8 +1683,14 @@ def validate_watchlist(watchlist: Any) -> list[str]:
             errors.append(f"{ticker}: currency must be a 3-letter ISO code")
         if not is_finite_number(entry.get("lotSize")) or entry["lotSize"] <= 0:
             errors.append(f"{ticker}: lotSize must be a positive number")
-        if entry.get("scoringProfile") not in PROFILES | {None}:
+        profile = entry.get("scoringProfile")
+        if profile not in PROFILES | {None}:
             errors.append(f"{ticker}: scoringProfile must be null or one of {sorted(PROFILES)}")
+        required = CLASS_PROFILES.get(entry.get("assetClass"))
+        if required is not None and profile not in {None, required}:
+            errors.append(f"{ticker}: {entry['assetClass']} assets always use the {required} profile")
+        if entry.get("assetClass") == "equity" and profile not in EQUITY_PROFILES | {None}:
+            errors.append(f"{ticker}: equities may only override to {sorted(EQUITY_PROFILES)}")
         if entry.get("assetClass") == "crypto" and not entry.get("binanceSymbol"):
             errors.append(f"{ticker}: crypto assets need a binanceSymbol")
     return errors
@@ -1710,6 +1782,320 @@ def write_step_summary(snapshot: dict[str, Any], elapsed: float) -> None:
         handle.write("\n".join(lines) + "\n")
 
 
+
+# --------------------------------------------------------------------------- #
+# Daily briefing (Telegram)
+# --------------------------------------------------------------------------- #
+
+MARKDOWN_V2_SPECIAL = set("_*[]()~`>#+-=|{}.!\\")
+
+
+def escape_markdown_v2(text: str) -> str:
+    """Escape every character that Telegram's MarkdownV2 treats as markup."""
+    return "".join("\\" + character if character in MARKDOWN_V2_SPECIAL else character for character in str(text))
+
+
+class BriefingFormat:
+    """The same message as MarkdownV2 or as plain text (the fallback if Markdown is rejected)."""
+
+    def __init__(self, markdown: bool) -> None:
+        self.markdown = markdown
+
+    def text(self, value: str) -> str:
+        return escape_markdown_v2(value) if self.markdown else str(value)
+
+    def bold(self, value: str) -> str:
+        return "*" + self.text(value) + "*" if self.markdown else str(value)
+
+    def italic(self, value: str) -> str:
+        return "_" + self.text(value) + "_" if self.markdown else str(value)
+
+    def code(self, value: str) -> str:
+        if not self.markdown:
+            return str(value)
+        return "`" + str(value).replace("\\", "\\\\").replace("`", "\\`") + "`"
+
+    def link(self, label: str, url: str) -> str:
+        if not self.markdown:
+            return f"{label}: {url}"
+        return "[" + self.text(label) + "](" + url.replace("\\", "\\\\").replace(")", "\\)") + ")"
+
+
+def pipeline_outcome(env: dict[str, str]) -> tuple[str, str | None]:
+    """('passed' | 'failed' | 'unknown', the first step that did not succeed).
+
+    The workflow passes each step's outcome (success, failure, cancelled or
+    skipped). A local run passes none, which is 'unknown'.
+    """
+    outcomes = [((env.get(key) or "").strip().lower(), label) for key, label in PIPELINE_STEPS]
+    if not any(outcome for outcome, _ in outcomes):
+        return "unknown", None
+    for outcome, label in outcomes:
+        if outcome != "success":
+            return "failed", label
+    return "passed", None
+
+
+def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
+    """Every asset's verdict and Composite score, from the site's own JavaScript engines.
+
+    Running the engines (rather than re-implementing them in Python) guarantees
+    the briefing says exactly what the site shows. Returns None, with a warning,
+    if Node.js is missing or the script fails; the briefing then goes out without signals.
+    """
+    node = shutil.which("node")
+    if node is None:
+        warn("Node.js is not installed, so the briefing will not include signals")
+        return None
+    try:
+        completed = subprocess.run(
+            [node, "--no-warnings", str(SIGNALS_SCRIPT), str(snapshot_path)],
+            capture_output=True, text=True, encoding="utf-8", timeout=SIGNALS_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        warn(f"the signals script did not run: {type(exc).__name__}")
+        return None
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        warn(f"the signals script failed: {detail[-1][:200] if detail else f'exit code {completed.returncode}'}")
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except ValueError:
+        warn("the signals script did not print valid JSON")
+        return None
+    rows = payload.get("assets") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        warn("the signals script returned no assets")
+        return None
+    signals = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("ticker"), str):
+            continue
+        verdict = row.get("verdict") if row.get("verdict") in {"BUY", "HOLD", "SELL"} else None
+        composite = row.get("composite") if is_finite_number(row.get("composite")) else None
+        confidence = row.get("confidence") if row.get("confidence") in {"High", "Medium", "Low"} else None
+        name = row.get("name") if isinstance(row.get("name"), str) else row["ticker"]
+        signals.append({"ticker": row["ticker"], "name": name, "verdict": verdict,
+                        "composite": composite, "confidence": confidence})
+    return signals
+
+
+def sentiment_shifts(previous: dict[str, Any] | None, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Assets whose headline tone moved notably since the previous snapshot.
+
+    Notable means the label flipped between positive and negative, or the mean
+    VADER score moved by at least SENTIMENT_SHIFT_MIN. Only freshly fetched news
+    counts: a carried-over block cannot have shifted.
+    """
+    if not isinstance(previous, dict) or not isinstance(previous.get("assets"), list):
+        return []
+    before = {asset.get("ticker"): asset for asset in previous["assets"] if isinstance(asset, dict)}
+    shifts = []
+    for asset in snapshot.get("assets", []):
+        news = asset.get("news") or {}
+        old_news = (before.get(asset.get("ticker")) or {}).get("news") or {}
+        new_tone, old_tone = news.get("sentiment"), old_news.get("sentiment")
+        if news.get("status") != "fresh" or not isinstance(new_tone, dict) or not isinstance(old_tone, dict):
+            continue
+        new_score, old_score = new_tone.get("compound"), old_tone.get("compound")
+        if not is_finite_number(new_score) or not is_finite_number(old_score):
+            continue
+        delta = new_score - old_score
+        flipped = {old_tone.get("label"), new_tone.get("label")} == {"positive", "negative"}
+        if not flipped and abs(delta) < SENTIMENT_SHIFT_MIN:
+            continue
+        clusters = news.get("clusters") or []
+        shifts.append({
+            "ticker": asset["ticker"],
+            "from": old_tone.get("label"), "to": new_tone.get("label"),
+            "before": old_score, "after": new_score, "delta": delta,
+            "headline": clusters[0].get("title") if clusters and isinstance(clusters[0], dict) else None,
+        })
+    shifts.sort(key=lambda shift: abs(shift["delta"]), reverse=True)
+    return shifts[:BRIEFING_MAX_SHIFTS]
+
+
+def signed(value: float, digits: int = 2) -> str:
+    """+0.31, -0.42 (with a true minus sign)."""
+    text = f"{abs(value):.{digits}f}"
+    return ("+" if value > 0 else "−" if value < 0 else "") + text
+
+
+def short_date(iso: str | None) -> str:
+    moment = parse_timestamp(iso) if isinstance(iso, str) and "T" in iso else None
+    if moment is None and isinstance(iso, str) and DATE_RE.match(iso):
+        moment = datetime.strptime(iso, "%Y-%m-%d")
+    return f"{moment.day} {moment.strftime('%b')}" if moment else "?"
+
+
+def briefing_links(env: dict[str, str]) -> list[tuple[str, str]]:
+    """The site and the workflow run, derived from GitHub's own variables (none locally)."""
+    repository = (env.get("GITHUB_REPOSITORY") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+", repository):
+        return []
+    owner, name = repository.split("/", 1)
+    links = [("Open QuantLens", f"https://{owner.lower()}.github.io/{name}/")]
+    server, run_id = (env.get("GITHUB_SERVER_URL") or "").strip(), (env.get("GITHUB_RUN_ID") or "").strip()
+    if server.startswith("https://") and run_id.isdigit():
+        links.append(("Run log", f"{server}/{repository}/actions/runs/{run_id}"))
+    return links
+
+
+def build_briefing(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]] | None,
+                   shifts: list[dict[str, Any]] | None, outcome: str, failed_step: str | None,
+                   now: datetime, links: list[tuple[str, str]], fmt: BriefingFormat) -> str:
+    """The message text. `shifts` is None when there was nothing to compare against."""
+    lines = [fmt.bold("QuantLens daily briefing"), fmt.text(now.strftime("%a %d %b %Y").replace(" 0", " "))]
+
+    assets = snapshot.get("assets", []) if isinstance(snapshot, dict) else []
+    stale = [asset["ticker"] for asset in assets if asset.get("status") != "fresh"]
+    counts = f"{len(assets)} assets, {len(assets) - len(stale)} fresh"
+    if stale:
+        shown = ", ".join(stale[:4]) + (f" and {len(stale) - 4} more" if len(stale) > 4 else "")
+        counts += f", {len(stale)} carried over ({shown})"
+    generated = short_date(snapshot.get("generatedAt")) if isinstance(snapshot, dict) else "?"
+
+    if outcome == "passed":
+        status = f"✅ Every check passed. {counts}. The site redeploys with this data."
+    elif outcome == "unknown":
+        status = f"ℹ️ Manual run: no pipeline results were supplied. Snapshot of {generated}: {counts}."
+    elif failed_step == "data refresh":
+        status = (f"❌ The data refresh failed, so nothing was committed. The site keeps the snapshot of "
+                  f"{generated}, and the signals below are from it.")
+    elif failed_step == "commit":
+        status = f"⚠️ The data passed every check but could not be committed. {counts}. The site keeps the previous snapshot."
+    else:
+        status = (f"❌ {failed_step[0].upper()}{failed_step[1:]} failed, so today's data was NOT published "
+                  f"and its signals are held back. The site keeps the previous snapshot.")
+    lines += ["", fmt.text(status)]
+
+    if signals:
+        def ranked(verdict: str, best_first: bool) -> list[dict[str, Any]]:
+            chosen = [row for row in signals if row["verdict"] == verdict and row["composite"] is not None]
+            return sorted(chosen, key=lambda row: (-row["composite"] if best_first else row["composite"], row["ticker"]))
+
+        for verdict, title, best_first in (("BUY", "Top BUY signals", True), ("SELL", "Top SELL signals", False)):
+            rows = ranked(verdict, best_first)
+            lines += ["", fmt.bold(title)]
+            if not rows:
+                lines.append(fmt.text(f"No {verdict} signals today."))
+            for position, row in enumerate(rows[:BRIEFING_TOP_SIGNALS], start=1):
+                confidence = f" · {row['confidence']} confidence" if row["confidence"] else ""
+                lines.append(fmt.text(f"{position}. ") + fmt.code(row["ticker"])
+                             + fmt.text(f" {row['name'][:32]} · {row['composite']:.0f}/100{confidence}"))
+        tally = {verdict: sum(1 for row in signals if row["verdict"] == verdict) for verdict in ("BUY", "HOLD", "SELL")}
+        lines += ["", fmt.text(f"All verdicts: {tally['BUY']} BUY · {tally['HOLD']} HOLD · {tally['SELL']} SELL")]
+    elif outcome != "failed" or failed_step in {"data refresh", "commit"}:
+        lines += ["", fmt.text("Signals are unavailable in this run (the engines could not be run).")]
+
+    if shifts is not None:
+        lines += ["", fmt.bold("Headline tone shifts")]
+        if not shifts:
+            lines.append(fmt.text("No notable shifts since the previous snapshot."))
+        for shift in shifts:
+            lines.append(fmt.text("• ") + fmt.code(shift["ticker"])
+                         + fmt.text(f" {shift['from']} → {shift['to']} ({signed(shift['before'])} → {signed(shift['after'])})"))
+            if shift["headline"]:
+                headline = shift["headline"] if len(shift["headline"]) <= 90 else shift["headline"][:87].rstrip() + "..."
+                lines.append("   " + fmt.italic(headline))
+
+    if links:
+        lines += ["", fmt.text(" · ").join(fmt.link(label, url) for label, url in links)]
+    lines.append(fmt.italic("Rule-based signals for learning, not financial advice."))
+
+    text = "\n".join(lines)
+    if len(text) > TELEGRAM_MAX_CHARS:  # cannot happen with the caps above, but never risk a rejected message
+        text = text[:TELEGRAM_MAX_CHARS].rsplit("\n", 1)[0]
+    return text
+
+
+def send_telegram(text: str, token: str, chat_id: str, parse_mode: str | None,
+                  opener: Callable[..., Any] | None = None) -> tuple[bool, int | None, str | None]:
+    """POST one message. Returns (delivered, HTTP status or None, Telegram's description)."""
+    body: dict[str, Any] = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if parse_mode:
+        body["parse_mode"] = parse_mode
+    request = urllib.request.Request(
+        TELEGRAM_API.format(token=urllib.parse.quote(token, safe=":")),
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        method="POST")
+    try:
+        with (opener or urllib.request.urlopen)(request, timeout=TELEGRAM_TIMEOUT) as response:
+            payload = json.loads(response.read(65536).decode("utf-8", "replace"))
+        if isinstance(payload, dict) and payload.get("ok") is True:
+            return True, 200, None
+        return False, 200, str(payload.get("description") if isinstance(payload, dict) else "unexpected reply")
+    except urllib.error.HTTPError as exc:
+        try:
+            description = json.loads(exc.read(65536).decode("utf-8", "replace")).get("description")
+        except (ValueError, AttributeError, OSError):
+            description = None
+        return False, exc.code, str(description or exc.reason)
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return False, None, f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"
+
+
+def deliver_briefing(snapshot_path: Path, previous_path: Path | None, env: dict[str, str],
+                     opener: Callable[..., Any] | None = None, now: datetime | None = None,
+                     signals_source: Callable[[Path], list[dict[str, Any]] | None] = compute_signals,
+                     pause: Callable[[float], None] = time.sleep) -> str:
+    """Build and send the briefing. Returns 'skipped', 'sent', 'sent-plain' or 'failed'. Never raises."""
+    token = (env.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (env.get("TELEGRAM_CHAT_ID") or "").strip()
+    if not token or not chat_id:
+        LOG.debug("Telegram is not configured; the daily briefing was not sent")
+        return "skipped"
+
+    def redact(message: str | None) -> str:
+        return (message or "no detail").replace(token, "***")[:300]
+
+    try:
+        outcome, failed_step = pipeline_outcome(env)
+        snapshot = load_previous(snapshot_path)  # None if missing or unreadable: status only
+        held_back = outcome == "failed" and failed_step not in {"data refresh", "commit"}
+        signals = signals_source(snapshot_path) if snapshot and not held_back else None
+        shifts = None
+        if snapshot and not held_back and failed_step != "data refresh" and previous_path is not None:
+            previous = load_previous(previous_path)
+            shifts = sentiment_shifts(previous, snapshot) if previous else None
+        moment = now or datetime.now(timezone.utc)
+        links = briefing_links(env)
+
+        for markdown in (True, False):
+            text = build_briefing(snapshot, signals, shifts, outcome, failed_step, moment, links, BriefingFormat(markdown))
+            for attempt in range(2):
+                delivered, status, description = send_telegram(text, token, chat_id, "MarkdownV2" if markdown else None, opener)
+                if delivered:
+                    LOG.info("daily briefing sent to Telegram%s", "" if markdown else " as plain text")
+                    return "sent" if markdown else "sent-plain"
+                transient = status is None or status == 429 or status >= 500
+                if not transient or attempt == 1:
+                    break
+                pause(3.0)
+            if status == 400 and markdown:
+                # Usually a formatting problem: send the same content without Markdown.
+                warn(f"Telegram rejected the Markdown briefing ({redact(description)}); retrying as plain text")
+                continue
+            warn(f"the daily briefing was not delivered: HTTP {status or '-'} {redact(description)}")
+            return "failed"
+        return "failed"
+    except Exception as exc:  # noqa: BLE001 - the briefing must never fail the pipeline
+        warn(f"the daily briefing was not sent: {type(exc).__name__}: {redact(str(exc))}")
+        return "failed"
+
+
+def run_notify(settings: argparse.Namespace) -> int:
+    """Entry point for --notify. Always exits 0: a briefing must never block a deployment."""
+    try:
+        deliver_briefing(settings.output, settings.previous, dict(os.environ))
+    except Exception as exc:  # noqa: BLE001 - belt and braces: deliver_briefing already never raises
+        token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        detail = str(exc).replace(token, "***") if token else str(exc)
+        warn(f"the daily briefing was not sent: {type(exc).__name__}: {detail[:300]}")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
@@ -1734,6 +2120,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--forecast-timeout", type=float, default=60.0, help="longest wait for one asset's forecast, seconds")
     parser.add_argument("--forecast-budget", type=float, default=300.0, help="seconds after which unfinished forecasts are abandoned")
     parser.add_argument("--validate-only", action="store_true", help="validate the existing snapshot and exit")
+    parser.add_argument("--notify", action="store_true",
+                        help="send the daily Telegram briefing for the snapshot at --output and exit (never fails; "
+                             "needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, otherwise does nothing)")
+    parser.add_argument("--previous", type=Path, default=None,
+                        help="with --notify: the snapshot before this run, to detect shifts in headline tone")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -1766,6 +2157,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if settings.validate_only:
         return run_validation(settings.output)
+    if settings.notify:
+        return run_notify(settings)
 
     try:
         watchlist = load_json(settings.watchlist)

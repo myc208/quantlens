@@ -16,7 +16,7 @@
  */
 
 export const MAX_SELECTED = 3;
-export const DEFAULT_SELECTED = Object.freeze(['AAPL', 'D05.SI', 'BTC-USD']);
+export const DEFAULT_SELECTED = Object.freeze(['AMD', 'D05.SI', 'BTC-USD']);
 
 export const CURRENCIES = Object.freeze(['USD', 'SGD']);
 export const MODES = Object.freeze(['guided', 'pro']);
@@ -27,8 +27,8 @@ export const DEFAULT_RANGE = '1y';
 export const MAX_PORTFOLIO_ASSETS = 8;
 export const COMPUTE_JOBS = Object.freeze(['monteCarlo', 'portfolio']);
 export const FILTER_OPTIONS = Object.freeze({
-  assetClass: Object.freeze(['all', 'equity', 'crypto']),
-  market: Object.freeze(['all', 'US', 'SG', 'CRYPTO']),
+  assetClass: Object.freeze(['all', 'equity', 'etf', 'index', 'crypto']),
+  market: Object.freeze(['all', 'US', 'SG', 'UK', 'CRYPTO']),
   verdict: Object.freeze(['all', 'buy', 'hold', 'sell']),
 });
 
@@ -48,7 +48,8 @@ const URL_KEYS = Object.freeze({
   assetClass: 'class', market: 'mkt', sector: 'sector', verdict: 'verdict',
   view: 'view', range: 'range', portfolio: 'p',
 });
-const TICKER_PATTERN = /^[A-Z0-9][A-Z0-9.\-=^]{0,14}$/;
+// Yahoo symbols: AMD, BRK-B, D05.SI, CSPX.L, BTC-USD, and indices with a leading caret (^GSPC).
+const TICKER_PATTERN = /^\^?[A-Z0-9][A-Z0-9.\-=]{0,14}$/;
 
 /* ------------------------------------------------------------------ */
 /* URL <-> state                                                       */

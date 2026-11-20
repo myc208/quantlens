@@ -19,6 +19,7 @@ import importlib.util
 import json
 import math
 import random
+import shutil
 import sys
 import time
 import unittest
@@ -406,8 +407,8 @@ class ForecastHelpers(unittest.TestCase):
         self.assertLessEqual(stock[-1], "2026-12-13")
 
     def test_the_seed_depends_only_on_the_ticker(self):
-        self.assertEqual(ff.stable_seed("AAPL"), ff.stable_seed("AAPL"))
-        self.assertNotEqual(ff.stable_seed("AAPL"), ff.stable_seed("NVDA"))
+        self.assertEqual(ff.stable_seed("AMD"), ff.stable_seed("AMD"))
+        self.assertNotEqual(ff.stable_seed("AMD"), ff.stable_seed("MU"))
         self.assertGreaterEqual(ff.stable_seed("BTC-USD"), 0)
 
     def test_backtest_metrics_match_a_hand_calculation(self):
@@ -601,7 +602,7 @@ class SnapshotValidation(unittest.TestCase):
         self.assertTrue(any("fx.series" in error for error in ff.validate_snapshot(snapshot)))
 
     def test_a_version_1_asset_is_upgraded_before_being_carried_over(self):
-        old = copy.deepcopy(self.snapshot["assets"][0])
+        old = copy.deepcopy(next(a for a in self.snapshot["assets"] if a["assetClass"] == "equity"))
         del old["news"], old["forecast"]
         self.assertTrue(ff.validate_asset(old))  # invalid as it stands
         upgraded = ff.upgrade_asset(old)
@@ -617,6 +618,320 @@ class SnapshotValidation(unittest.TestCase):
         carried = ff.carry_over(asset, {"lotSize": asset["lotSize"], "binanceSymbol": asset["binanceSymbol"]}, "test")
         self.assertEqual(carried["news"]["status"], "stale")
         self.assertEqual(ff.validate_asset(carried), [])
+
+
+class AssetClasses(unittest.TestCase):
+    """Stocks, REITs, ETFs, indices and crypto, including the London listing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.watchlist = ff.load_json(ff.DEFAULT_WATCHLIST)
+        cls.snapshot = ff.load_json(SNAPSHOT_PATH)
+
+    def entry(self, **overrides) -> dict:
+        base = {"ticker": "VOO", "assetClass": "etf", "market": "US", "currency": "USD", "lotSize": 1,
+                "binanceSymbol": None, "scoringProfile": None}
+        base.update(overrides)
+        return base
+
+    def watchlist_with(self, *entries) -> dict:
+        clone = copy.deepcopy(self.watchlist)
+        clone["assets"] = list(entries)
+        return clone
+
+    def test_the_committed_watchlist_is_valid_and_within_the_designed_size(self):
+        # Rules only, never the list itself: editing the watchlist must not break this gate.
+        self.assertEqual(ff.validate_watchlist(self.watchlist), [])
+        self.assertLessEqual(len(self.watchlist["assets"]), 30)
+
+    def test_index_symbols_with_a_leading_caret_are_accepted(self):
+        for ticker in ("^GSPC", "^IXIC", "^DJI", "^STI", "CSPX.L", "BRK-B", "AVAX-USD", "D05.SI"):
+            self.assertRegex(ticker, ff.TICKER_RE)
+        for ticker in ("GS^PC", "^^GSPC", "^", "aapl", "A" * 17):
+            self.assertIsNone(ff.TICKER_RE.match(ticker), ticker)
+
+    def test_each_class_without_accounts_has_its_own_profile(self):
+        for asset_class, profile in (("etf", "ETF"), ("index", "INDEX"), ("crypto", "CRYPTO")):
+            entry = self.entry(assetClass=asset_class, scoringProfile=None)
+            # The class decides, whatever the (missing) sector says.
+            self.assertEqual(ff.resolve_profile(entry, "Financial Services"), profile)
+        self.assertEqual(ff.resolve_profile(self.entry(assetClass="equity"), "Real Estate"), "REIT")
+        self.assertEqual(ff.resolve_profile(self.entry(assetClass="equity"), "Energy"), "CORPORATE")
+
+    def test_a_profile_that_contradicts_the_class_is_rejected(self):
+        errors = ff.validate_watchlist(self.watchlist_with(
+            self.entry(ticker="VOO", scoringProfile="CORPORATE"),
+            self.entry(ticker="AMD", assetClass="equity", scoringProfile="ETF"),
+            self.entry(ticker="CSPX.L", market="LSE"),
+        ))
+        joined = " ".join(errors)
+        self.assertIn("VOO: etf assets always use the ETF profile", joined)
+        self.assertIn("AMD: equities may only override to", joined)
+        self.assertIn("CSPX.L: market must be one of", joined)
+
+    def test_snapshot_assets_must_pair_class_and_profile(self):
+        asset = copy.deepcopy(next(a for a in self.snapshot["assets"] if a["assetClass"] == "equity"))
+        self.assertEqual(ff.validate_asset(asset), [])
+        asset["assetClass"], asset["scoringProfile"] = "etf", "CORPORATE"
+        self.assertTrue(any("etf assets must use the ETF scoring profile" in e for e in ff.validate_asset(asset)))
+        asset["assetClass"], asset["scoringProfile"] = "equity", "INDEX"
+        self.assertTrue(any("equities must use one of" in e for e in ff.validate_asset(asset)))
+        asset["assetClass"], asset["scoringProfile"], asset["ticker"], asset["market"] = "index", "INDEX", "^GSPC", "US"
+        self.assertEqual(ff.validate_asset(asset), [])
+
+    def test_assets_without_accounts_carry_no_company_figures(self):
+        for asset in self.snapshot["assets"]:
+            if asset["assetClass"] in {"etf", "index"}:
+                self.assertIsNone(asset["sector"])
+                self.assertIsNone(asset["fundamentalsPeriod"])
+                ignored = {"dividendYieldTTM"} if asset["assetClass"] == "etf" else set()
+                self.assertTrue(all(v is None for k, v in asset["fundamentals"].items() if k not in ignored), asset["ticker"])
+
+    def test_a_london_candle_is_kept_only_after_the_london_close(self):
+        index = pd.DatetimeIndex(pd.date_range("2026-11-16", periods=3, freq="D", tz="Europe/London"))
+        history = pd.DataFrame({"Open": [10.0, 11.0, 12.0], "High": [10.5, 11.5, 12.5], "Low": [9.5, 10.5, 11.5],
+                                "Close": [10.2, 11.2, 12.2], "Volume": [100, 100, 100]}, index=index)
+        during = datetime(2026, 11, 18, 15, 0, tzinfo=timezone.utc)   # 15:00 in London (GMT): session still open
+        after = datetime(2026, 11, 18, 17, 0, tzinfo=timezone.utc)    # 17:00: closed, past the 20-minute buffer
+        self.assertEqual([c[0] for c in ff.build_candles(history, "UK", during)], ["2026-11-16", "2026-11-17"])
+        self.assertEqual(len(ff.build_candles(history, "UK", after)), 3)
+
+
+class PriceToBookCheck(unittest.TestCase):
+    def fundamentals(self, **values) -> dict:
+        base = ff.empty_fundamentals()
+        base.update(values)
+        return base
+
+    def test_an_implausible_reported_value_is_replaced_by_market_cap_over_equity(self):
+        # Yahoo reported Berkshire Hathaway B at 0.001.
+        data = self.fundamentals(priceToBook=0.0010664, marketCap=1_215_000_000_000, totalEquity=675_000_000_000)
+        self.assertAlmostEqual(ff.checked_price_to_book("BRK-B", data, "USD", "USD"), 1.8, places=4)
+
+    def test_a_plausible_reported_value_is_kept(self):
+        data = self.fundamentals(priceToBook=1.9, marketCap=100.0, totalEquity=60.0)  # computed 1.67
+        self.assertEqual(ff.checked_price_to_book("D05.SI", data, "SGD", "SGD"), 1.9)
+
+    def test_no_check_without_comparable_inputs(self):
+        cases = [
+            (self.fundamentals(priceToBook=0.001, marketCap=100.0, totalEquity=50.0), "USD", "CAD"),  # mixed currencies
+            (self.fundamentals(priceToBook=0.001, marketCap=100.0, totalEquity=None), "USD", "USD"),
+            (self.fundamentals(priceToBook=0.001, marketCap=100.0, totalEquity=-5.0), "USD", "USD"),  # negative book
+            (self.fundamentals(priceToBook=None, marketCap=100.0, totalEquity=50.0), "USD", "USD"),   # nothing reported
+            (self.fundamentals(priceToBook=-2.0, marketCap=100.0, totalEquity=50.0), "USD", "USD"),
+        ]
+        for data, currency, reporting in cases:
+            self.assertEqual(ff.checked_price_to_book("X", data, currency, reporting), data["priceToBook"])
+
+
+class TelegramBriefing(unittest.TestCase):
+    TOKEN = "123456:TEST-token-value"
+    ENV = {"TELEGRAM_BOT_TOKEN": TOKEN, "TELEGRAM_CHAT_ID": "-1001234"}
+    PASSED = {"QUANTLENS_FETCH": "success", "QUANTLENS_VALIDATE": "success", "QUANTLENS_GATE1": "success",
+              "QUANTLENS_GATE2": "success", "QUANTLENS_COMMIT": "success"}
+    SIGNALS = [
+        {"ticker": "MU", "name": "Micron Technology", "verdict": "BUY", "composite": 81.4, "confidence": "High"},
+        {"ticker": "D05.SI", "name": "DBS Group", "verdict": "BUY", "composite": 70.0, "confidence": "Medium"},
+        {"ticker": "^GSPC", "name": "S&P 500", "verdict": "HOLD", "composite": 55.0, "confidence": "Low"},
+        {"ticker": "BRK-B", "name": "Berkshire Hathaway", "verdict": "SELL", "composite": 40.2, "confidence": "Low"},
+        {"ticker": "ETH-USD", "name": "Ethereum", "verdict": "SELL", "composite": 12.0, "confidence": "Low"},
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.snapshot = ff.load_json(SNAPSHOT_PATH)
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = json.dumps(payload).encode()
+
+        def read(self, *_):
+            return self.payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    def opener(self, *replies):
+        """A fake urlopen that records requests and returns (or raises) the given replies in turn."""
+        calls = []
+        queue = list(replies)
+
+        def fake(request, timeout=None):
+            calls.append({"url": request.full_url, "body": json.loads(request.data), "timeout": timeout})
+            reply = queue.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return self.Response(reply)
+
+        return fake, calls
+
+    @staticmethod
+    def http_error(code, description):
+        import io
+        body = io.BytesIO(json.dumps({"ok": False, "description": description}).encode())
+        return urllib.error.HTTPError("https://api.telegram.org/bot***/sendMessage", code, "error", {}, body)
+
+    def deliver(self, env, opener, **kwargs):
+        kwargs.setdefault("signals_source", lambda _path: self.SIGNALS)
+        kwargs.setdefault("pause", lambda _seconds: None)
+        return ff.deliver_briefing(SNAPSHOT_PATH, kwargs.pop("previous", None), env, opener=opener, now=NOW, **kwargs)
+
+    def test_missing_credentials_skip_silently_without_any_request(self):
+        fake, calls = self.opener()
+        for env in ({}, {"TELEGRAM_BOT_TOKEN": self.TOKEN}, {"TELEGRAM_CHAT_ID": "1"}, {"TELEGRAM_BOT_TOKEN": " ", "TELEGRAM_CHAT_ID": "1"}):
+            with self.assertNoLogs(ff.LOG, level="WARNING"):
+                self.assertEqual(self.deliver(env, fake), "skipped")
+        self.assertEqual(calls, [])
+
+    def test_a_successful_send_uses_markdown_v2_and_the_bot_api(self):
+        fake, calls = self.opener({"ok": True, "result": {}})
+        self.assertEqual(self.deliver({**self.ENV, **self.PASSED}, fake), "sent")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["url"], f"https://api.telegram.org/bot{self.TOKEN}/sendMessage")
+        self.assertEqual(calls[0]["body"]["parse_mode"], "MarkdownV2")
+        self.assertEqual(calls[0]["body"]["chat_id"], "-1001234")
+        self.assertTrue(calls[0]["body"]["disable_web_page_preview"])
+        self.assertEqual(calls[0]["timeout"], ff.TELEGRAM_TIMEOUT)
+
+    def test_a_rejected_markdown_message_is_resent_as_plain_text(self):
+        fake, calls = self.opener(self.http_error(400, "Bad Request: can't parse entities"), {"ok": True})
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(self.deliver({**self.ENV, **self.PASSED}, fake), "sent-plain")
+        self.assertNotIn("parse_mode", calls[1]["body"])
+        self.assertNotIn("\\.", calls[1]["body"]["text"])  # no Markdown escapes in the plain version
+
+    def test_api_failures_warn_never_raise_and_never_print_the_token(self):
+        scenarios = [
+            (self.http_error(401, "Unauthorized"),),                                     # bad token: no retry
+            (self.http_error(403, f"Forbidden: bot {self.TOKEN} was blocked"),),          # token echoed back
+            (urllib.error.URLError("offline"), urllib.error.URLError("still offline")),  # network: one retry
+            (self.http_error(502, "Bad Gateway"), self.http_error(502, "Bad Gateway")),
+        ]
+        for replies in scenarios:
+            fake, calls = self.opener(*replies)
+            with self.assertLogs(ff.LOG, level="WARNING") as logs:
+                self.assertEqual(self.deliver({**self.ENV, **self.PASSED}, fake), "failed")
+            self.assertEqual(len(calls), len(replies))
+            self.assertFalse(any(self.TOKEN in line for line in logs.output))
+
+    def test_an_unexpected_error_while_building_is_a_warning_too(self):
+        def broken(_path):
+            raise ValueError(f"something mentioning {self.TOKEN}")
+        fake, calls = self.opener()
+        with self.assertLogs(ff.LOG, level="WARNING") as logs:
+            self.assertEqual(self.deliver({**self.ENV, **self.PASSED}, fake, signals_source=broken), "failed")
+        self.assertEqual(calls, [])
+        self.assertFalse(any(self.TOKEN in line for line in logs.output))
+
+    def test_the_notify_command_always_exits_zero(self):
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("boom")
+        original = ff.deliver_briefing
+        try:
+            ff.deliver_briefing = explode
+            with self.assertLogs(ff.LOG, level="WARNING"):
+                self.assertEqual(ff.run_notify(settings(notify=True)), 0)
+        finally:
+            ff.deliver_briefing = original
+        # A missing snapshot, no signals and a dead network still end normally, with a status-only attempt.
+        fake, calls = self.opener(urllib.error.URLError("offline"), urllib.error.URLError("offline"))
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            result = ff.deliver_briefing(Path("does/not/exist.json"), None, {**self.ENV, **self.PASSED},
+                                         opener=fake, now=NOW, signals_source=lambda _p: None, pause=lambda _s: None)
+        self.assertEqual(result, "failed")
+        self.assertIn("Every check passed", calls[0]["body"]["text"].replace("\\", ""))
+
+    def test_pipeline_outcome_names_the_first_step_that_did_not_succeed(self):
+        self.assertEqual(ff.pipeline_outcome(self.PASSED), ("passed", None))
+        self.assertEqual(ff.pipeline_outcome({}), ("unknown", None))
+        gate = {**self.PASSED, "QUANTLENS_GATE2": "failure", "QUANTLENS_COMMIT": "skipped"}
+        self.assertEqual(ff.pipeline_outcome(gate), ("failed", "Gate 2 (browser tests)"))
+        fetch = {key: "skipped" for key in self.PASSED} | {"QUANTLENS_FETCH": "failure"}
+        self.assertEqual(ff.pipeline_outcome(fetch), ("failed", "data refresh"))
+
+    def build(self, outcome="passed", failed_step=None, signals=SIGNALS, shifts=None, markdown=True, links=()):
+        return ff.build_briefing(self.snapshot, signals, shifts, outcome, failed_step, NOW, list(links),
+                                 ff.BriefingFormat(markdown))
+
+    def test_signals_are_ranked_best_buy_first_and_worst_sell_first(self):
+        text = self.build(markdown=False)
+        self.assertLess(text.index("Top BUY signals"), text.index("1. MU"))
+        self.assertLess(text.index("1. MU"), text.index("2. D05.SI"))
+        self.assertLess(text.index("Top SELL signals"), text.index("1. ETH-USD"))
+        self.assertLess(text.index("1. ETH-USD"), text.index("2. BRK-B"))
+        self.assertIn("81/100 · High confidence", text)
+        self.assertIn("All verdicts: 2 BUY · 1 HOLD · 2 SELL", text)
+        self.assertNotIn("^GSPC", text)  # a HOLD is neither a top BUY nor a top SELL
+
+    def test_markdown_escapes_every_special_character_outside_code(self):
+        self.assertEqual(ff.escape_markdown_v2("D05.SI (+1.5%) [x]_*!"), r"D05\.SI \(\+1\.5%\) \[x\]\_\*\!")
+        text = self.build(links=[("Open QuantLens", "https://user.github.io/quantlens/")])
+        self.assertIn("`BRK-B`", text)        # tickers sit in code spans, unescaped
+        self.assertIn("`^GSPC`" if "^GSPC" in text else "`MU`", text)
+        self.assertIn(r"81/100 · High confidence", text)
+        self.assertIn("[Open QuantLens](https://user.github.io/quantlens/)", text)
+        self.assertIn(r"_Rule\-based signals for learning, not financial advice\._", text)
+
+    def test_a_failed_gate_holds_the_signals_back(self):
+        text = self.build(outcome="failed", failed_step="Gate 2 (browser tests)", signals=None, markdown=False)
+        self.assertIn("Gate 2 (browser tests) failed, so today's data was NOT published", text)
+        self.assertNotIn("Top BUY signals", text)
+        self.assertNotIn("Signals are unavailable", text)
+
+    def test_a_failed_refresh_reports_the_signals_of_the_last_good_snapshot(self):
+        text = self.build(outcome="failed", failed_step="data refresh", markdown=False)
+        self.assertIn("The data refresh failed, so nothing was committed", text)
+        self.assertIn("the signals below are from it", text)
+        self.assertIn("Top BUY signals", text)
+
+    def test_the_message_stays_inside_telegrams_limit(self):
+        many = [{"ticker": f"T{i}", "name": "N" * 200, "verdict": "BUY", "composite": 90 - i % 40, "confidence": "High"} for i in range(400)]
+        shifts = [{"ticker": f"S{i}", "from": "positive", "to": "negative", "before": 0.5, "after": -0.5, "delta": -1.0,
+                   "headline": "H" * 400} for i in range(50)]
+        text = self.build(signals=many, shifts=shifts)
+        self.assertLessEqual(len(text), ff.TELEGRAM_MAX_CHARS)
+
+    def test_sentiment_shifts_need_a_flip_or_a_large_move_in_fresh_news(self):
+        def asset(ticker, label, compound, status="fresh"):
+            return {"ticker": ticker, "news": {"status": status, "sentiment": {"label": label, "compound": compound},
+                                               "clusters": [{"title": f"{ticker} headline"}]}}
+        previous = {"assets": [asset("A", "positive", 0.06), asset("B", "neutral", 0.0), asset("C", "positive", 0.4),
+                               asset("D", "positive", 0.5), asset("E", "neutral", 0.0)]}
+        current = {"assets": [asset("A", "negative", -0.06),      # small, but flipped sign: notable
+                              asset("B", "neutral", 0.2),          # small move, no flip: not notable
+                              asset("C", "neutral", 0.0),          # moved 0.40: notable
+                              asset("D", "negative", -0.5, "stale"),  # carried over: cannot have shifted
+                              asset("F", "negative", -0.9)]}       # nothing to compare with
+        shifts = ff.sentiment_shifts(previous, current)
+        self.assertEqual([s["ticker"] for s in shifts], ["C", "A"])  # largest move first
+        self.assertEqual((shifts[1]["from"], shifts[1]["to"]), ("positive", "negative"))
+        self.assertEqual(shifts[0]["headline"], "C headline")
+        self.assertEqual(ff.sentiment_shifts(None, current), [])
+
+    def test_links_come_from_githubs_own_variables(self):
+        env = {"GITHUB_REPOSITORY": "MyUser/quantlens", "GITHUB_SERVER_URL": "https://github.com", "GITHUB_RUN_ID": "42"}
+        self.assertEqual(ff.briefing_links(env), [
+            ("Open QuantLens", "https://myuser.github.io/quantlens/"),
+            ("Run log", "https://github.com/MyUser/quantlens/actions/runs/42"),
+        ])
+        self.assertEqual(ff.briefing_links({}), [])
+        self.assertEqual(ff.briefing_links({"GITHUB_REPOSITORY": "../evil"}), [])
+
+    @unittest.skipIf(shutil.which("node") is None, "Node.js is not installed")
+    def test_the_signals_bridge_runs_the_sites_engines_over_the_committed_snapshot(self):
+        signals = ff.compute_signals(SNAPSHOT_PATH)
+        self.assertIsNotNone(signals)
+        self.assertEqual([row["ticker"] for row in signals], [asset["ticker"] for asset in self.snapshot["assets"]])
+        for row in signals:
+            self.assertIn(row["verdict"], {"BUY", "HOLD", "SELL"}, row["ticker"])
+            self.assertTrue(0 <= row["composite"] <= 100, row["ticker"])
+        by_class = {asset["ticker"]: asset["assetClass"] for asset in self.snapshot["assets"]}
+        for row in signals:
+            if by_class[row["ticker"]] in {"etf", "index", "crypto"}:
+                self.assertEqual(row["confidence"], "Low", row["ticker"])  # technical only, by construction
 
 
 if __name__ == "__main__":

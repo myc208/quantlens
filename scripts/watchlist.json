@@ -3,17 +3,32 @@
   "history": { "period": "1y", "interval": "1d" },
   "fx": { "base": "USD", "quote": "SGD", "yahooSymbol": "SGD=X" },
   "assets": [
-    { "ticker": "AAPL",    "name": "Apple Inc.",                                    "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "NVDA",    "name": "NVIDIA Corporation",                            "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "MSFT",    "name": "Microsoft Corporation",                         "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "GOOGL",   "name": "Alphabet Inc.",                                 "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "AMZN",    "name": "Amazon.com, Inc.",                              "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "JPM",     "name": "JPMorgan Chase & Co.",                          "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "D05.SI",  "name": "DBS Group Holdings Ltd",                        "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "O39.SI",  "name": "Oversea-Chinese Banking Corporation Limited",   "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "Z74.SI",  "name": "Singapore Telecommunications Limited",          "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "C38U.SI", "name": "CapitaLand Integrated Commercial Trust",        "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,      "scoringProfile": null },
-    { "ticker": "BTC-USD", "name": "Bitcoin",                                       "assetClass": "crypto", "market": "CRYPTO", "currency": "USD", "lotSize": 0.000001, "binanceSymbol": "BTCUSDT", "scoringProfile": "CRYPTO" },
-    { "ticker": "ETH-USD", "name": "Ethereum",                                      "assetClass": "crypto", "market": "CRYPTO", "currency": "USD", "lotSize": 0.000001, "binanceSymbol": "ETHUSDT", "scoringProfile": "CRYPTO" }
+    { "ticker": "BTC-USD",  "name": "Bitcoin",                                        "assetClass": "crypto", "market": "CRYPTO", "currency": "USD", "lotSize": 0.000001, "binanceSymbol": "BTCUSDT",  "scoringProfile": "CRYPTO" },
+    { "ticker": "ETH-USD",  "name": "Ethereum",                                       "assetClass": "crypto", "market": "CRYPTO", "currency": "USD", "lotSize": 0.000001, "binanceSymbol": "ETHUSDT",  "scoringProfile": "CRYPTO" },
+    { "ticker": "AVAX-USD", "name": "Avalanche",                                      "assetClass": "crypto", "market": "CRYPTO", "currency": "USD", "lotSize": 0.000001, "binanceSymbol": "AVAXUSDT", "scoringProfile": "CRYPTO" },
+
+    { "ticker": "BLK",      "name": "BlackRock, Inc.",                                "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "SNDK",     "name": "Sandisk Corporation",                            "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "MU",       "name": "Micron Technology, Inc.",                        "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "AMD",      "name": "Advanced Micro Devices, Inc.",                   "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "ORCL",     "name": "Oracle Corporation",                             "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "BRK-B",    "name": "Berkshire Hathaway Inc. (Class B)",              "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "TSLA",     "name": "Tesla, Inc.",                                    "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "CCJ",      "name": "Cameco Corporation",                             "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+
+    { "ticker": "D05.SI",   "name": "DBS Group Holdings Ltd",                         "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "U11.SI",   "name": "United Overseas Bank Limited",                   "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "C6L.SI",   "name": "Singapore Airlines Limited",                     "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "AJBU.SI",  "name": "Keppel DC REIT",                                 "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "A17U.SI",  "name": "CapitaLand Ascendas REIT",                       "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "J69U.SI",  "name": "Frasers Centrepoint Trust",                      "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,       "scoringProfile": null },
+
+    { "ticker": "VOO",      "name": "Vanguard S&P 500 ETF",                           "assetClass": "etf",    "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": "ETF" },
+    { "ticker": "CSPX.L",   "name": "iShares Core S&P 500 UCITS ETF USD (Acc)",       "assetClass": "etf",    "market": "UK",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": "ETF" },
+
+    { "ticker": "^IXIC",    "name": "Nasdaq Composite",                               "assetClass": "index",  "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": "INDEX" },
+    { "ticker": "^GSPC",    "name": "S&P 500",                                        "assetClass": "index",  "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": "INDEX" },
+    { "ticker": "^DJI",     "name": "Dow Jones Industrial Average",                   "assetClass": "index",  "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": "INDEX" },
+    { "ticker": "^STI",     "name": "Straits Times Index",                            "assetClass": "index",  "market": "SG",     "currency": "SGD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": "INDEX" }
   ]
 }

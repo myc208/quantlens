@@ -25,6 +25,13 @@ import {
   traced, notAvailable, input, step, threshold, interpretation, valueOf, fmtN, fmtPct,
 } from '../core/derivationTracer.js';
 
+// Asset classes that never have a Fundamental score, and how the trace explains it.
+const NO_ACCOUNTS_REASON = Object.freeze({
+  crypto: { subject: 'Crypto has', because: 'crypto has no earnings or balance sheet to assess', plural: 'crypto' },
+  etf: { subject: 'An ETF has', because: 'an ETF is a basket of companies with no accounts of its own', plural: 'ETFs' },
+  index: { subject: 'An index has', because: 'an index is a calculated level with no accounts', plural: 'indices' },
+});
+
 export const ADVISOR_CONFIG = Object.freeze({
   weights: Object.freeze({ technical: 0.5, fundamental: 0.5 }),
   bands: Object.freeze({ buy: 65, hold: 45 }),
@@ -69,15 +76,15 @@ function buildComposite(asset, technicalScore, fundamentalScore) {
     });
   }
   if (fund === null) {
-    const isCrypto = asset.assetClass === 'crypto';
+    const why = NO_ACCOUNTS_REASON[asset.assetClass] ?? null;
     return traced({
       id, label, value: tech, unit: 'score', tone: scoreTone(tech), meta: { technicalOnly: true }, rawInputs, dependsOn,
       formula: 'Composite = Technical score (no Fundamental score is available)',
       steps: [
-        step(isCrypto ? 'Crypto has no fundamentals, so the composite is the Technical score alone' : 'The Fundamental score is unavailable, so the composite is the Technical score alone', 'Composite = Technical', tech),
+        step(why ? `${why.subject} no fundamentals, so the composite is the Technical score alone` : 'The Fundamental score is unavailable, so the composite is the Technical score alone', 'Composite = Technical', tech),
       ],
       interpretation: interpretation(
-        `The composite rests on price behaviour only${isCrypto ? ', because crypto has no earnings or balance sheet to assess' : ''}.`,
+        `The composite rests on price behaviour only${why ? `, because ${why.because}` : ''}.`,
         [threshold('65 – 100', 'BUY zone', 'healthy'), threshold('45 – 65', 'HOLD zone', 'neutral'), threshold('0 – 45', 'SELL zone', 'risky')],
         'With one source of evidence instead of two, confidence is always Low.',
       ),
@@ -229,7 +236,7 @@ function buildConfidence(asset, composite, technicalScore, fundamentalScore) {
       interpretation: interpretation(
         'The verdict rests on price behaviour alone, with nothing to confirm or contradict it.',
         thresholds,
-        asset.assetClass === 'crypto' ? 'This is always the case for crypto. Size positions accordingly.' : null,
+        NO_ACCOUNTS_REASON[asset.assetClass] ? `This is always the case for ${NO_ACCOUNTS_REASON[asset.assetClass].plural}. Size positions accordingly.` : null,
       ),
     });
   }

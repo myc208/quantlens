@@ -35,9 +35,12 @@ export const FUNDAMENTAL_KEYS = Object.freeze([
 export const MAX_NEWS_CLUSTERS = 3;
 export const RISK_FREE_CURRENCIES = Object.freeze(['USD', 'SGD']);
 
-const ASSET_CLASSES = ['equity', 'crypto'];
-const MARKETS = ['US', 'SG', 'CRYPTO'];
-const PROFILES = ['CORPORATE', 'FINANCIAL', 'REIT', 'CRYPTO'];
+const ASSET_CLASSES = ['equity', 'etf', 'index', 'crypto'];
+const MARKETS = ['US', 'SG', 'UK', 'CRYPTO'];
+const PROFILES = ['CORPORATE', 'FINANCIAL', 'REIT', 'ETF', 'INDEX', 'CRYPTO'];
+const EQUITY_PROFILES = ['CORPORATE', 'FINANCIAL', 'REIT'];
+// Asset classes with no company accounts: each has exactly one profile, with no fundamental score.
+const CLASS_PROFILES = Object.freeze({ crypto: 'CRYPTO', etf: 'ETF', index: 'INDEX' });
 const STATUSES = ['fresh', 'stale'];
 const SECTION_STATUSES = ['fresh', 'stale', 'unavailable'];
 const RISK_FREE_STATUSES = ['fresh', 'stale', 'proxy', 'unavailable'];
@@ -46,7 +49,8 @@ const YIELD_BOUNDS = Object.freeze({ min: -0.02, max: 0.25 });
 const TITLE_LIMIT = 300;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/;
-const TICKER_PATTERN = /^[A-Z0-9][A-Z0-9.\-=^]{0,14}$/;
+// Yahoo symbols: AMD, BRK-B, D05.SI, CSPX.L, BTC-USD, and indices with a leading caret (^GSPC).
+const TICKER_PATTERN = /^\^?[A-Z0-9][A-Z0-9.\-=]{0,14}$/;
 
 export class SnapshotError extends Error {
   /**
@@ -113,8 +117,9 @@ export function validateAsset(asset) {
     if (typeof asset[key] !== 'string' || !CURRENCY_PATTERN.test(asset[key])) errors.push(`${key} must be a 3-letter ISO code`);
   }
   if (!PROFILES.includes(asset.scoringProfile)) errors.push(`scoringProfile must be one of ${PROFILES.join(', ')}`);
-  if (asset.assetClass === 'crypto' && asset.scoringProfile !== 'CRYPTO') errors.push('crypto assets must use the CRYPTO profile');
-  if (asset.assetClass !== 'crypto' && asset.scoringProfile === 'CRYPTO') errors.push('only crypto assets may use the CRYPTO profile');
+  const required = CLASS_PROFILES[asset.assetClass];
+  if (required && asset.scoringProfile !== required) errors.push(`${asset.assetClass} assets must use the ${required} profile`);
+  if (asset.assetClass === 'equity' && !EQUITY_PROFILES.includes(asset.scoringProfile)) errors.push(`equities must use one of ${EQUITY_PROFILES.join(', ')}`);
   for (const key of ['sector', 'industry', 'statusNote', 'fundamentalsPeriod', 'binanceSymbol']) {
     if (asset[key] !== null && asset[key] !== undefined && typeof asset[key] !== 'string') errors.push(`${key} must be a string or null`);
   }

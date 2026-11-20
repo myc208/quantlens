@@ -298,15 +298,17 @@ const ENTRIES = {
   },
   fundamentalScore: {
     term: 'Fundamental score',
-    what: 'A 0 to 100 summary of business quality and valuation. The ingredients depend on the kind of company: corporates, banks and REITs are each scored on the measures that actually apply to them.',
+    what: 'A 0 to 100 summary of business quality and valuation. The ingredients depend on the kind of company: corporates, financial companies and REITs are each scored on the measures that actually apply to them. ETFs, indices and crypto have no accounts of their own, so they have no fundamental score.',
     why: 'It answers "is this a good business at a reasonable price?" independently of recent price moves.',
     healthy: '65 or more.',
     risky: 'Below 45. The thresholds are absolute and lean towards value, so fast-growing companies can score low on valuation.',
     profileNotes: {
       CORPORATE: 'Corporate profile: EV/EBITDA 25%, operating margin 20%, FCF yield 20%, Debt/Equity 15%, ROE 10%, forward P/E 10%.',
-      FINANCIAL: 'Bank profile: ROE 35%, Price-to-Book 30%, net margin 20%, trailing P/E 15%.',
+      FINANCIAL: 'Financial profile (banks, insurers, asset managers): ROE 35%, Price-to-Book 30%, net margin 20%, trailing P/E 15%.',
       REIT: 'REIT profile: Price-to-Book 35%, dividend yield 30%, gearing 25%, operating margin 10%.',
       CRYPTO: 'Crypto assets have no earnings, balance sheet or cash flow, so there is no fundamental score.',
+      ETF: 'An ETF is a basket of companies with no accounts of its own, so there is no fundamental score. Its verdict comes from price behaviour alone.',
+      INDEX: 'An index is a calculated level, not a business, so there is no fundamental score. Its verdict comes from price behaviour alone, and it cannot be bought directly.',
     },
   },
 

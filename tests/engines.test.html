@@ -1178,7 +1178,7 @@
           const value = a();
           if (!(value >= 0 && value < 1)) fail(`out of range: ${value}`);
         }
-        expect(monteCarlo.seedFromString('AAPL|2026-11-13')).toBe(monteCarlo.seedFromString('AAPL|2026-11-13'));
+        expect(monteCarlo.seedFromString('AMD|2026-11-13')).toBe(monteCarlo.seedFromString('AMD|2026-11-13'));
       });
       test('the normal sampler has mean 0 and variance 1', () => {
         const normal = monteCarlo.createNormalSampler(monteCarlo.mulberry32(1));
@@ -1253,8 +1253,8 @@
     suite('store: URL state and reducer rules', () => {
       const { actions, reduce, createInitialState, parseUrlState, serializeUrlState } = storeModule;
       const fakeSnapshot = {
-        assets: ['AAPL', 'NVDA', 'MSFT', 'D05.SI', 'BTC-USD'].map((ticker) => ({ ticker })),
-        byTicker: Object.fromEntries(['AAPL', 'NVDA', 'MSFT', 'D05.SI', 'BTC-USD'].map((ticker) => [ticker, { ticker, currency: 'USD', quote: { lastClose: 10, asOf: '2026-01-02' } }])),
+        assets: ['AMD', 'MU', 'ORCL', 'D05.SI', 'BTC-USD'].map((ticker) => ({ ticker })),
+        byTicker: Object.fromEntries(['AMD', 'MU', 'ORCL', 'D05.SI', 'BTC-USD'].map((ticker) => [ticker, { ticker, currency: 'USD', quote: { lastClose: 10, asOf: '2026-01-02' } }])),
         sectors: ['Technology', 'Financial Services'],
         fx: { rate: 1.29, asOf: '2026-01-02' },
       };
@@ -1263,15 +1263,15 @@
         expect(serializeUrlState(parseUrlState(''))).toBe('');
       });
       test('a full view round-trips through the URL unchanged', () => {
-        const query = '?t=NVDA,JPM,ETH-USD&ccy=SGD&mode=pro&class=equity&mkt=SG&sector=Financial+Services&verdict=buy';
+        const query = '?t=MU,BLK,ETH-USD&ccy=SGD&mode=pro&class=equity&mkt=SG&sector=Financial+Services&verdict=buy';
         const view = parseUrlState(query);
-        expect(view.selected).toEqual(['NVDA', 'JPM', 'ETH-USD']);
+        expect(view.selected).toEqual(['MU', 'BLK', 'ETH-USD']);
         expect(view.filters.sector).toBe('Financial Services');
         expect(serializeUrlState(view)).toBe(query);
       });
       test('parsing is forgiving: case, duplicates, a fourth ticker and garbage are all handled', () => {
-        const view = parseUrlState('?t=nvda,NVDA,%3Cscript%3E,jpm,eth-usd,aapl&ccy=xyz&mode=PRO&mkt=sg&verdict=maybe');
-        expect(view.selected).toEqual(['NVDA', 'JPM', 'ETH-USD']); // de-duplicated, sanitised, capped at three
+        const view = parseUrlState('?t=mu,MU,%3Cscript%3E,blk,eth-usd,amd&ccy=xyz&mode=PRO&mkt=sg&verdict=maybe');
+        expect(view.selected).toEqual(['MU', 'BLK', 'ETH-USD']); // de-duplicated, sanitised, capped at three
         expect(view.currency).toBe('USD');
         expect(view.mode).toBe('pro');
         expect(view.filters.market).toBe('SG');
@@ -1293,16 +1293,16 @@
       test('at most three assets can be selected; a fourth raises a notice instead', () => {
         let state = reduce(createInitialState(''), actions.snapshotLoaded(fakeSnapshot));
         expect(state.selected.length).toBe(3);
-        state = reduce(state, actions.toggleTicker('NVDA'));
+        state = reduce(state, actions.toggleTicker('MU'));
         expect(state.selected.length).toBe(3);
         expect(state.notice.text).toMatch(/up to 3/);
-        state = reduce(state, actions.toggleTicker('AAPL')); // deselect
-        state = reduce(state, actions.toggleTicker('NVDA'));
-        expect(state.selected).toEqual(['D05.SI', 'BTC-USD', 'NVDA']);
+        state = reduce(state, actions.toggleTicker('AMD')); // deselect
+        state = reduce(state, actions.toggleTicker('MU'));
+        expect(state.selected).toEqual(['D05.SI', 'BTC-USD', 'MU']);
       });
       test('tickers that are not in the snapshot are dropped when it loads', () => {
-        const state = reduce(createInitialState('?t=AAPL,FAKE,NVDA&sector=Mining'), actions.snapshotLoaded(fakeSnapshot));
-        expect(state.selected).toEqual(['AAPL', 'NVDA']);
+        const state = reduce(createInitialState('?t=AMD,FAKE,MU&sector=Mining'), actions.snapshotLoaded(fakeSnapshot));
+        expect(state.selected).toEqual(['AMD', 'MU']);
         expect(state.filters.sector).toBe('all');
         expect(state.notice.text).toMatch(/FAKE/);
       });
@@ -1325,7 +1325,7 @@
         expect(reduce(state, actions.livePrice('BTC-USD', 64000, 1, 'ws')).live.prices['BTC-USD'].price).toBe(64000);
       });
       test('the drawer trail supports drill-down, back and breadcrumb jumps', () => {
-        let state = reduce(createInitialState(''), actions.openTrace('AAPL', 'verdict'));
+        let state = reduce(createInitialState(''), actions.openTrace('AMD', 'verdict'));
         state = reduce(state, actions.drillTrace('compositeScore'));
         state = reduce(state, actions.drillTrace('technicalScore'));
         state = reduce(state, actions.drillTrace('rsi14'));
@@ -1804,7 +1804,7 @@
         expect(glossary.getExplainer('priceToBook', 'REIT').note).toMatch(/NAV/);
       });
       test('correlation pair ids resolve to the correlation explainer; unknown ids degrade gracefully', () => {
-        expect(glossary.getExplainer('corr:AAPL|NVDA').term).toBe('Correlation');
+        expect(glossary.getExplainer('corr:AMD|MU').term).toBe('Correlation');
         expect(glossary.hasExplainer('no-such-metric')).toBeFalse();
         expect(glossary.getExplainer('no-such-metric').term).toBe('Metric');
       });
@@ -1873,21 +1873,26 @@
         for (const { asset, fund } of Object.values(byTicker)) {
           let expected = 'CORPORATE';
           if (asset.assetClass === 'crypto') expected = 'CRYPTO';
+          else if (asset.assetClass === 'etf') expected = 'ETF';
+          else if (asset.assetClass === 'index') expected = 'INDEX';
           else if (asset.sector === 'Financial Services') expected = 'FINANCIAL';
           else if (asset.sector === 'Real Estate') expected = 'REIT';
           expect(fund.profile).toBe(expected);
         }
       });
-      test('banks never receive an EBITDA-based score; crypto never receives a fundamental score', async () => {
+      test('financial companies never receive an EBITDA-based score; crypto, ETFs and indices never receive a fundamental score', async () => {
         const { byTicker } = await analysed();
         for (const { asset, fund, advice } of Object.values(byTicker)) {
           if (fund.profile === 'FINANCIAL') {
             expect(fund.metrics.evEbitda.status).toBe('na');
             expect(fund.scoredIds).toEqual(['roe', 'priceToBook', 'netMargin', 'trailingPE']);
           }
-          if (asset.assetClass === 'crypto') {
+          if (['crypto', 'etf', 'index'].includes(asset.assetClass)) {
             expect(fund.metrics.fundamentalScore.status).toBe('na');
+            expect(fund.scoredIds).toEqual([]);
+            expect(advice.metrics.compositeScore.meta.technicalOnly).toBeTrue();
             expect(advice.metrics.confidence.value).toBe('Low');
+            expect(['BUY', 'HOLD', 'SELL']).toContain(advice.verdict); // still a verdict, from price behaviour
           }
         }
       });
@@ -2446,8 +2451,8 @@
         service.terminate();
       });
       test('equal inputs give equal job keys', () => {
-        expect(workerService.jobKey('AAPL', { riskPct: 1 }, 100)).toBe(workerService.jobKey('AAPL', { riskPct: 1 }, 100));
-        expect(workerService.jobKey('AAPL', 100) === workerService.jobKey('AAPL', 101)).toBeFalse();
+        expect(workerService.jobKey('AMD', { riskPct: 1 }, 100)).toBe(workerService.jobKey('AMD', { riskPct: 1 }, 100));
+        expect(workerService.jobKey('AMD', 100) === workerService.jobKey('AMD', 101)).toBeFalse();
       });
 
       /** A service whose replies are released by the test, to stage races deliberately. */
@@ -2552,7 +2557,7 @@
 
     suite('store: tabs, time range, portfolio weights and compute state', () => {
       const { actions, reduce, createInitialState, parseUrlState, serializeUrlState } = storeModule;
-      const tickers = ['AAPL', 'NVDA', 'MSFT', 'D05.SI', 'BTC-USD', 'JPM', 'O39.SI', 'GOOGL', 'AMZN', 'ETH-USD'];
+      const tickers = ['AMD', 'MU', 'ORCL', 'D05.SI', 'BTC-USD', 'BLK', 'U11.SI', 'TSLA', 'CCJ', 'ETH-USD'];
       const fakeSnapshot = {
         assets: tickers.map((ticker) => ({ ticker })),
         byTicker: Object.fromEntries(tickers.map((ticker) => [ticker, { ticker }])),
@@ -2563,11 +2568,11 @@
       const loaded = (query = '') => reduce(createInitialState(query), actions.snapshotLoaded(fakeSnapshot));
 
       test('tab, range and portfolio weights round-trip through the URL', () => {
-        const query = '?view=portfolio&range=3m&p=AAPL:40,D05.SI:35,BTC-USD:25';
+        const query = '?view=portfolio&range=3m&p=AMD:40,D05.SI:35,BTC-USD:25';
         const view = parseUrlState(query);
         expect(view.view).toBe('portfolio');
         expect(view.range).toBe('3m');
-        expect(view.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 40 }, { ticker: 'D05.SI', weight: 35 }, { ticker: 'BTC-USD', weight: 25 }]);
+        expect(view.portfolio.weights).toEqual([{ ticker: 'AMD', weight: 40 }, { ticker: 'D05.SI', weight: 35 }, { ticker: 'BTC-USD', weight: 25 }]);
         expect(serializeUrlState(view)).toBe(query);
       });
       test('defaults are omitted, so the default view still has an empty query string', () => {
@@ -2580,12 +2585,12 @@
         expect(serializeUrlState(reduce(state, actions.setRange('6m')))).toBe('?range=6m');
       });
       test('malformed tab, range and weights fall back safely', () => {
-        const view = parseUrlState('?view=admin&range=10y&p=aapl:150,<x>:5,NVDA:abc,MSFT:-3,AAPL:9,JPM:12.345');
+        const view = parseUrlState('?view=admin&range=10y&p=amd:150,<x>:5,MU:abc,ORCL:-3,AMD:9,BLK:12.345');
         expect(view.view).toBe('compare');
         expect(view.range).toBe('1y');
         // 150 is capped at 100, the script tag and the non-number are dropped, −3 is floored at 0,
-        // the second AAPL is a duplicate, and 12.345 is rounded to two decimals.
-        expect(view.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 100 }, { ticker: 'MSFT', weight: 0 }, { ticker: 'JPM', weight: 12.35 }]);
+        // the second AMD is a duplicate, and 12.345 is rounded to two decimals.
+        expect(view.portfolio.weights).toEqual([{ ticker: 'AMD', weight: 100 }, { ticker: 'ORCL', weight: 0 }, { ticker: 'BLK', weight: 12.35 }]);
         expect(parseUrlState('?p=').portfolio.weights).toBeNull();
         expect(parseUrlState('?p=garbage').portfolio.weights).toBeNull();
       });
@@ -2604,40 +2609,40 @@
       test('with no explicit weights the portfolio follows the compared assets, equally', () => {
         const state = loaded();
         expect(storeModule.hasCustomPortfolio(state)).toBeFalse();
-        expect(storeModule.selectPortfolioWeights(state).map((entry) => entry.ticker)).toEqual(['AAPL', 'D05.SI', 'BTC-USD']);
+        expect(storeModule.selectPortfolioWeights(state).map((entry) => entry.ticker)).toEqual(['AMD', 'D05.SI', 'BTC-USD']);
         const fewer = reduce(state, actions.toggleTicker('BTC-USD'));
         expect(storeModule.selectPortfolioWeights(fewer).map((entry) => entry.weight)).toEqual([50, 50]);
       });
       test('changing one weight makes the portfolio explicit and puts it in the URL', () => {
-        const state = reduce(loaded(), actions.setPortfolioWeight('AAPL', 60));
+        const state = reduce(loaded(), actions.setPortfolioWeight('AMD', 60));
         expect(storeModule.hasCustomPortfolio(state)).toBeTrue();
-        expect(state.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 60 }, { ticker: 'D05.SI', weight: 33.33 }, { ticker: 'BTC-USD', weight: 33.34 }]);
-        expect(serializeUrlState(state)).toBe('?p=AAPL:60,D05.SI:33.33,BTC-USD:33.34');
-        expect(reduce(state, actions.setPortfolioWeight('AAPL', 60))).toBe(state); // no change, same object
-        expect(reduce(state, actions.setPortfolioWeight('AAPL', 'abc'))).toBe(state);
-        expect(reduce(state, actions.setPortfolioWeight('TSLA', 10))).toBe(state); // not in the portfolio
-        expect(reduce(state, actions.setPortfolioWeight('AAPL', 250)).portfolio.weights[0].weight).toBe(100);
+        expect(state.portfolio.weights).toEqual([{ ticker: 'AMD', weight: 60 }, { ticker: 'D05.SI', weight: 33.33 }, { ticker: 'BTC-USD', weight: 33.34 }]);
+        expect(serializeUrlState(state)).toBe('?p=AMD:60,D05.SI:33.33,BTC-USD:33.34');
+        expect(reduce(state, actions.setPortfolioWeight('AMD', 60))).toBe(state); // no change, same object
+        expect(reduce(state, actions.setPortfolioWeight('AMD', 'abc'))).toBe(state);
+        expect(reduce(state, actions.setPortfolioWeight('NVDA', 10))).toBe(state); // not in the portfolio
+        expect(reduce(state, actions.setPortfolioWeight('AMD', 250)).portfolio.weights[0].weight).toBe(100);
       });
       test('a new asset joins at 0% so the existing allocation is untouched', () => {
-        const state = reduce(reduce(loaded(), actions.setPortfolioWeight('AAPL', 60)), actions.addPortfolioAsset('nvda'));
-        expect(state.portfolio.weights[3]).toEqual({ ticker: 'NVDA', weight: 0 });
+        const state = reduce(reduce(loaded(), actions.setPortfolioWeight('AMD', 60)), actions.addPortfolioAsset('mu'));
+        expect(state.portfolio.weights[3]).toEqual({ ticker: 'MU', weight: 0 });
         expect(state.portfolio.weights[0].weight).toBe(60);
-        expect(reduce(state, actions.addPortfolioAsset('NVDA'))).toBe(state); // already there
-        expect(reduce(state, actions.addPortfolioAsset('TSLA'))).toBe(state); // not in the watchlist
+        expect(reduce(state, actions.addPortfolioAsset('MU'))).toBe(state); // already there
+        expect(reduce(state, actions.addPortfolioAsset('NVDA'))).toBe(state); // not in the watchlist
         const removed = reduce(state, actions.removePortfolioAsset('D05.SI'));
-        expect(removed.portfolio.weights.map((entry) => entry.ticker)).toEqual(['AAPL', 'BTC-USD', 'NVDA']);
+        expect(removed.portfolio.weights.map((entry) => entry.ticker)).toEqual(['AMD', 'BTC-USD', 'MU']);
       });
       test('a portfolio holds at most eight assets; a ninth raises a notice', () => {
         let state = loaded();
-        for (const ticker of ['NVDA', 'MSFT', 'JPM', 'O39.SI', 'GOOGL']) state = reduce(state, actions.addPortfolioAsset(ticker));
+        for (const ticker of ['MU', 'ORCL', 'BLK', 'U11.SI', 'TSLA']) state = reduce(state, actions.addPortfolioAsset(ticker));
         expect(state.portfolio.weights.length).toBe(8);
-        const full = reduce(state, actions.addPortfolioAsset('AMZN'));
+        const full = reduce(state, actions.addPortfolioAsset('CCJ'));
         expect(full.portfolio.weights.length).toBe(8);
         expect(full.notice.text).toMatch(/up to 8/);
       });
       test('normalise scales any weights to exactly 100, equalise splits evenly, reset follows the selection again', () => {
         let state = loaded();
-        state = reduce(state, actions.setPortfolioWeight('AAPL', 50));
+        state = reduce(state, actions.setPortfolioWeight('AMD', 50));
         state = reduce(state, actions.setPortfolioWeight('D05.SI', 50));
         state = reduce(state, actions.setPortfolioWeight('BTC-USD', 50)); // total 150
         const normalised = reduce(state, actions.normalisePortfolio());
@@ -2650,13 +2655,13 @@
         expect(serializeUrlState(reset)).toBe('');
       });
       test('portfolio tickers that are not in the snapshot are dropped when it loads', () => {
-        const state = loaded('?p=AAPL:50,FAKE:30,NVDA:20');
-        expect(state.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 50 }, { ticker: 'NVDA', weight: 20 }]);
+        const state = loaded('?p=AMD:50,FAKE:30,MU:20');
+        expect(state.portfolio.weights).toEqual([{ ticker: 'AMD', weight: 50 }, { ticker: 'MU', weight: 20 }]);
         expect(loaded('?p=FAKE:100').portfolio.weights).toBeNull();
       });
       test('weights are percentages: no amount of money can reach the URL through the portfolio', () => {
         let state = reduce(loaded(), actions.setAccount('equity', 987654));
-        state = reduce(state, actions.setPortfolioWeight('AAPL', 70));
+        state = reduce(state, actions.setPortfolioWeight('AMD', 70));
         expect(serializeUrlState(state).includes('987654')).toBeFalse();
         for (const entry of state.portfolio.weights) expect(entry.weight).toBeAtMost(100);
       });
@@ -2687,7 +2692,7 @@
         expect(viewNotifications).toBe(0);
         store.dispatch(actions.setView('portfolio'));
         store.dispatch(actions.setRange('1m'));
-        store.dispatch(actions.setPortfolioWeight('AAPL', 10));
+        store.dispatch(actions.setPortfolioWeight('AMD', 10));
         expect(viewNotifications).toBe(3);
         expect(serializeUrlState(store.getState()).includes('result')).toBeFalse();
       });
@@ -2872,7 +2877,7 @@
         { id: 'view:compare', title: 'Compare', keywords: ['matrix', 'view'] },
         { id: 'view:leaderboard', title: 'Leaderboard', keywords: ['ranking', 'view'] },
         { id: 'view:portfolio', title: 'Portfolio', keywords: ['allocation', 'sharpe', 'view'] },
-        { id: 'asset:AAPL', title: 'AAPL', keywords: ['Apple Inc.', 'Technology', 'US'] },
+        { id: 'asset:AMD', title: 'AMD', keywords: ['Advanced Micro Devices', 'Technology', 'US'] },
         { id: 'asset:D05.SI', title: 'D05.SI', keywords: ['DBS Group Holdings Ltd', 'Financial Services', 'SG'] },
         { id: 'asset:BTC-USD', title: 'BTC-USD', keywords: ['Bitcoin', 'Crypto'] },
         { id: 'action:reset', title: 'Reset the portfolio', keywords: ['weights'] },
@@ -2884,8 +2889,8 @@
         expect(ids('   ')).toEqual(commands.map((command) => command.id));
       });
       test('a ticker, a company name and a sector all find the asset', () => {
-        expect(ids('aapl')[0]).toBe('asset:AAPL');
-        expect(ids('apple')).toEqual(['asset:AAPL']);
+        expect(ids('amd')[0]).toBe('asset:AMD');
+        expect(ids('micro')).toEqual(['asset:AMD']);
         expect(ids('dbs')).toEqual(['asset:D05.SI']);
         expect(ids('bitcoin')).toEqual(['asset:BTC-USD']);
         expect(ids('BTC')[0]).toBe('asset:BTC-USD'); // case-insensitive, matches the start of the ticker
@@ -3002,17 +3007,17 @@
       const set = (weights, state = base) => storeModule.reduce(state, storeModule.actions.setPortfolioWeights(weights));
 
       test('a valid list replaces the allocation, whatever was there before', () => {
-        const first = set([{ ticker: 'AAPL', weight: 60 }, { ticker: 'NVDA', weight: 40 }]);
-        expect(first.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 60 }, { ticker: 'NVDA', weight: 40 }]);
+        const first = set([{ ticker: 'AMD', weight: 60 }, { ticker: 'MU', weight: 40 }]);
+        expect(first.portfolio.weights).toEqual([{ ticker: 'AMD', weight: 60 }, { ticker: 'MU', weight: 40 }]);
         const second = set([{ ticker: 'BTC-USD', weight: 100 }], first);
         expect(second.portfolio.weights).toEqual([{ ticker: 'BTC-USD', weight: 100 }]);
       });
       test('duplicates and malformed entries are dropped; a negative weight is clamped to zero', () => {
         const state = set([
-          { ticker: 'aapl', weight: 50 }, { ticker: 'AAPL', weight: 10 }, { ticker: '<script>', weight: 10 },
-          { ticker: 'NVDA', weight: -5 }, { ticker: 'MSFT', weight: 'abc' }, null, { ticker: 'JPM', weight: 25 },
+          { ticker: 'amd', weight: 50 }, { ticker: 'AMD', weight: 10 }, { ticker: '<script>', weight: 10 },
+          { ticker: 'MU', weight: -5 }, { ticker: 'ORCL', weight: 'abc' }, null, { ticker: 'BLK', weight: 25 },
         ]);
-        expect(state.portfolio.weights).toEqual([{ ticker: 'AAPL', weight: 50 }, { ticker: 'NVDA', weight: 0 }, { ticker: 'JPM', weight: 25 }]);
+        expect(state.portfolio.weights).toEqual([{ ticker: 'AMD', weight: 50 }, { ticker: 'MU', weight: 0 }, { ticker: 'BLK', weight: 25 }]);
       });
       test('a list with nothing usable leaves the state untouched', () => {
         expect(set([])).toBe(base);
@@ -3078,6 +3083,118 @@
         // No sampled mix can be less volatile than the sample's own minimum.
         expect(Math.min(...frontier.risk)).toBeCloseTo(frontier.minVariance.risk, 1e-12);
         expect(analysis.metrics.portfolioVolatility.value).toBeAtLeast(frontier.minVariance.risk - 1e-12);
+      });
+    });
+
+    /* ================================================================== */
+    /* 22. ETFs, indices and the London listing                            */
+    /* ================================================================== */
+
+    const ACCOUNT_FOR_FUNDS = Object.freeze({ equity: 10000, riskPct: 1, atrMultiple: 2, maxPositionPct: 25 });
+
+    suite('ETFs and indices: no accounts, no fundamental score, no index positions', () => {
+      const etf = () => makeAsset({
+        ticker: 'VOO', assetClass: 'etf', scoringProfile: 'ETF', sector: null, industry: null, fundamentalsPeriod: null,
+        fundamentals: { dividendYieldTTM: 0.0112 },
+      });
+      const index = () => makeAsset({
+        ticker: '^GSPC', assetClass: 'index', scoringProfile: 'INDEX', sector: null, industry: null, fundamentalsPeriod: null,
+      });
+
+      test('an ETF has no fundamental score, and every company measure says why', () => {
+        const result = fundamental.analyzeFundamentals(etf());
+        expect(result.profile).toBe('ETF');
+        expect(result.scoredIds).toEqual([]);
+        expect(result.metrics.fundamentalScore.status).toBe('na');
+        expect(result.metrics.fundamentalScore.naReason).toMatch(/basket of companies/);
+        for (const id of ['evEbitda', 'operatingMargin', 'fcfYield', 'debtToEquity', 'roe', 'trailingPE', 'priceToBook', 'marketCap']) {
+          expect(result.metrics[id].status).toBe('na');
+          expect(result.metrics[id].naReason).toMatch(/An ETF holds a basket of companies/);
+        }
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test("an ETF's distribution yield is shown for context only", () => {
+        const { dividendYield } = fundamental.analyzeFundamentals(etf()).metrics;
+        expect(dividendYield.status).toBe('ok');
+        expect(dividendYield.value).toBeCloseTo(0.0112, 1e-12);
+        expect(dividendYield.meta.scored).toBeFalse();
+        expect(JSON.stringify(dividendYield.trace)).toMatch(/no fundamental score for this kind of asset/);
+      });
+      test('an index has no fundamental measures at all', () => {
+        const result = fundamental.analyzeFundamentals(index());
+        expect(result.profile).toBe('INDEX');
+        for (const metric of Object.values(result.metrics)) {
+          expect(metric.status).toBe('na');
+          expect(tracer.validateTrace(metric)).toEqual([]);
+        }
+        expect(result.metrics.dividendYield.naReason).toMatch(/calculated level/);
+      });
+      test('the verdict of an ETF or an index rests on price behaviour, and the trace names the reason', () => {
+        for (const [asset, phrase] of [[etf(), /an ETF is a basket/], [index(), /an index is a calculated level/]]) {
+          const tech = technical.analyzeTechnicals(asset);
+          const advice = advisor.advise({ asset, technical: tech, fundamental: fundamental.analyzeFundamentals(asset) });
+          expect(advice.metrics.compositeScore.value).toBe(tech.metrics.technicalScore.value);
+          expect(advice.metrics.compositeScore.trace.interpretation.summary).toMatch(phrase);
+          expect(advice.metrics.confidence.value).toBe('Low');
+        }
+      });
+      test('an index cannot be sized, an ETF is sized in shares like a stock', () => {
+        const args = { entryPrice: 100, atr: 2, verdict: 'BUY', account: { equity: 10000, riskPct: 1, atrMultiple: 2, maxPositionPct: 25 }, accountCurrency: 'USD', fxRate: 1.3 };
+        const indexSizing = sizer.sizePosition({ asset: index(), ...args });
+        expect(indexSizing.ok).toBeFalse();
+        expect(indexSizing.metrics.positionSize.naReason).toMatch(/cannot be bought directly/);
+        for (const metric of Object.values(indexSizing.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        const fundSizing = sizer.sizePosition({ asset: etf(), ...args });
+        expect(fundSizing.ok).toBeTrue();
+        expect(fundSizing.summary.unitName).toBe('shares');
+        expect(fundSizing.summary.units).toBe(25); // 100 risk / (2 × 2 ATR) = 25 shares, worth 2,500 = the 25% cap
+      });
+      test('the snapshot schema pairs each asset class with its profile', async () => {
+        const raw = await rawSnapshot();
+        const equity = raw.assets.find((asset) => asset.assetClass === 'equity');
+        const valid = (overrides) => snapshotService.validateAsset({ ...equity, ticker: 'VOO', ...overrides });
+        expect(valid({ assetClass: 'etf', scoringProfile: 'ETF' })).toEqual([]);
+        expect(valid({ ticker: '^GSPC', assetClass: 'index', scoringProfile: 'INDEX' })).toEqual([]);
+        expect(valid({ ticker: 'CSPX.L', assetClass: 'etf', scoringProfile: 'ETF', market: 'UK' })).toEqual([]);
+        expect(valid({ assetClass: 'etf', scoringProfile: 'CORPORATE' }).join(' ')).toMatch(/etf assets must use the ETF profile/);
+        expect(valid({ assetClass: 'equity', scoringProfile: 'INDEX' }).join(' ')).toMatch(/equities must use one of/);
+        expect(valid({ market: 'LSE' }).join(' ')).toMatch(/market must be one of/);
+        expect(valid({ ticker: 'GS^PC' }).join(' ')).toMatch(/ticker/); // a caret only ever leads
+      });
+      test('an index ticker survives the address bar in both spellings', () => {
+        const encoded = storeModule.parseUrlState('?t=%5EGSPC,^sti,CSPX.L&class=index&mkt=UK&p=%5EGSPC:60,VOO:40');
+        expect(encoded.selected).toEqual(['^GSPC', '^STI', 'CSPX.L']);
+        expect(encoded.filters.assetClass).toBe('index');
+        expect(encoded.filters.market).toBe('UK');
+        expect(encoded.portfolio.weights).toEqual([{ ticker: '^GSPC', weight: 60 }, { ticker: 'VOO', weight: 40 }]);
+        const state = storeModule.createInitialState('?t=%5EGSPC,^sti,CSPX.L&class=index&mkt=UK&p=%5EGSPC:60,VOO:40');
+        const again = storeModule.parseUrlState(storeModule.serializeUrlState(state));
+        expect(again.selected).toEqual(['^GSPC', '^STI', 'CSPX.L']);
+        expect(again.portfolio.weights).toEqual(encoded.portfolio.weights);
+        expect(storeModule.FILTER_OPTIONS.assetClass).toEqual(['all', 'equity', 'etf', 'index', 'crypto']);
+      });
+      test('every asset class and market has a Guided-mode explanation and a profile label', () => {
+        for (const profile of ['ETF', 'INDEX']) {
+          expect(glossary.getExplainer('fundamentalScore', profile).note).toMatch(/no fundamental score/);
+          expect(fundamental.PROFILES[profile].scoring.length).toBe(0);
+        }
+        expect(fundamental.PROFILES.FINANCIAL.label).toBe('Financial');
+      });
+      test('real snapshot: ETFs and indices are analysed end to end without a single exception', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const funds = snapshot.assets.filter((asset) => asset.assetClass === 'etf' || asset.assetClass === 'index');
+        for (const asset of funds) {
+          const tech = technical.analyzeTechnicals(asset);
+          const fund = fundamental.analyzeFundamentals(asset, { fxRate: snapshot.fx.rate });
+          const advice = advisor.advise({ asset, technical: tech, fundamental: fund });
+          for (const metric of [...Object.values(tech.metrics), ...Object.values(fund.metrics), ...Object.values(advice.metrics)]) {
+            expect(tracer.validateTrace(metric)).toEqual([]);
+          }
+          expect(asset.sector).toBeNull();
+          const sizing = sizer.sizePosition({ asset, entryPrice: asset.quote.lastClose, atr: tracer.valueOf(tech.metrics.atr14), verdict: advice.verdict, account: ACCOUNT_FOR_FUNDS, accountCurrency: 'USD', fxRate: snapshot.fx.rate });
+          expect(sizing.ok).toBe(asset.assetClass === 'etf');
+        }
       });
     });
 

@@ -85,6 +85,10 @@ export function sizePosition({
 }) {
   const assetCurrency = asset.currency;
   const unitName = asset.assetClass === 'crypto' ? 'coins' : 'shares';
+
+  if (asset.assetClass === 'index') {
+    return unavailable(asset, 'An index cannot be bought directly, so there is no position to size. To act on it, size a position in a fund that tracks it, such as an ETF.');
+  }
   const lot = asset.lotSize;
   const asOf = asset.quote.asOf;
 

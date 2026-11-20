@@ -139,8 +139,8 @@ const SIZING_SECTION = Object.freeze({
 });
 
 const VERDICT_TONES = Object.freeze({ BUY: 'healthy', HOLD: 'neutral', SELL: 'risky' });
-const PROFILE_CHIPS = Object.freeze({ CORPORATE: 'Corporate', FINANCIAL: 'Bank', REIT: 'REIT', CRYPTO: 'Crypto' });
-const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'banks', REIT: 'REITs', CRYPTO: 'crypto' });
+const PROFILE_CHIPS = Object.freeze({ CORPORATE: 'Corporate', FINANCIAL: 'Financial', REIT: 'REIT', ETF: 'ETF', INDEX: 'Index', CRYPTO: 'Crypto' });
+const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'financial companies', REIT: 'REITs', ETF: 'ETFs', INDEX: 'indices', CRYPTO: 'crypto' });
 const STORY_TONES = Object.freeze({ positive: 'healthy', neutral: 'neutral', negative: 'caution' });
 const DAY_MS = 86400000;
 const dayOf = (isoDate) => Date.parse(`${isoDate}T00:00:00Z`);
