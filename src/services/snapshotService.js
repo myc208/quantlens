@@ -22,7 +22,8 @@
 import { isNum } from '../core/precisionMath.js';
 
 export const SNAPSHOT_URL = './data/market_snapshot.json';
-export const SUPPORTED_SCHEMA_VERSIONS = Object.freeze([1, 2]);
+// v3 adds five years of closes, dividends and an event calendar; Step 2 of V3.0 reads them.
+export const SUPPORTED_SCHEMA_VERSIONS = Object.freeze([1, 2, 3]);
 export const SUPPORTED_SCHEMA_VERSION = 2;
 export const MIN_CANDLES = 200;
 export const CANDLE_FIELDS = Object.freeze(['date', 'open', 'high', 'low', 'close', 'volume']);

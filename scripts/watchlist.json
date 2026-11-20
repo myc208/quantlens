@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "history": { "period": "1y", "interval": "1d" },
+  "history": { "period": "5y", "interval": "1d" },
   "fx": { "base": "USD", "quote": "SGD", "yahooSymbol": "SGD=X" },
   "assets": [
     { "ticker": "BTC-USD",  "name": "Bitcoin",                                        "assetClass": "crypto", "market": "CRYPTO", "currency": "USD", "lotSize": 0.000001, "binanceSymbol": "BTCUSDT",  "scoringProfile": "CRYPTO" },
@@ -15,6 +15,13 @@
     { "ticker": "BRK-B",    "name": "Berkshire Hathaway Inc. (Class B)",              "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
     { "ticker": "TSLA",     "name": "Tesla, Inc.",                                    "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
     { "ticker": "CCJ",      "name": "Cameco Corporation",                             "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "XOM",      "name": "Exxon Mobil Corporation",                        "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "NEM",      "name": "Newmont Corporation",                            "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "WPM",      "name": "Wheaton Precious Metals Corp.",                  "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "BHP",      "name": "BHP Group Limited (ADR)",                        "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "WMT",      "name": "Walmart Inc.",                                   "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "LLY",      "name": "Eli Lilly and Company",                          "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
+    { "ticker": "CAT",      "name": "Caterpillar Inc.",                               "assetClass": "equity", "market": "US",     "currency": "USD", "lotSize": 1,        "binanceSymbol": null,       "scoringProfile": null },
 
     { "ticker": "D05.SI",   "name": "DBS Group Holdings Ltd",                         "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,       "scoringProfile": null },
     { "ticker": "U11.SI",   "name": "United Overseas Bank Limited",                   "assetClass": "equity", "market": "SG",     "currency": "SGD", "lotSize": 100,      "binanceSymbol": null,       "scoringProfile": null },

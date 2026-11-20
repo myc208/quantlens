@@ -1501,9 +1501,9 @@
       /** Warnings the untouched snapshot already carries (for example a stale-ticker notice on a degraded day). */
       const baselineWarnings = async () => normalise(await rawSnapshot()).warnings.length;
 
-      test('the committed snapshot is schema v2 and none of its sections is malformed', async () => {
+      test('the committed snapshot is schema v3 and none of its sections is malformed', async () => {
         const raw = await rawSnapshot();
-        expect(raw.schemaVersion).toBe(2);
+        expect(raw.schemaVersion).toBe(3);
         expect(snapshotService.validateSnapshot(raw).sectionProblems).toEqual([]);
         const snapshot = normalise(raw);
         expect(snapshot.fx.series.dates.length).toBe(snapshot.fx.series.rates.length);
