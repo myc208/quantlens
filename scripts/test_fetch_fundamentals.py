@@ -1102,6 +1102,12 @@ class SchemaV3Snapshot(unittest.TestCase):
                 step = asset["candles"][0][4] / asset["history"][-1][1]
                 self.assertTrue(0.5 < step < 2.0, asset["ticker"])
 
+    def test_usd_sgd_history_spans_the_same_five_years(self):
+        earliest = min((a["history"] or a["candles"])[0][0] for a in self.snapshot["assets"])
+        first_rate = self.snapshot["fx"]["series"][0][0]
+        self.assertLessEqual((date.fromisoformat(first_rate) - date.fromisoformat(earliest)).days, 10)
+        self.assertEqual(ff.FX_HISTORY_PERIOD, "5y")
+
     def test_a_v2_asset_is_upgraded_to_v3_and_carried_over_with_its_history(self):
         old = copy.deepcopy(next(a for a in self.snapshot["assets"] if a["assetClass"] == "equity"))
         for key in ("history", "dividends", "events"):

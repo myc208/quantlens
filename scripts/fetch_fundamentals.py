@@ -103,6 +103,7 @@ HISTORY_FIELDS = ["date", "close"]
 FORECAST_FIELDS = ["date", "yhat", "lower", "upper"]
 MIN_CANDLES = 200
 CANDLE_WINDOW_DAYS = 365      # the most recent year keeps full OHLCV; older sessions keep the close only
+FX_HISTORY_PERIOD = "5y"      # USD/SGD closes, as long as the asset history
 HISTORY_MAX_ROWS = 2000       # five years of daily crypto closes is about 1,460 rows
 SPLICE_MAX_GAP_DAYS = 10      # the last history row and the first candle are at most this far apart
 DIVIDEND_MAX_ROWS = 300
@@ -1516,7 +1517,8 @@ def fetch_fx(config: dict[str, str], previous: dict[str, Any] | None, settings: 
     symbol = config["yahooSymbol"]
     deadline = time.monotonic() + settings.macro_timeout
     try:
-        history = with_retry(f"{symbol} FX rate", lambda: fetch_history(symbol, "1y", "1d", settings.request_timeout),
+        # Five years, like the asset history, so a 5-year portfolio converts each day at that day's rate.
+        history = with_retry(f"{symbol} FX rate", lambda: fetch_history(symbol, FX_HISTORY_PERIOD, "1d", settings.request_timeout),
                              settings.max_retries, settings.retry_delay, deadline)
         closes = history["Close"].dropna()
         series_by_date: dict[str, float] = {}

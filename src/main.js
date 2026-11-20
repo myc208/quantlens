@@ -103,7 +103,11 @@ const RANGE_INFO = Object.freeze({
   '3m': Object.freeze({ id: '3m', short: '3M', label: '3 months', title: '3 months' }),
   '6m': Object.freeze({ id: '6m', short: '6M', label: '6 months', title: '6 months' }),
   '1y': Object.freeze({ id: '1y', short: '1Y', label: 'year', title: '1 year' }),
+  '5y': Object.freeze({ id: '5y', short: '5Y', label: '5 years', title: '5 years' }),
 });
+
+/** Ranges long enough for the full-year correlation rule (at least 60 overlapping returns). */
+const FULL_CORRELATION_RANGES = new Set(['1y', '5y']);
 
 /** Escape text for safe insertion into HTML. Every dynamic string goes through this. */
 function esc(value) {
@@ -273,7 +277,9 @@ function windowFor(ticker, range = store.getState().range) {
   const key = `${ticker}|${info.id}`;
   let cached = windows.get(key);
   if (!cached) {
-    const series = sliceSeries(analysis.asset.series, info.id);
+    // 5Y reads the long close-only series; every shorter range is cut from the year of candles.
+    const source = info.id === '5y' ? analysis.asset.longSeries : analysis.asset.series;
+    const series = sliceSeries(source, info.id);
     const result = analyzeWindow(analysis.asset, series, info.label);
     cached = Object.freeze({
       range: info.id,
@@ -375,7 +381,7 @@ function comparison() {
     correlationMemo = {
       key: selectionKey,
       value: analyzeCorrelation(windowed, {
-        minOverlap: info.id === '1y' ? CORR_CONFIG.minOverlap : CORR_CONFIG.minWindowOverlap,
+        minOverlap: FULL_CORRELATION_RANGES.has(info.id) ? CORR_CONFIG.minOverlap : CORR_CONFIG.minWindowOverlap,
         windowLabel: info.label,
       }),
     };

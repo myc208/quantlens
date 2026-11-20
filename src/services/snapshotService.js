@@ -22,11 +22,17 @@
 import { isNum } from '../core/precisionMath.js';
 
 export const SNAPSHOT_URL = './data/market_snapshot.json';
-// v3 adds five years of closes, dividends and an event calendar; Step 2 of V3.0 reads them.
+// v2 added news, forecasts and macro data; v3 adds five years of closes, dividends and an event calendar.
 export const SUPPORTED_SCHEMA_VERSIONS = Object.freeze([1, 2, 3]);
-export const SUPPORTED_SCHEMA_VERSION = 2;
+export const SUPPORTED_SCHEMA_VERSION = 3;
 export const MIN_CANDLES = 200;
 export const CANDLE_FIELDS = Object.freeze(['date', 'open', 'high', 'low', 'close', 'volume']);
+export const HISTORY_FIELDS = Object.freeze(['date', 'close']);
+export const MAX_HISTORY_ROWS = 2000;
+export const SPLICE_MAX_GAP_DAYS = 10;
+export const MAX_DIVIDEND_ROWS = 300;
+export const MAX_PAST_EARNINGS = 30;
+export const EARNINGS_TIMINGS = Object.freeze(['before-open', 'during-session', 'after-close', 'unknown']);
 export const FORECAST_FIELDS = Object.freeze(['date', 'yhat', 'lower', 'upper']);
 export const FUNDAMENTAL_KEYS = Object.freeze([
   'marketCap', 'enterpriseValue', 'ebit', 'ebitda', 'operatingIncome', 'totalRevenue', 'netIncome',
@@ -457,9 +463,132 @@ export function validateSnapshot(raw) {
       if (asset.forecast === undefined) sectionProblems.push(`${label}: the forecast block is missing`);
       else if (forecast.problem) sectionProblems.push(`${label}: ${forecast.problem}`);
     }
+    if (raw.schemaVersion >= 3) {
+      const sections = [
+        ['history', normaliseHistory(asset.history, asset.candles[0][0]).problem],
+        ['dividends', normaliseDividends(asset.dividends).problem],
+        ['events', normaliseEvents(asset.events).problem],
+      ];
+      for (const [name, problem] of sections) {
+        if (asset[name] === undefined) sectionProblems.push(`${label}: the ${name} block is missing`);
+        else if (problem) sectionProblems.push(`${label}: ${problem}`);
+      }
+    }
   });
   if (Object.keys(assetErrors).length === raw.assets.length) fatal.push('no asset passed validation');
   return { fatal, assetErrors, sectionProblems };
+}
+
+/* ------------------------------------------------------------------ */
+/* Schema v3 sections: older closes, dividends, events                 */
+/* ------------------------------------------------------------------ */
+
+const DAY_MS = 86400000;
+const emptyHistory = () => ({ dates: [], close: [] });
+const emptyDividends = () => ({ dates: [], amounts: [] });
+
+/**
+ * Closes older than the first candle. Malformed history is dropped (the asset
+ * keeps its year of candles), never the asset itself.
+ * @returns {{ history:{dates:string[], close:number[]}, problem:string|null }}
+ */
+export function normaliseHistory(raw, firstCandleDate) {
+  if (raw === undefined || raw === null) return { history: emptyHistory(), problem: null };
+  const reject = (problem) => ({ history: emptyHistory(), problem });
+  if (!Array.isArray(raw)) return reject('history is not a list');
+  if (raw.length > MAX_HISTORY_ROWS) return reject(`history has more than ${MAX_HISTORY_ROWS} rows`);
+  const history = emptyHistory();
+  let previousDate = '';
+  for (const row of raw) {
+    if (!Array.isArray(row) || row.length !== HISTORY_FIELDS.length || !isIsoDate(row[0]) || row[0] <= previousDate || !isNum(row[1]) || row[1] <= 0) {
+      return reject('history rows must be [date, close], strictly ascending, with positive closes');
+    }
+    previousDate = row[0];
+    history.dates.push(row[0]);
+    history.close.push(row[1]);
+  }
+  if (previousDate && isIsoDate(firstCandleDate)) {
+    if (previousDate >= firstCandleDate) return reject('history overlaps the candles');
+    const gap = (Date.parse(`${firstCandleDate}T00:00:00Z`) - Date.parse(`${previousDate}T00:00:00Z`)) / DAY_MS;
+    if (gap > SPLICE_MAX_GAP_DAYS) return reject(`history ends ${gap} days before the first candle`);
+  }
+  return { history, problem: null };
+}
+
+/** @returns {{ dividends:{dates:string[], amounts:number[]}, problem:string|null }} */
+export function normaliseDividends(raw) {
+  if (raw === undefined || raw === null) return { dividends: emptyDividends(), problem: null };
+  const reject = (problem) => ({ dividends: emptyDividends(), problem });
+  if (!Array.isArray(raw) || raw.length > MAX_DIVIDEND_ROWS) return reject(`dividends must be a list of at most ${MAX_DIVIDEND_ROWS} rows`);
+  const dividends = emptyDividends();
+  let previousDate = '';
+  for (const row of raw) {
+    if (!Array.isArray(row) || row.length !== 2 || !isIsoDate(row[0]) || row[0] <= previousDate || !isNum(row[1]) || row[1] <= 0) {
+      return reject('dividend rows must be [ex-date, amount], strictly ascending, with positive amounts');
+    }
+    previousDate = row[0];
+    dividends.dates.push(row[0]);
+    dividends.amounts.push(row[1]);
+  }
+  return { dividends, problem: null };
+}
+
+function unavailableEvents(note) {
+  return Object.freeze({ status: 'unavailable', fetchedAt: null, nextEarnings: null, nextExDividend: null, earnings: Object.freeze([]), note: note ?? null });
+}
+
+/**
+ * The event calendar: next earnings (with a second date when sources disagree),
+ * next ex-dividend date, and past earnings dates with their timing.
+ * @returns {{ events:object, problem:string|null }}
+ */
+export function normaliseEvents(raw) {
+  if (raw === undefined || raw === null) return { events: unavailableEvents('This snapshot predates event calendars.'), problem: null };
+  const reject = (problem) => ({ events: unavailableEvents('The stored event calendar was malformed and has been ignored.'), problem });
+  if (!isPlainObject(raw) || !SECTION_STATUSES.includes(raw.status)) return reject('events have no valid status');
+  const earningsRaw = Array.isArray(raw.earnings) ? raw.earnings : null;
+  if (!earningsRaw || earningsRaw.length > MAX_PAST_EARNINGS) return reject(`events.earnings must be a list of at most ${MAX_PAST_EARNINGS} entries`);
+  if (raw.status === 'unavailable') {
+    return raw.nextEarnings || raw.nextExDividend || earningsRaw.length
+      ? reject('an unavailable event calendar carries dates')
+      : { events: unavailableEvents(textOrNull(raw.note)), problem: null };
+  }
+
+  let nextEarnings = null;
+  if (raw.nextEarnings !== null && raw.nextEarnings !== undefined) {
+    const item = raw.nextEarnings;
+    const dateTo = isPlainObject(item) ? item.dateTo ?? null : null;
+    if (!isPlainObject(item) || !isIsoDate(item.date) || !EARNINGS_TIMINGS.includes(item.timing)
+      || (dateTo !== null && (!isIsoDate(dateTo) || dateTo <= item.date))) {
+      return reject('events.nextEarnings is malformed');
+    }
+    nextEarnings = Object.freeze({ date: item.date, dateTo, timing: item.timing });
+  }
+  let nextExDividend = null;
+  if (raw.nextExDividend !== null && raw.nextExDividend !== undefined) {
+    if (!isPlainObject(raw.nextExDividend) || !isIsoDate(raw.nextExDividend.date)) return reject('events.nextExDividend is malformed');
+    nextExDividend = Object.freeze({ date: raw.nextExDividend.date });
+  }
+  const earnings = [];
+  let previousDate = '9999-12-31';
+  for (const item of earningsRaw) {
+    if (!isPlainObject(item) || !isIsoDate(item.date) || item.date >= previousDate || !EARNINGS_TIMINGS.includes(item.timing)) {
+      return reject('events.earnings must be {date, timing} entries, newest first, without repeats');
+    }
+    previousDate = item.date;
+    earnings.push(Object.freeze({ date: item.date, timing: item.timing }));
+  }
+  return {
+    events: Object.freeze({
+      status: raw.status,
+      fetchedAt: typeof raw.fetchedAt === 'string' ? raw.fetchedAt : null,
+      nextEarnings,
+      nextExDividend,
+      earnings: Object.freeze(earnings),
+      note: textOrNull(raw.note),
+    }),
+    problem: null,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -485,6 +614,10 @@ function toSeries(candles) {
 }
 
 function normaliseAsset(asset, forecastsUsable) {
+  const series = toSeries(asset.candles);
+  const { history } = normaliseHistory(asset.history, series.dates[0]);
+  const { dividends } = normaliseDividends(asset.dividends);
+  const { events } = normaliseEvents(asset.events);
   const fundamentals = {};
   for (const key of FUNDAMENTAL_KEYS) fundamentals[key] = isNum(asset.fundamentals[key]) ? asset.fundamentals[key] : null;
   const { news } = normaliseNews(asset.news);
@@ -508,10 +641,16 @@ function normaliseAsset(asset, forecastsUsable) {
     fundamentalsPeriod: asset.fundamentalsPeriod ?? null,
     quote: Object.freeze({ lastClose: asset.quote.lastClose, previousClose: asset.quote.previousClose, asOf: asset.quote.asOf }),
     fundamentals: Object.freeze(fundamentals),
-    series: toSeries(asset.candles),
+    series,
     candleCount: asset.candles.length,
+    // Up to five years of closes: the older history followed by the candles' closes.
+    // Indicators and the verdict keep using `series` (the last year, with highs and lows).
+    longSeries: { dates: [...history.dates, ...series.dates], close: [...history.close, ...series.close] },
+    historyCount: history.dates.length,
+    dividends,
     news,
     forecast,
+    events,
   });
 }
 
@@ -593,8 +732,12 @@ export function normaliseSnapshot(raw, now = new Date()) {
 /* Time ranges                                                         */
 /* ------------------------------------------------------------------ */
 
-/** Calendar days covered by each time-slicer option; null means "everything in the snapshot". */
-export const RANGE_DAYS = Object.freeze({ '1m': 30, '3m': 91, '6m': 182, '1y': null });
+/**
+ * Calendar days covered by each time-slicer option; null means "the whole series given".
+ * `1y` is applied to an asset's `series` (its year of candles) and `5y` to its
+ * `longSeries` (up to five years of closes), so both are "everything".
+ */
+export const RANGE_DAYS = Object.freeze({ '1m': 30, '3m': 91, '6m': 182, '1y': null, '5y': null });
 
 /**
  * The trailing part of a candle series for a time range, measured in calendar
