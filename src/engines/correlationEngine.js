@@ -16,10 +16,12 @@ import { isNum, pearson, mean } from '../core/precisionMath.js';
 import {
   traced, notAvailable, input, step, threshold, interpretation, valueOf, fmtN,
 } from '../core/derivationTracer.js';
+import { weeklyCloses, sessionName } from './riskEngine.js';
 
 export const CORR_CONFIG = Object.freeze({
   minOverlap: 60, // full-year view
   minWindowOverlap: 15, // shorter time ranges: allowed, and the trace says the figure is rough
+  minWeeklyOverlap: 15, // weekly returns for markets that close at different times (about 4 months)
   roughBelow: 40,
   dangerThreshold: 0.8,
   elevatedThreshold: 0.6,
@@ -101,27 +103,46 @@ function describe(rho, a, b) {
  * @param {{ minOverlap?: number, windowLabel?: string }} [options] minimum return pairs, and the
  *        name of the period the series cover ("year", "3 months"), used in the explanation
  */
-export function correlatePair(assetA, assetB, { minOverlap = CORR_CONFIG.minOverlap, windowLabel = 'year' } = {}) {
+export function correlatePair(assetA, assetB, { minOverlap = CORR_CONFIG.minOverlap, windowLabel = 'year', minWeeklyOverlap = CORR_CONFIG.minWeeklyOverlap } = {}) {
   const id = pairId(assetA.ticker, assetB.ticker);
   const label = `Correlation: ${assetA.ticker} vs ${assetB.ticker}`;
-  const formula = 'ρ = covariance(rA, rB) ÷ (stdev(rA) × stdev(rB)), using daily log returns on dates both assets traded';
   const crossMarket = assetA.market !== assetB.market;
-  const caveat = crossMarket
-    ? `${assetA.ticker} and ${assetB.ticker} trade in different sessions (${assetA.market} and ${assetB.market}), so their daily closes are hours apart. This understates how closely they really move; treat the figure as a lower bound.`
-    : `Correlation is measured over the past ${windowLabel} and rises sharply in market sell-offs, exactly when diversification is needed most.`;
-  const base = { id, label, unit: 'ratio', formula, meta: { tickers: [assetA.ticker, assetB.ticker], crossMarket, window: windowLabel } };
 
-  const aligned = alignedReturns(assetA.series, assetB.series);
+  // Markets that close at different times are compared week by week (Friday to Friday):
+  // daily closes taken hours apart make two assets look less related than they are.
+  let frequency = 'daily';
+  let aligned = null;
+  if (crossMarket) {
+    const weekly = alignedReturns(weeklyCloses(assetA.series), weeklyCloses(assetB.series));
+    if (weekly && weekly.a.length >= minWeeklyOverlap) {
+      aligned = weekly;
+      frequency = 'weekly';
+    }
+  }
+  const asynchronous = crossMarket && frequency === 'daily';
+  if (!aligned) aligned = alignedReturns(assetA.series, assetB.series);
+  const required = frequency === 'weekly' ? minWeeklyOverlap : minOverlap;
+  const unitWord = frequency === 'weekly' ? 'weekly' : 'daily';
+  const sessions = `${sessionName(assetA.market)} and ${sessionName(assetB.market)}`;
+  const formula = `ρ = covariance(rA, rB) ÷ (stdev(rA) × stdev(rB)), using ${unitWord} log returns on ${frequency === 'weekly' ? 'weeks' : 'dates'} both assets traded`;
+  let caveat = `Correlation is measured over the past ${windowLabel} and rises sharply in market sell-offs, exactly when diversification is needed most.`;
+  if (frequency === 'weekly') {
+    caveat = `${assetA.ticker} and ${assetB.ticker} trade in different sessions (${sessions}), so their daily closes are hours apart. Weekly returns, Friday to Friday, line them up. ${caveat}`;
+  } else if (asynchronous) {
+    caveat = `${assetA.ticker} and ${assetB.ticker} trade in different sessions (${sessions}), so their daily closes are hours apart, and the last ${windowLabel} has too few weeks for weekly returns. This understates how closely they really move: treat the figure as a lower bound, or choose 6M or longer.`;
+  }
+  const base = { id, label, unit: 'ratio', formula, meta: { tickers: [assetA.ticker, assetB.ticker], crossMarket, window: windowLabel, frequency, asynchronous } };
+
   const overlap = aligned ? aligned.a.length : 0;
   const rawInputs = [
     input(`${assetA.ticker} daily closes`, assetA.series.close.length, 'candles', 'snapshot', assetA.quote.asOf),
     input(`${assetB.ticker} daily closes`, assetB.series.close.length, 'candles', 'snapshot', assetB.quote.asOf),
-    input('Overlapping daily returns', overlap, 'observations', 'dates present in both series'),
+    input(`Overlapping ${unitWord} returns`, overlap, 'observations', frequency === 'weekly' ? 'Friday-ending weeks present in both series' : 'dates present in both series'),
   ];
-  if (overlap < minOverlap) {
+  if (overlap < required) {
     return notAvailable({
       ...base, rawInputs,
-      reason: `Only ${overlap} overlapping daily returns are available; at least ${minOverlap} are needed for a reliable correlation.`,
+      reason: `Only ${overlap} overlapping ${unitWord} returns are available; at least ${required} are needed for a reliable correlation.`,
     });
   }
   const stats = pearson(aligned.a, aligned.b);
@@ -134,8 +155,10 @@ export function correlatePair(assetA, assetB, { minOverlap = CORR_CONFIG.minOver
     meta: { ...base.meta, overlap, level: correlationLevel(rho), from: aligned.dates[0], to: aligned.dates[aligned.dates.length - 1] },
     rawInputs,
     steps: [
-      step('Keep only dates on which both assets have a close', `${assetA.series.dates.length} and ${assetB.series.dates.length} candles`, `${aligned.commonDates} common dates`),
-      step('Log return between consecutive common dates, for each asset', 'ln(Cₜ ÷ Cₜ₋₁)', `${overlap} return pairs`),
+      frequency === 'weekly'
+        ? step("Keep each asset's last close of every Friday-ending week, and the weeks both traded", `${assetA.series.dates.length} and ${assetB.series.dates.length} candles`, `${aligned.commonDates} common weeks`)
+        : step('Keep only dates on which both assets have a close', `${assetA.series.dates.length} and ${assetB.series.dates.length} candles`, `${aligned.commonDates} common dates`),
+      step(`Log return between consecutive common ${frequency === 'weekly' ? 'weeks' : 'dates'}, for each asset`, 'ln(Cₜ ÷ Cₜ₋₁)', `${overlap} return pairs`),
       step(`Standard deviation of ${assetA.ticker} returns`, `stdev(${overlap} returns)`, stats.sdX),
       step(`Standard deviation of ${assetB.ticker} returns`, `stdev(${overlap} returns)`, stats.sdY),
       step('Covariance of the two return series', 'Σ (rA − mean A)(rB − mean B) ÷ (n − 1)', stats.covariance),
@@ -144,7 +167,7 @@ export function correlatePair(assetA, assetB, { minOverlap = CORR_CONFIG.minOver
     interpretation: interpretation(
       describe(rho, assetA.ticker, assetB.ticker),
       THRESHOLDS,
-      overlap < CORR_CONFIG.roughBelow ? `Based on only ${overlap} pairs of daily returns, so this is a rough figure that can swing a lot from one month to the next. ${caveat}` : caveat,
+      overlap < CORR_CONFIG.roughBelow ? `Based on only ${overlap} pairs of ${unitWord} returns, so this is a rough figure that can swing a lot from one month to the next. ${caveat}` : caveat,
     ),
   });
 }

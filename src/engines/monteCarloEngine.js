@@ -25,12 +25,17 @@ import {
 import {
   traced, notAvailable, input, step, threshold, interpretation, fmtN, fmtPct,
 } from '../core/derivationTracer.js';
+import { filteredResiduals } from './riskEngine.js';
 
 export const MC_CONFIG = Object.freeze({
   paths: 1000,
   horizons: Object.freeze([21, 63, 126]),
   minReturns: 15, // enough for a 1-month window; the trace says when the estimate is rough
   annualisation: Object.freeze({ equity: 252, crypto: 365 }),
+  // Filtered bootstrap: real past days, rescaled to today's EWMA volatility, drawn in blocks.
+  blockLength: 10,
+  bootstrapMinReturns: 60, // standardised returns needed before resampling them is worth more than a normal draw
+  models: Object.freeze(['bootstrap', 'normal']),
 });
 
 const Z_95 = 1.6448536269514722;
@@ -118,7 +123,7 @@ function unavailable(asset, reason) {
  */
 export function runMonteCarlo({
   asset, startPrice, stop = null, target = null, useHistoricalDrift = false,
-  paths = MC_CONFIG.paths, horizons = MC_CONFIG.horizons, seed, historyLabel = 'year',
+  paths = MC_CONFIG.paths, horizons = MC_CONFIG.horizons, seed, historyLabel = 'year', model = 'bootstrap',
 }) {
   if (!isNum(startPrice) || startPrice <= 0) return unavailable(asset, 'No valid starting price is available.');
   const pathCount = Number.isInteger(paths) ? Math.min(20000, Math.max(100, paths)) : MC_CONFIG.paths;
@@ -129,11 +134,39 @@ export function runMonteCarlo({
     return unavailable(asset, `At least ${MC_CONFIG.minReturns} daily returns with some movement are needed to estimate volatility.`);
   }
 
-  const { sigma, meanLogReturn, observations } = params;
-  const drift = useHistoricalDrift ? meanLogReturn : -(sigma * sigma) / 2;
+  const { meanLogReturn, observations } = params;
+  const sampleSigma = params.sigma;
+
+  // Filtered bootstrap unless asked for the normal model, or too few days to resample.
+  let usedModel = model === 'normal' ? 'normal' : 'bootstrap';
+  let fallbackNote = null;
+  let pool = null;
+  let correction = 0;
+  let filtered = null;
+  if (usedModel === 'bootstrap') {
+    filtered = filteredResiduals(asset.series.close);
+    const available = filtered ? filtered.residuals.length : 0;
+    if (available < MC_CONFIG.bootstrapMinReturns) {
+      usedModel = 'normal';
+      fallbackNote = `Only ${available} days could be resampled (at least ${MC_CONFIG.bootstrapMinReturns} are needed), so this run uses the normal model. Choose a longer range for the bootstrap.`;
+    }
+  }
+  const sigma = usedModel === 'bootstrap' ? filtered.sigmaNow : sampleSigma;
+  if (usedModel === 'bootstrap') {
+    // Standardise the residuals to mean 0 and variance 1, then give them today's volatility.
+    const zMean = mean(filtered.residuals);
+    const zSd = stdev(filtered.residuals);
+    pool = filtered.residuals.map((z) => (sigma * (z - zMean)) / zSd);
+    // Zero expected return: shift every log step so that the average of exp(step) over the pool is exactly 1.
+    correction = Math.log(mean(pool.map((x) => Math.exp(x))));
+  }
+  const drift = useHistoricalDrift ? meanLogReturn : -(sigma * sigma) / 2; // normal model, and the comparison line
   const maxDays = horizonList[horizonList.length - 1];
   const usedSeed = Number.isInteger(seed) ? seed >>> 0 : seedFromString(`${asset.ticker}|${asset.quote.asOf}`);
-  const normal = createNormalSampler(mulberry32(usedSeed));
+  const random = mulberry32(usedSeed);
+  const normal = createNormalSampler(random);
+  const bootstrapShift = useHistoricalDrift ? meanLogReturn : -correction;
+  const blockLength = MC_CONFIG.blockLength;
   const currency = asset.currency;
   const periods = MC_CONFIG.annualisation[asset.assetClass] ?? MC_CONFIG.annualisation.equity;
 
@@ -144,9 +177,22 @@ export function runMonteCarlo({
   for (let p = 0; p < pathCount; p += 1) {
     let price = startPrice;
     let outcome = 0; // 0 none, 1 stop, 2 target
+    let cursor = 0;
+    let left = 0;
     byDay[0][p] = price;
     for (let day = 1; day <= maxDays; day += 1) {
-      price *= Math.exp(drift + sigma * normal());
+      if (pool) {
+        // Circular block bootstrap: runs of 10 consecutive past days keep volatility clusters together.
+        if (left === 0) {
+          cursor = Math.floor(random() * pool.length);
+          left = blockLength;
+        }
+        price *= Math.exp(pool[cursor] + bootstrapShift);
+        cursor = (cursor + 1) % pool.length;
+        left -= 1;
+      } else {
+        price *= Math.exp(drift + sigma * normal());
+      }
       byDay[day][p] = price;
       if (hasLevels && outcome === 0) {
         if (price <= stop) outcome = 1;
@@ -185,13 +231,63 @@ export function runMonteCarlo({
   const downside = safeDiv(longest.p05 - startPrice, startPrice);
   const upside = safeDiv(longest.p95 - startPrice, startPrice);
 
-  const monteCarlo = traced({
+  const sharedMeta = {
+    currency, horizons: horizonRows, paths: pathCount, seed: usedSeed, sigmaDaily: sigma, sigmaAnnual: sigma * Math.sqrt(periods),
+    sampleSigmaAnnual: sampleSigma * Math.sqrt(periods), drift, driftMode: useHistoricalDrift ? 'historical' : 'zero', model: usedModel, fallbackNote,
+  };
+  const tailGap = safeDiv(longest.p05 - longest.theoryP05, longest.theoryP05);
+  const monteCarlo = usedModel === 'bootstrap' ? traced({
     id: 'monteCarlo',
     label: `Simulated price range (${maxDays} days)`,
     value: longest.p50,
     unit: 'currency',
     tone: 'neutral',
-    meta: { currency, horizons: horizonRows, paths: pathCount, seed: usedSeed, sigmaDaily: sigma, sigmaAnnual: sigma * Math.sqrt(periods), drift, driftMode: useHistoricalDrift ? 'historical' : 'zero' },
+    meta: { ...sharedMeta, pool: pool.length, blockLength, correction },
+    formula: `Sₜ₊₁ = Sₜ × exp(σ_now × zₖ − c), with zₖ drawn in blocks of ${blockLength} consecutive past days from returns standardised by their own EWMA volatility; c makes the expected return zero`,
+    rawInputs: [
+      input('Starting price', startPrice, currency, 'live tick or last daily close', asset.quote.asOf),
+      input("Today's daily volatility σ_now (EWMA)", sigma, 'fraction', 'riskEngine: ewmaVolatility', asset.quote.asOf),
+      input(`Equal-weighted daily volatility (past ${historyLabel})`, sampleSigma, 'fraction', 'shown for comparison', asset.quote.asOf),
+      input('Past days available to resample', pool.length, 'days', `standardised log returns, past ${historyLabel}`),
+      input('Block length', blockLength, 'days', 'fixed'),
+      input('Paths', pathCount, 'simulations', 'fixed'),
+      input('Random seed', usedSeed, '', 'hash of the ticker and snapshot date, so results are reproducible'),
+    ],
+    steps: [
+      step('Divide each past log return by the EWMA volatility forecast for its day', 'zₜ = rₜ ÷ σₜ', `${pool.length} standardised days`),
+      step('Rescale them to mean 0, variance 1, then to today\'s volatility', `σ_now = ${fmtPct(sigma, 3)} a day`, `${pool.length} possible daily moves`),
+      useHistoricalDrift
+        ? step(`Add the mean daily log return of the past ${historyLabel}`, 'mean(ln(Cₜ ÷ Cₜ₋₁))', fmtPct(meanLogReturn, 4))
+        : step('Shift every move so that the average of exp(move) is exactly 1 (no trend)', `c = ln(mean(exp(moves)))`, fmtPct(correction, 4)),
+      step(`Simulate ${fmtN(pathCount, 0)} paths of ${maxDays} days, drawing runs of ${blockLength} consecutive past days`, 'S × exp(move − c) each day', `${fmtN(pathCount * maxDays, 0)} steps`),
+      ...horizonRows.map((row) => step(
+        `After ${row.days} days: 5th percentile, median, 95th percentile`,
+        `sort ${fmtN(pathCount, 0)} simulated prices on day ${row.days}`,
+        `${fmtN(row.p05, 2)} | ${fmtN(row.p50, 2)} | ${fmtN(row.p95, 2)}`,
+      )),
+      step(
+        `Compare day ${longest.days} with a normal model at the same volatility`,
+        `${fmtN(startPrice)} × exp(${fmtN(drift * longest.days, 6)} ± 1.645 × ${fmtN(sigma, 6)} × √${longest.days})`,
+        `${fmtN(longest.theoryP05, 2)} | ${fmtN(longest.theoryP50, 2)} | ${fmtN(longest.theoryP95, 2)}`,
+      ),
+    ],
+    interpretation: interpretation(
+      `In 90% of simulated paths the price after ${maxDays} trading days lies between ${fmtN(longest.p05, 2)} and ${fmtN(longest.p95, 2)} ${currency} (${fmtPct(downside, 0)} to +${fmtPct(upside, 0)} from today).${isNum(tailGap) ? ` A normal model at the same volatility puts the 5th percentile ${tailGap < 0 ? 'higher' : 'lower'}, at ${fmtN(longest.theoryP05, 2)}.` : ''}`,
+      [
+        threshold('5th percentile', 'A bad but plausible outcome', 'caution'),
+        threshold('Median', 'Half of the paths end above, half below', 'neutral'),
+        threshold('95th percentile', 'A good but plausible outcome', 'healthy'),
+      ],
+      `Each simulated day is a real day from the past ${historyLabel}, rescaled to today's volatility, so fat tails and short bursts of volatility carry over. It cannot invent a day worse than the worst one in the window, and it knows nothing about scheduled events such as earnings.`,
+    ),
+    dependsOn: ['ewmaVolatility'],
+  }) : traced({
+    id: 'monteCarlo',
+    label: `Simulated price range (${maxDays} days)`,
+    value: longest.p50,
+    unit: 'currency',
+    tone: 'neutral',
+    meta: sharedMeta,
     formula: 'Sₜ₊₁ = Sₜ × exp(d + σ × Z), Z ~ N(0, 1); d = −σ² ÷ 2 for zero drift, or the mean daily log return for historical drift',
     rawInputs: [
       input('Starting price', startPrice, currency, 'live tick or last daily close', asset.quote.asOf),
@@ -224,7 +320,7 @@ export function runMonteCarlo({
         threshold('Median', 'Half of the paths end above, half below', 'neutral'),
         threshold('95th percentile', 'A good but plausible outcome', 'healthy'),
       ],
-      `${observations < 40 ? `Volatility was estimated from only ${observations} days, so the width of this fan is a rough figure. ` : ''}The model assumes constant volatility and no sudden jumps. Real markets have fatter tails, so extreme outcomes are more likely than shown.`,
+      `${fallbackNote ? `${fallbackNote} ` : ''}${observations < 40 ? `Volatility was estimated from only ${observations} days, so the width of this fan is a rough figure. ` : ''}The model assumes constant volatility and no sudden jumps. Real markets have fatter tails, so extreme outcomes are more likely than shown.`,
     ),
     dependsOn: ['volatility'],
   });
@@ -277,6 +373,10 @@ export function runMonteCarlo({
     fan,
     horizons: horizonRows,
     outcomes: hasLevels ? { stopFirst, targetFirst, neither, paths: pathCount } : null,
-    params: { sigmaDaily: sigma, sigmaAnnual: sigma * Math.sqrt(periods), meanLogReturn, drift, driftMode: useHistoricalDrift ? 'historical' : 'zero', paths: pathCount, seed: usedSeed, days: maxDays, observations },
+    params: {
+      sigmaDaily: sigma, sigmaAnnual: sigma * Math.sqrt(periods), sampleSigmaAnnual: sampleSigma * Math.sqrt(periods), meanLogReturn, drift,
+      driftMode: useHistoricalDrift ? 'historical' : 'zero', paths: pathCount, seed: usedSeed, days: maxDays, observations,
+      model: usedModel, fallbackNote, pool: pool ? pool.length : 0, blockLength,
+    },
   };
 }

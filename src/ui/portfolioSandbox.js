@@ -607,7 +607,8 @@ export function mountPortfolioSandbox(root, app) {
       <div>
         <div class="sandbox__block-title">
           <h2 class="panel-title">Historical statistics</h2>
-          <span class="field__hint">${analysis.observations} daily returns on dates every asset traded · ${esc(h.shortDate(analysis.period.from, true))} to ${esc(h.shortDate(analysis.period.to, true))}</span>
+          <span class="field__hint">${analysis.observations} ${analysis.frequency === 'weekly' ? 'weekly returns (markets close at different times)' : 'daily returns'} on ${analysis.frequency === 'weekly' ? 'weeks' : 'dates'} every asset traded · ${esc(h.shortDate(analysis.period.from, true))} to ${esc(h.shortDate(analysis.period.to, true))}${analysis.tickers.length > 2 ? ` · covariance shrunk ${esc(h.formatPercent(analysis.shrinkage.delta, 0))} toward equal correlations` : ''}</span>
+          ${analysis.asynchronous ? '<p class="alloc__note">These markets close at different times, and this range is too short for weekly returns, so daily closes are used: correlations are understated and diversification looks better than it is. Choose 6M or longer.</p>' : ''}
         </div>
         ${tiles(analysis, state)}
         <p class="alloc__note"><span data-role="status-line">${esc(statusLine(job))}</span>${fxNote ? ` · ${esc(fxNote)}` : ''}</p>

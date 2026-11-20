@@ -62,6 +62,20 @@ const SECTIONS = Object.freeze([
     ],
   },
   {
+    id: 'risk',
+    title: 'Risk',
+    note: (range) => `From the actual returns of the last ${range.label}: no bell-curve assumption`,
+    rows: [
+      { id: 'ewmaVolatility' },
+      { id: 'var95' },
+      { id: 'cvar95' },
+      { id: 'var99' },
+      { id: 'cvar99', pro: true },
+      { id: 'var95x10', pro: true },
+      { id: 'cvar95x10', pro: true },
+    ],
+  },
+  {
     id: 'technical',
     title: 'Technical',
     note: 'Price behaviour, from a full year of completed daily candles',
@@ -133,6 +147,8 @@ const SIZING_SECTION = Object.freeze({
     { id: 'positionSize', lead: true },
     { id: 'positionValue' },
     { id: 'amountAtRisk' },
+    { id: 'positionVar95' },
+    { id: 'positionCvar95', pro: true },
     { id: 'riskBudget', pro: true },
     { id: 'riskPerUnit', pro: true },
   ],
@@ -250,6 +266,18 @@ export function mountComparisonMatrix(root, app) {
         return isNum(meta.returns) ? sub(`From ${meta.returns} daily returns${meta.returns < 40 ? ' · rough' : ''}`) : '';
       case 'maxDrawdown':
         return metric.value < 0 ? sub(`${h.shortDate(meta.peakDate)} to ${h.shortDate(meta.troughDate)}`) : sub('No fall from a high');
+      case 'ewmaVolatility':
+        return sub(`Equal-weighted ${h.formatPercent(meta.flat, 0)} · half-life ${h.formatNumber(meta.halfLifeDays, 0)} days`);
+      case 'var95':
+      case 'var99':
+      case 'cvar95':
+      case 'cvar99':
+      case 'var95x10':
+      case 'cvar95x10':
+        return sub(`Loss · ${meta.tail} worst of ${meta.observations} ${meta.horizon === 1 ? 'days' : '10-day windows'}`);
+      case 'positionVar95':
+      case 'positionCvar95':
+        return sub(`${h.formatPercent(meta.fraction, 1)} of the position · stop risks ${h.formatAmount(meta.amountAtRisk)}`);
       case 'periodRange':
         return sub(`Low ${h.formatAmount(h.money(meta.low, meta.currency).value)} · High ${h.formatAmount(h.money(meta.high, meta.currency).value)}`);
       case 'headlineTone':

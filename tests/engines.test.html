@@ -187,6 +187,7 @@
     import * as forecasting from '../src/engines/forecastEngine.js';
     import * as mathWorker from '../src/workers/mathWorker.js';
     import * as workerService from '../src/services/workerService.js';
+    import * as risk from '../src/engines/riskEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -1163,7 +1164,7 @@
       const memo = new Map();
       const run = (overrides = {}) => {
         const key = JSON.stringify(overrides);
-        if (!memo.has(key)) memo.set(key, monteCarlo.runMonteCarlo({ asset, startPrice: start, paths: 5000, ...overrides }));
+        if (!memo.has(key)) memo.set(key, monteCarlo.runMonteCarlo({ model: 'normal', asset, startPrice: start, paths: 5000, ...overrides }));
         return memo.get(key);
       };
 
@@ -1193,7 +1194,7 @@
         expect(monteCarlo.estimateDailyParams([1, 2, 3])).toBeNull();
       });
       test('the same inputs always produce the same simulation', () => {
-        const fresh = (seed) => monteCarlo.runMonteCarlo({ asset, startPrice: start, paths: 1000, seed });
+        const fresh = (seed) => monteCarlo.runMonteCarlo({ model: 'normal', asset, startPrice: start, paths: 1000, seed });
         expect(fresh(undefined).horizons).toEqual(fresh(undefined).horizons);
         expect(fresh(1).fan.p50).toEqual(fresh(1).fan.p50);
         expect(JSON.stringify(fresh(1).horizons) === JSON.stringify(fresh(2).horizons)).toBeFalse();
@@ -1236,8 +1237,8 @@
       test('without valid levels the stop probability is N/A; without a price there is no simulation', () => {
         expect(run({ stop: start * 1.1, target: start * 1.2 }).metrics.probStopFirst.status).toBe('na');
         expect(run().outcomes).toBeNull();
-        expect(monteCarlo.runMonteCarlo({ asset, startPrice: 0 }).ok).toBeFalse();
-        expect(monteCarlo.runMonteCarlo({ asset: makeAsset({ closes: [1, 2, 3] }), startPrice: 3 }).ok).toBeFalse();
+        expect(monteCarlo.runMonteCarlo({ model: 'normal', asset, startPrice: 0 }).ok).toBeFalse();
+        expect(monteCarlo.runMonteCarlo({ model: 'normal', asset: makeAsset({ closes: [1, 2, 3] }), startPrice: 3 }).ok).toBeFalse();
       });
       test('simulation metrics satisfy the trace contract and contain no non-finite numbers', () => {
         const result = run({ paths: 1000, stop: start * 0.96, target: start * 1.08 });
@@ -1866,6 +1867,9 @@
         Object.keys(portfolio.analyzePortfolio({ assets: [], weights: [], baseCurrency: 'USD' }).metrics).forEach((id) => ids.add(id));
         // Batch 6: the statistics of the selected time range.
         Object.keys(technical.analyzeWindow(anyAsset, anyAsset.series).metrics).forEach((id) => ids.add(id));
+        // V3: risk measures of the window and the tail risk of a sized position.
+        Object.keys(risk.analyzeRisk(anyAsset, anyAsset.series).metrics).forEach((id) => ids.add(id));
+        Object.keys(risk.positionTailRisk({ sizing: null, risk: null, accountCurrency: 'USD' })).forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -1941,7 +1945,7 @@
       test('a simulation of a real asset agrees with the closed-form distribution', async () => {
         const { snapshot } = await analysed();
         const asset = snapshot.assets[0];
-        const result = monteCarlo.runMonteCarlo({ asset, startPrice: asset.quote.lastClose, paths: 4000 });
+        const result = monteCarlo.runMonteCarlo({ model: 'normal', asset, startPrice: asset.quote.lastClose, paths: 4000 });
         expect(result.ok).toBeTrue();
         const longest = result.horizons[result.horizons.length - 1];
         expect(Math.abs(longest.p50 / longest.theoryP50 - 1)).toBeAtMost(0.03);
@@ -2857,14 +2861,14 @@
       test('a one-month window is enough to simulate, and the trace says the volatility is rough', () => {
         const closes = randomWalk(21, { seed: 5, sigma: 0.02 });
         const asset = makeAsset({ ticker: 'MC', closes });
-        const result = monteCarlo.runMonteCarlo({ asset, startPrice: closes[20], historyLabel: 'month', paths: 400 });
+        const result = monteCarlo.runMonteCarlo({ model: 'normal', asset, startPrice: closes[20], historyLabel: 'month', paths: 400 });
         expect(result.ok).toBeTrue();
         expect(result.params.observations).toBe(20);
         expect(result.metrics.monteCarlo.trace.interpretation.caveat).toMatch(/only 20 days/);
         expect(JSON.stringify(result.metrics.monteCarlo.trace.rawInputs)).toMatch(/Mean daily log return \(past month\)/);
         // Fewer than the minimum of 15 returns is still refused.
         const tiny = makeAsset({ ticker: 'MC', closes: closes.slice(0, 12) });
-        expect(monteCarlo.runMonteCarlo({ asset: tiny, startPrice: 100 }).ok).toBeFalse();
+        expect(monteCarlo.runMonteCarlo({ model: 'normal', asset: tiny, startPrice: 100 }).ok).toBeFalse();
       });
     });
 
@@ -3314,6 +3318,199 @@
           // A month cut from the long series is the same month as one cut from the candles.
           expect(snapshotService.sliceSeries(asset.longSeries, '1m').close).toEqual(snapshotService.sliceSeries(asset.series, '1m').close);
         }
+      });
+    });
+
+    /* ================================================================== */
+    /* 24. V3 risk model: EWMA, historical VaR, bootstrap, shrinkage, weeks */
+    /* ================================================================== */
+
+    const ladderCloses = (returns, start = 100) => returns.reduce((closes, r) => [...closes, closes[closes.length - 1] * (1 + r)], [start]);
+
+    suite('riskEngine: EWMA volatility and historical VaR / CVaR', () => {
+      test('EWMA variance matches a hand calculation', () => {
+        // Seed = mean of 0.01² and 0.02² = 0.00025; then 0.94 × 0.00025 + 0.06 × 0.03² = 0.000289.
+        const result = risk.ewmaVariance([0.01, -0.02, 0.03], 0.94, 2);
+        expect(result.forecasts).toEqual([null, null, 0.00025]);
+        expect(result.next).toBeCloseTo(0.000289, 1e-15);
+        expect(risk.ewmaVariance([0.01, 0.02], 0.94, 2)).toBeNull(); // nothing left after the seed
+      });
+      test('historical VaR and CVaR read the actual tail', () => {
+        // 100 returns from −5.0% to +4.9%. The 5th percentile sits at position 4.95: −4.6% + 0.95 × 0.1% = −4.505%.
+        const returns = Array.from({ length: 100 }, (_, k) => (k - 50) / 1000);
+        const result = risk.historicalVar([...returns].reverse(), 0.95);
+        expect(result.var).toBeCloseTo(0.04505, 1e-12);
+        expect(result.tail).toBe(5); // −5.0% to −4.6%
+        expect(result.cvar).toBeCloseTo(0.048, 1e-12);
+      });
+      test('too few returns give N/A with the count and the range advice', () => {
+        const closes = ladderCloses(Array.from({ length: 80 }, (_, k) => ((k % 7) - 3) / 100));
+        const asset = makeAsset({ ticker: 'R', closes });
+        const { metrics } = risk.analyzeRisk(asset, asset.series, '3 months');
+        expect(metrics.var95.status).toBe('na');
+        expect(metrics.var95.naReason).toMatch(/at least 100 daily returns; the last 3 months has 80/);
+        expect(metrics.var99.naReason).toMatch(/at least 250/);
+        expect(metrics.ewmaVolatility.status).toBe('ok');
+        for (const metric of Object.values(metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('EWMA reacts to a recent rise in volatility; the equal-weighted figure lags', () => {
+        const calm = Array.from({ length: 220 }, (_, k) => (k % 2 ? 0.005 : -0.005));
+        const storm = Array.from({ length: 30 }, (_, k) => (k % 2 ? 0.03 : -0.03));
+        const asset = makeAsset({ ticker: 'R', closes: ladderCloses([...calm, ...storm]) });
+        const { metrics } = risk.analyzeRisk(asset, asset.series, 'year');
+        expect(metrics.ewmaVolatility.value).toBeGreaterThan(metrics.ewmaVolatility.meta.flat);
+        expect(metrics.ewmaVolatility.trace.interpretation.summary).toMatch(/running hot/);
+        expect(metrics.var95.status).toBe('ok');
+        expect(metrics.cvar95.value).toBeAtLeast(metrics.var95.value);
+        expect(metrics.var99.status).toBe('ok'); // 250 returns
+        expect(metrics.var95x10.status).toBe('ok');
+      });
+      test('position tail risk = position value × the daily tail loss', () => {
+        const riskStub = { metrics: { var95: tracer.traced({ id: 'var95', label: 'v', value: 0.03, unit: 'pct', formula: 'f' }), cvar95: tracer.traced({ id: 'cvar95', label: 'c', value: 0.05, unit: 'pct', formula: 'f' }) } };
+        const sizing = { ok: true, summary: { units: 10, positionValue: 1000, amountAtRisk: 100 } };
+        const metrics = risk.positionTailRisk({ sizing, risk: riskStub, accountCurrency: 'SGD' });
+        expect(metrics.positionVar95.value).toBeCloseTo(30, 1e-12);
+        expect(metrics.positionCvar95.value).toBeCloseTo(50, 1e-12);
+        expect(metrics.positionVar95.meta.currency).toBe('SGD');
+        const none = risk.positionTailRisk({ sizing: { ok: true, summary: { units: 0, positionValue: 0, amountAtRisk: 0 } }, risk: riskStub, accountCurrency: 'SGD' });
+        expect(none.positionVar95.status).toBe('na');
+        for (const metric of [...Object.values(metrics), ...Object.values(none)]) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+    });
+
+    suite('riskEngine: Ledoit-Wolf shrinkage', () => {
+      const dataset = () => {
+        const a = []; const b = []; const c = []; const d = [];
+        for (let t = 0; t < 60; t += 1) a.push(Math.sin(t * 0.7) * 0.01 + 0.002 * Math.cos(t * 1.3));
+        for (let t = 0; t < 60; t += 1) {
+          b.push(0.6 * a[t] + 0.008 * Math.sin(t * 2.1));
+          c.push(-0.2 * a[t] + 0.01 * Math.cos(t * 0.45 + 1));
+          d.push(0.3 * b[t] + 0.006 * Math.sin(t * 1.7 + 0.5));
+        }
+        return [a, b, c, d];
+      };
+      test('matches an independent NumPy port of Ledoit and Wolf\'s own code', () => {
+        // Reference values computed with numpy from the published covCor routine (2004).
+        const result = risk.ledoitWolf(dataset());
+        expect(result.delta).toBeCloseTo(0.13476127580846628, 1e-12);
+        expect(result.meanCorrelation).toBeCloseTo(0.16898516705196162, 1e-12);
+        expect(result.shrunk[0][1]).toBeCloseTo(2.8249236199633494e-05, 1e-15);
+        expect(result.shrunk[2][3]).toBeCloseTo(3.5555927983340175e-09, 1e-15);
+        expect(result.shrunk[1][1]).toBeCloseTo(5.187169190129517e-05, 1e-15);
+      });
+      test('variances are kept, the matrix stays symmetric, and two assets are never shrunk', () => {
+        const result = risk.ledoitWolf(dataset());
+        for (let i = 0; i < 4; i += 1) {
+          expect(result.shrunk[i][i]).toBeCloseTo(result.sample[i][i], 1e-18);
+          for (let j = 0; j < 4; j += 1) expect(result.shrunk[i][j]).toBe(result.shrunk[j][i]);
+        }
+        expect(risk.ledoitWolf(dataset().slice(0, 2)).delta).toBe(0); // the constant-correlation target equals the sample
+        expect(risk.ledoitWolf([[1, 2], [3, 4]])).toBeNull();
+      });
+    });
+
+    suite('monteCarloEngine: filtered block bootstrap', () => {
+      const walk = (count, seed = 13, sigma = 0.015) => randomWalk(count, { seed, sigma });
+      test('the bootstrap is the default, and a short window falls back to the normal model with a note', () => {
+        const asset = makeAsset({ ticker: 'B', closes: walk(250) });
+        const result = monteCarlo.runMonteCarlo({ asset, startPrice: 100, paths: 300 });
+        expect(result.params.model).toBe('bootstrap');
+        expect(result.params.blockLength).toBe(10);
+        expect(result.params.pool).toBe(249 - 20); // returns after the EWMA warm-up
+        const short = makeAsset({ ticker: 'B', closes: walk(60) });
+        const fallback = monteCarlo.runMonteCarlo({ asset: short, startPrice: 100, paths: 300 });
+        expect(fallback.params.model).toBe('normal');
+        expect(fallback.params.fallbackNote).toMatch(/at least 60/);
+        for (const r of [result, fallback]) for (const metric of Object.values(r.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('no trend and reproducible: the drift correction is applied and traced', () => {
+        const asset = makeAsset({ ticker: 'B', closes: walk(250) });
+        const result = monteCarlo.runMonteCarlo({ asset, startPrice: 100, paths: 5000, horizons: [21] });
+        // Zero expected return with volatility puts the median a little below the start.
+        expect(result.fan.p50[21]).toBeAtMost(100);
+        expect(result.fan.p95[21]).toBeGreaterThan(100);
+        expect(result.metrics.monteCarlo.trace.steps.some((s) => /average of exp\(move\) is exactly 1/.test(s.description))).toBeTrue();
+        expect(monteCarlo.runMonteCarlo({ asset, startPrice: 100, paths: 5000, horizons: [21] }).fan.p05[21]).toBe(result.fan.p05[21]);
+      });
+      test('real tails and today\'s volatility: a recent storm widens the fan beyond the equal-weighted normal model', () => {
+        const calm = randomWalk(220, { seed: 3, sigma: 0.008 });
+        const stormy = [...calm];
+        const normal = monteCarlo.createNormalSampler(monteCarlo.mulberry32(4));
+        for (let i = 0; i < 30; i += 1) stormy.push(stormy[stormy.length - 1] * Math.exp(0.035 * normal()));
+        const asset = makeAsset({ ticker: 'B', closes: stormy });
+        const boot = monteCarlo.runMonteCarlo({ asset, startPrice: 100, paths: 2000, horizons: [21] });
+        const flat = monteCarlo.runMonteCarlo({ model: 'normal', asset, startPrice: 100, paths: 2000, horizons: [21] });
+        expect(boot.params.sigmaAnnual).toBeGreaterThan(boot.params.sampleSigmaAnnual);
+        expect(boot.fan.p95[21] - boot.fan.p05[21]).toBeGreaterThan(flat.fan.p95[21] - flat.fan.p05[21]);
+        expect(boot.metrics.monteCarlo.trace.interpretation.summary).toMatch(/normal model at the same volatility/);
+      });
+    });
+
+    suite('weekly returns for markets that close at different times', () => {
+      const weekdays = (count, start = '2025-01-06') => {
+        const dates = [];
+        let time = Date.parse(`${start}T00:00:00Z`);
+        while (dates.length < count) {
+          const day = new Date(time).getUTCDay();
+          if (day !== 0 && day !== 6) dates.push(new Date(time).toISOString().slice(0, 10));
+          time += 86400000;
+        }
+        return dates;
+      };
+      test('a week ends on Friday; weekend days belong to the next week', () => {
+        expect(risk.weekKey('2026-11-20')).toBe('2026-11-20'); // Friday
+        expect(risk.weekKey('2026-11-16')).toBe('2026-11-20'); // Monday
+        expect(risk.weekKey('2026-11-21')).toBe('2026-11-27'); // Saturday
+        expect(risk.weekKey('2026-11-22')).toBe('2026-11-27'); // Sunday
+        const weekly = risk.weeklyCloses({ dates: ['2026-11-19', '2026-11-20', '2026-11-21', '2026-11-23'], close: [1, 2, 3, 4] });
+        expect(weekly).toEqual({ dates: ['2026-11-20', '2026-11-27'], close: [2, 4] });
+      });
+      test('a market that closes a day later looks unrelated day by day, but not week by week', () => {
+        const dates = weekdays(261);
+        const base = randomWalk(262, { seed: 21, sigma: 0.012 });
+        const early = makeAsset({ ticker: 'EARLY', closes: base.slice(1), dates });
+        // The same prices, one session later: what a market closing hours after another sees.
+        const late = makeAsset({ ticker: 'LATE', closes: base.slice(0, 261), dates, market: 'SG' });
+        const cross = correlation.correlatePair(early, late);
+        expect(cross.meta.frequency).toBe('weekly');
+        expect(cross.value).toBeGreaterThan(0.6);
+        const sameSession = correlation.correlatePair(early, { ...late, market: 'US' });
+        expect(sameSession.meta.frequency).toBe('daily');
+        expect(Math.abs(sameSession.value)).toBeAtMost(0.25);
+        expect(tracer.validateTrace(cross)).toEqual([]);
+      });
+      test('a range too short for weekly returns falls back to daily closes, flagged as a lower bound', () => {
+        const dates = weekdays(40);
+        const a = makeAsset({ ticker: 'A', closes: randomWalk(40, { seed: 1 }), dates });
+        const b = makeAsset({ ticker: 'B', closes: randomWalk(40, { seed: 2 }), dates, market: 'SG' });
+        const metric = correlation.correlatePair(a, b, { minOverlap: 15, windowLabel: 'month' });
+        expect(metric.meta.frequency).toBe('daily');
+        expect(metric.meta.asynchronous).toBeTrue();
+        expect(metric.trace.interpretation.caveat).toMatch(/lower bound/);
+      });
+      test('a portfolio that mixes markets uses weekly returns and shrinks its covariance', () => {
+        const dates = weekdays(261);
+        const pack = (ticker, seed, market) => ({ ...makeAsset({ ticker, closes: randomWalk(261, { seed }), dates }), market });
+        const assets = [pack('AAA', 31, 'US'), pack('BBB', 32, 'SG'), pack('CCC', 33, 'US')];
+        const result = portfolio.analyzePortfolio({ assets, weights: assets.map((a) => ({ ticker: a.ticker, weight: 1 })), baseCurrency: 'USD', riskFree: { yield: 0.04, status: 'fresh' } });
+        expect(result.ok).toBeTrue();
+        expect(result.frequency).toBe('weekly');
+        expect(result.periodsPerYear).toBe(52);
+        expect(result.shrinkage.delta).toBeAtLeast(0);
+        expect(result.shrinkage.delta).toBeAtMost(1);
+        expect(result.metrics.portfolioVolatility.trace.steps[0].description).toMatch(/Ledoit-Wolf/);
+        const oneMarket = portfolio.analyzePortfolio({ assets: assets.map((a) => ({ ...a, market: 'US' })), weights: assets.map((a) => ({ ticker: a.ticker, weight: 1 })), baseCurrency: 'USD' });
+        expect(oneMarket.frequency).toBe('daily');
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('real snapshot: VOO and CSPX.L track the same index, and weekly returns show it', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const [voo, cspx] = [snapshot.byTicker.VOO, snapshot.byTicker['CSPX.L']];
+        if (!voo || !cspx) skip('VOO or CSPX.L is not on the watchlist');
+        const metric = correlation.correlatePair(voo, cspx);
+        expect(metric.meta.frequency).toBe('weekly');
+        expect(metric.value).toBeGreaterThan(0.85);
       });
     });
 

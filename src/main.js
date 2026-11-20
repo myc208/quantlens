@@ -36,6 +36,7 @@ import { startLiveFeeds } from './services/liveFeedService.js';
 import { getExplainer } from './services/glossaryService.js';
 import { createWorkerService, createJobRunner, jobKey } from './services/workerService.js';
 import { analyzeTechnicals, analyzeWindow } from './engines/technicalEngine.js';
+import { analyzeRisk, positionTailRisk } from './engines/riskEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
 import { advise } from './engines/advisorEngine.js';
@@ -287,6 +288,8 @@ function windowFor(ticker, range = store.getState().range) {
       series,
       asset: { ...analysis.asset, series },
       metrics: result.metrics,
+      // EWMA volatility and historical VaR/CVaR over the same window.
+      risk: analyzeRisk(analysis.asset, series, info.label),
       from: result.from,
       to: result.to,
       observations: result.observations,
@@ -353,7 +356,7 @@ function priceMetric(ticker) {
 /* ------------------------------------------------------------------ */
 
 const EMPTY_COMPARISON = Object.freeze({
-  assets: [], tickers: [], fx: null, sizings: {}, sizingList: [],
+  assets: [], tickers: [], fx: null, sizings: {}, sizingList: [], tailRisks: {},
   correlation: analyzeCorrelation([]), heat: portfolioHeat([], null, 'USD'),
 });
 let correlationMemo = { key: null, value: null };
@@ -409,7 +412,12 @@ function comparison() {
     return sizing;
   });
   const heat = portfolioHeat(sizingList, state.account, state.currency);
-  const value = { assets, tickers: assets.map((asset) => asset.ticker), fx, sizings, sizingList, correlation, heat, range: info };
+  // One-day 95% VaR and CVaR of each suggested position, from the selected range's returns.
+  const tailRisks = {};
+  for (const asset of assets) {
+    tailRisks[asset.ticker] = positionTailRisk({ sizing: sizings[asset.ticker], risk: windowFor(asset.ticker, info.id).risk, accountCurrency: state.currency });
+  }
+  const value = { assets, tickers: assets.map((asset) => asset.ticker), fx, sizings, sizingList, tailRisks, correlation, heat, range: info };
   comparisonMemo = { key, value };
   return value;
 }
@@ -483,6 +491,7 @@ function portfolioRequest(state) {
       ticker: view.asset.ticker,
       currency: view.asset.currency,
       assetClass: view.asset.assetClass,
+      market: view.asset.market,
       series: { dates: view.series.dates, close: view.series.close },
     };
   });
@@ -561,18 +570,21 @@ function traceIndex(ticker) {
   const analysis = ticker ? analyses.get(ticker) ?? null : null;
   const view = analysis ? windowFor(ticker, state.range) : null;
   const sizing = ticker ? current.sizings[ticker] ?? null : null;
+  const tail = ticker && current.tailRisks ? current.tailRisks[ticker] ?? null : null;
   const simulated = state.compute.monteCarlo.result;
   const run = ticker && simulated && simulated.ticker === ticker ? simulated : null;
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
-  const parts = [analysis, view, sizing, run, price, current.correlation, current.heat, held];
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
   const index = buildTraceIndex(
     analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics] : null,
     view ? view.metrics : null,
+    view ? view.risk.metrics : null,
     sizing ? sizing.metrics : null,
+    tail,
     run ? run.metrics : null,
     price,
     current.correlation.pairs,

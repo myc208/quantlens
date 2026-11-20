@@ -284,7 +284,10 @@ export function mountRiskSandboxModal(dialog, app) {
       <div>
         <div class="sandbox__block-title">
           <h3>Range of outcomes for ${esc(ticker)}</h3>
-          <span class="field__hint">${h.formatNumber(params.paths, 0)} simulated paths · prices in ${esc(asset.currency)} · volatility ${h.formatPercent(params.sigmaAnnual, 0)} a year, from the last ${esc(range.label)} · ${params.driftMode === 'zero' ? 'no trend assumed' : `the last ${esc(range.label)}'s trend assumed`}</span>
+          <span class="field__hint">${h.formatNumber(params.paths, 0)} simulated paths · prices in ${esc(asset.currency)} · ${params.model === 'bootstrap'
+    ? `real days from the last ${esc(range.label)}, resampled in ${params.blockLength}-day blocks and rescaled to today's volatility of ${h.formatPercent(params.sigmaAnnual, 0)} a year (${h.formatPercent(params.sampleSigmaAnnual, 0)} on average)`
+    : `normal model, volatility ${h.formatPercent(params.sigmaAnnual, 0)} a year from the last ${esc(range.label)}`} · ${params.driftMode === 'zero' ? 'no trend assumed' : `the last ${esc(range.label)}'s trend assumed`}</span>
+          ${params.fallbackNote ? `<p class="field__hint">${esc(params.fallbackNote)}</p>` : ''}
         </div>
         <div class="chart">
           <div class="chart__plot" data-role="fan" tabindex="0" role="img" aria-label="${esc(summary)}"></div>
