@@ -25,7 +25,7 @@ export const RANGES = Object.freeze(['1m', '3m', '6m', '1y', '5y']);
 export const DEFAULT_VIEW = 'compare';
 export const DEFAULT_RANGE = '1y';
 export const MAX_PORTFOLIO_ASSETS = 8;
-export const COMPUTE_JOBS = Object.freeze(['monteCarlo', 'portfolio']);
+export const COMPUTE_JOBS = Object.freeze(['monteCarlo', 'portfolio', 'backtest']);
 export const FILTER_OPTIONS = Object.freeze({
   assetClass: Object.freeze(['all', 'equity', 'etf', 'index', 'crypto']),
   market: Object.freeze(['all', 'US', 'SG', 'UK', 'CRYPTO']),

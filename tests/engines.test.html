@@ -189,6 +189,7 @@
     import * as workerService from '../src/services/workerService.js';
     import * as risk from '../src/engines/riskEngine.js';
     import * as eventsEngine from '../src/engines/eventEngine.js';
+    import * as backtest from '../src/engines/backtestEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -1873,6 +1874,7 @@
         Object.keys(risk.positionTailRisk({ sizing: null, risk: null, accountCurrency: 'USD' })).forEach((id) => ids.add(id));
         Object.keys(eventsEngine.analyzeEvents(anyAsset).metrics).forEach((id) => ids.add(id));
         ids.add(eventsEngine.gapRisk({ sizing: null, events: null, accountCurrency: 'USD' }).id);
+        Object.keys(backtest.backtestAsset(anyAsset).metrics).forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -3631,6 +3633,86 @@
           if (metrics.earningsMove.status === 'ok') measured += 1;
         }
         expect(measured).toBeGreaterThan(10);
+      });
+    });
+
+    /* ================================================================== */
+    /* 26. V3 verdict backtest                                              */
+    /* ================================================================== */
+
+    suite('backtestEngine: the verdict\'s own track record', () => {
+      test('ranks share ties, and Spearman correlation matches hand cases', () => {
+        expect(backtest.averageRanks([10, 20, 20, 30])).toEqual([1, 2.5, 2.5, 4]);
+        expect(backtest.spearman([1, 2, 3, 4], [10, 20, 30, 40])).toBeCloseTo(1, 1e-12);
+        expect(backtest.spearman([1, 2, 3, 4], [40, 30, 20, 10])).toBeCloseTo(-1, 1e-12);
+        expect(backtest.spearman([1, 2, 3, 4], [1, 100, 2, 3])).toBeCloseTo(0.4, 1e-12); // monotone transforms do not matter, only order
+        expect(backtest.spearman([1, 2], [1, 2])).toBeNull();
+      });
+      test('band statistics: average forward return, hit rate and excess over all days', () => {
+        const summary = backtest.summariseBacktest(
+          [70, 70, 50, 30, 30],
+          ['BUY', 'BUY', 'HOLD', 'SELL', 'SELL'],
+          [0.05, 0.01, 0, -0.02, 0.03],
+        );
+        expect(summary.n).toBe(5);
+        expect(summary.base.mean).toBeCloseTo(0.014, 1e-12);
+        expect(summary.bands.BUY.mean).toBeCloseTo(0.03, 1e-12);
+        expect(summary.bands.BUY.hitRate).toBe(1);           // both BUY days rose
+        expect(summary.bands.SELL.hitRate).toBe(0.5);         // one of two SELL days fell
+        expect(summary.bands.BUY.excess).toBeCloseTo(0.016, 1e-12);
+        expect(summary.bands.SELL.share).toBe(0.4);
+        expect(summary.independent).toBe(0);                 // 5 days are not even one 21-day period
+        expect(summary.tStat).toBeNull();
+      });
+      test('the safety rules cap a BUY exactly as the live advisor does', () => {
+        const strong = { score: 80, sma200: 90, macdLine: 1, macdSignal: 0.5, rsi: 60 };
+        expect(backtest.technicalVerdict(strong, 100)).toBe('BUY');
+        expect(backtest.technicalVerdict({ ...strong, rsi: 85 }, 100)).toBe('HOLD');                    // overheated
+        expect(backtest.technicalVerdict({ ...strong, macdLine: 0.1, macdSignal: 0.5 }, 85)).toBe('HOLD'); // below SMA200 while MACD falls
+        expect(backtest.technicalVerdict({ ...strong, score: 50 }, 100)).toBe('HOLD');
+        expect(backtest.technicalVerdict({ ...strong, score: 30 }, 100)).toBe('SELL');
+      });
+      test('the fast scorer equals the live Technical score on a synthetic year', () => {
+        const closes = randomWalk(260, { seed: 41, sigma: 0.018 });
+        const asset = makeAsset({ ticker: 'BT', closes, highs: closes.map((c) => c * 1.01), lows: closes.map((c) => c * 0.99) });
+        const live = technical.analyzeTechnicals(asset).metrics.technicalScore.value;
+        expect(backtest.technicalScoreAt(asset.series.close, asset.series.high, asset.series.low).score).toBeCloseTo(live, 1e-9);
+      });
+      test('without older history there is nothing to replay, and the record says so', () => {
+        const asset = makeAsset({ ticker: 'BT', closes: randomWalk(260, { seed: 42 }) });
+        const result = backtest.backtestAsset(asset);
+        expect(result.metrics.verdictBacktest.status).toBe('na');
+        expect(result.metrics.verdictBacktest.naReason).toMatch(/at least 120/);
+      });
+      test('real snapshot: the last replayed day reproduces today\'s live score and verdict', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const result = mathWorker.handleRequest('backtest', { assets: snapshot.assets });
+        let reported = 0;
+        for (const asset of snapshot.assets) {
+          const record = result.byTicker[asset.ticker];
+          const tech = technical.analyzeTechnicals(asset);
+          expect(record.lastScore).toBeCloseTo(tech.metrics.technicalScore.value, 1e-9);
+          if (asset.assetClass !== 'equity') {
+            // Without fundamentals the Technical score is the whole verdict, safety rules included.
+            const advice = advisor.advise({ asset, technical: tech, fundamental: fundamental.analyzeFundamentals(asset, { fxRate: snapshot.fx.rate }) });
+            expect(record.lastVerdict).toBe(advice.verdict);
+          }
+          const metric = record.metrics.verdictBacktest;
+          expect(tracer.validateTrace(metric)).toEqual([]);
+          if (metric.status === 'ok') {
+            reported += 1;
+            expect(metric.meta.n).toBeAtLeast(backtest.BACKTEST_CONFIG.minScoredDays);
+            expect(metric.trace.interpretation.caveat).toMatch(/look-ahead|leak the future/);
+          }
+        }
+        expect(reported).toBeGreaterThan(20);
+        expect(result.summary.assets).toBe(reported);
+      });
+      test('the compute store has a backtest slot', () => {
+        expect(storeModule.COMPUTE_JOBS).toContain('backtest');
+        expect(storeModule.createInitialState('').compute.backtest.status).toBe('idle');
+        expect(mathWorker.JOB_TYPES).toContain('backtest');
       });
     });
 

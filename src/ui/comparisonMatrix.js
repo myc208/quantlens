@@ -39,6 +39,7 @@ const SECTIONS = Object.freeze([
       { id: 'verdict', lead: true },
       { id: 'compositeScore', meter: 'score' },
       { id: 'confidence' },
+      { id: 'verdictBacktest', label: 'Track record (backtest)' },
     ],
   },
   {
@@ -307,6 +308,11 @@ export function mountComparisonMatrix(root, app) {
       }
       case 'earningsMove':
         return sub(`Worst ${h.signedPercent(meta.worst, 1)} · ${h.formatNumber(meta.ratio, 1)}× a normal day · ${meta.count} releases`);
+      case 'verdictBacktest': {
+        const buy = meta.bands.BUY;
+        const verdictWord = meta.meaningful ? (metric.value > 0 ? 'a modest edge' : 'pointed the wrong way') : 'no reliable edge';
+        return sub(`BUY days ${h.signedPercent(buy.mean, 1)} vs ${h.signedPercent(meta.base.mean, 1)} on all days (${meta.horizon} sessions) · ${verdictWord} · ${meta.n} days`);
+      }
       case 'nextExDividend':
         return sub(`${h.shortDate(meta.date)}${meta.estimated ? ' (estimated)' : ''}${isNum(meta.dropFraction) ? ` · price drop ≈ ${h.formatPercent(meta.dropFraction, 2)}` : ''}`);
       case 'gapRisk':
@@ -341,7 +347,8 @@ export function mountComparisonMatrix(root, app) {
   function metricCell(section, row, asset, state, comparison) {
     const metric = app.trace(asset.ticker, row.id);
     if (!metric) {
-      return '<td><div class="cell cell--static cell--na"><span class="cell__value">–</span></div></td>';
+      const pending = row.id === 'verdictBacktest' && app.backtest().status !== 'error';
+      return `<td><div class="cell cell--static cell--na"><span class="cell__value">${pending ? '<span class="cell__sub">Replaying past days in the background…</span>' : '–'}</span></div></td>`;
     }
     const label = rowLabel(row);
     let bar = '';
@@ -1007,7 +1014,8 @@ export function mountComparisonMatrix(root, app) {
     const structural = next.snapshot !== previous.snapshot || next.selected !== previous.selected
       || next.currency !== previous.currency || next.mode !== previous.mode
       || next.account !== previous.account || next.live.fx !== previous.live.fx
-      || next.warnings !== previous.warnings || next.range !== previous.range;
+      || next.warnings !== previous.warnings || next.range !== previous.range
+      || next.compute.backtest !== previous.compute.backtest;
     // The matrix is only rebuilt while it is the visible view; otherwise it is marked stale
     // and rebuilt once when the user comes back to it.
     if (next.view !== 'compare') {

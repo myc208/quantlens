@@ -547,6 +547,29 @@ function schedulePortfolio(delay = 140) {
   }, delay);
 }
 
+// The verdict backtest replays about 1,000 days for every asset: it runs once per snapshot,
+// in the worker, so the page is usable while it computes.
+function submitBacktest(snapshot) {
+  const assets = snapshot.assets.map((asset) => ({
+    ticker: asset.ticker,
+    assetClass: asset.assetClass,
+    series: { dates: asset.series.dates, high: asset.series.high, low: asset.series.low, close: asset.series.close },
+    longSeries: asset.longSeries,
+  }));
+  jobs.submit('backtest', jobKey('backtest', snapshot.generatedAt, assets.length), 'backtest', { assets });
+}
+
+store.subscribe((next, previous) => {
+  if (next.status === 'ready' && next.snapshot && (next.snapshot !== previous.snapshot || next.status !== previous.status)) {
+    submitBacktest(next.snapshot);
+  }
+});
+
+/** The backtest slot: the result covers the whole watchlist. */
+function backtest() {
+  return store.getState().compute.backtest;
+}
+
 // Portfolio statistics are only computed while the Portfolio view is open. Slider
 // drags arrive many times a second, so they are debounced before reaching the worker.
 store.subscribe((next, previous) => {
@@ -583,7 +606,8 @@ function traceIndex(ticker) {
   const run = ticker && simulated && simulated.ticker === ticker ? simulated : null;
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
-  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held];
+  const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
@@ -591,6 +615,7 @@ function traceIndex(ticker) {
     analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics] : null,
     view ? view.metrics : null,
     view ? view.risk.metrics : null,
+    record ? record.metrics : null,
     sizing ? sizing.metrics : null,
     tail,
     run ? run.metrics : null,
@@ -625,6 +650,7 @@ const app = {
   requestSimulation,
   simulation,
   portfolio,
+  backtest,
   traceIndex,
   trace,
   explain: (id, profile) => getExplainer(id, profile),

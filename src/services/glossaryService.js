@@ -538,6 +538,13 @@ const ENTRIES = {
     healthy: 'Within the planned amount at risk.',
     risky: 'Several times the planned amount, especially with earnings inside the next 21 trading days.',
   },
+  verdictBacktest: {
+    term: 'Verdict track record',
+    what: 'How the price-based (Technical) half of the verdict would have done over the stored years: each past day is rescored from the year behind it and compared with the next 21 trading days. The headline is the rank IC, the correlation between the score and what followed.',
+    why: 'A signal is only worth acting on if it has worked before. This is the same discipline the forecast row applies to the projection.',
+    healthy: 'A rank IC of 0.05 or more that is unlikely to be luck (t of 2 or more), with BUY days beating the asset\'s average day.',
+    risky: 'A negative IC, or BUY days that did no better than any other day: the verdict then describes the trend without predicting anything.',
+  },
   maxDrawdown: {
     term: 'Maximum drawdown',
     what: 'The largest fall from a high to a later low within the selected time range.',
