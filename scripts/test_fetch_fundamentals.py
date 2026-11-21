@@ -24,7 +24,7 @@ import sys
 import time
 import unittest
 import urllib.error
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -554,7 +554,7 @@ class SnapshotValidation(unittest.TestCase):
 
     def test_the_committed_snapshot_is_valid(self):
         self.assertEqual(ff.validate_snapshot(self.snapshot), [])
-        self.assertEqual(self.snapshot["schemaVersion"], 2)
+        self.assertEqual(self.snapshot["schemaVersion"], 3)
 
     def test_rendering_round_trips_exactly(self):
         self.assertEqual(json.loads(ff.render_snapshot(self.snapshot)), self.snapshot)
@@ -844,6 +844,55 @@ class TelegramBriefing(unittest.TestCase):
         self.assertEqual(result, "failed")
         self.assertIn("Every check passed", calls[0]["body"]["text"].replace("\\", ""))
 
+    def test_chat_ids_are_split_on_commas_trimmed_and_deduplicated(self):
+        ids, invalid = ff.parse_chat_ids(" 123456789, -1001234567890 ,, @quant_lens_feed, 123456789, abc, 12x, ")
+        self.assertEqual(ids, ["123456789", "-1001234567890", "@quant_lens_feed"])
+        self.assertEqual(invalid, 2)
+        self.assertEqual(ff.parse_chat_ids("-1001234"), (["-1001234"], 0))
+        self.assertEqual(ff.parse_chat_ids(None), ([], 0))
+        self.assertEqual(ff.parse_chat_ids(" , ,"), ([], 0))
+
+    def test_every_recipient_gets_the_same_message_and_a_failure_does_not_stop_the_others(self):
+        ids = ["111111", "-1002222222222", "333333"]
+        fake, calls = self.opener({"ok": True}, self.http_error(403, "Forbidden: bot was blocked by the user"), {"ok": True})
+        env = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": ", ".join(ids), **self.PASSED}
+        with self.assertLogs(ff.LOG, level="WARNING") as logs:
+            self.assertEqual(self.deliver(env, fake), "partial")
+        self.assertEqual([call["body"]["chat_id"] for call in calls], ids)
+        self.assertEqual(len({call["body"]["text"] for call in calls}), 1)
+        joined = "\n".join(logs.output)
+        self.assertIn("recipient 2 of 3", joined)
+        self.assertIn("reached 2 of 3 recipients", joined)
+        for secret in [self.TOKEN, *ids]:
+            self.assertNotIn(secret, joined)  # chat ids are not masked by GitHub once the secret is split
+
+    def test_all_recipients_reached_is_a_plain_success(self):
+        fake, calls = self.opener({"ok": True}, {"ok": True})
+        env = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": "111111,222222", **self.PASSED}
+        with self.assertNoLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(self.deliver(env, fake), "sent")
+        self.assertEqual(len(calls), 2)
+
+    def test_the_markdown_fallback_is_decided_per_recipient(self):
+        fake, calls = self.opener(self.http_error(400, "Bad Request: can't parse entities"), {"ok": True}, {"ok": True})
+        env = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": "111111,222222", **self.PASSED}
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(self.deliver(env, fake), "sent-plain")
+        self.assertEqual([("parse_mode" in call["body"]) for call in calls], [True, False, True])
+
+    def test_invalid_entries_are_skipped_with_a_count_never_their_values(self):
+        fake, calls = self.opener({"ok": True})
+        env = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": "not-an-id, 111111", **self.PASSED}
+        with self.assertLogs(ff.LOG, level="WARNING") as logs:
+            self.assertEqual(self.deliver(env, fake), "sent")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("1 TELEGRAM_CHAT_ID entry was skipped", "\n".join(logs.output))
+        self.assertNotIn("not-an-id", "\n".join(logs.output))
+        fake, calls = self.opener()
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(self.deliver({"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": "nope"}, fake), "failed")
+        self.assertEqual(calls, [])
+
     def test_pipeline_outcome_names_the_first_step_that_did_not_succeed(self):
         self.assertEqual(ff.pipeline_outcome(self.PASSED), ("passed", None))
         self.assertEqual(ff.pipeline_outcome({}), ("unknown", None))
@@ -886,6 +935,23 @@ class TelegramBriefing(unittest.TestCase):
         self.assertIn("The data refresh failed, so nothing was committed", text)
         self.assertIn("the signals below are from it", text)
         self.assertIn("Top BUY signals", text)
+
+    def test_earnings_within_30_days_are_listed_nearest_first(self):
+        rows = [dict(row) for row in self.SIGNALS]
+        rows[0].update(nextEarnings={"date": "2026-12-17", "days": 26}, typicalMove=0.058, worstMove=-0.162)
+        rows[1].update(nextEarnings={"date": "2026-12-01", "days": 10}, typicalMove=None, worstMove=None)
+        rows[3].update(nextEarnings={"date": "2027-02-01", "days": 72}, typicalMove=0.02, worstMove=-0.03)
+        text = self.build(signals=rows, markdown=False)
+        self.assertIn("Earnings in the next 30 days", text)
+        first, second = text.index("D05.SI ~1 Dec (in 10 days)"), text.index("MU ~17 Dec (in 26 days)")
+        self.assertLess(first, second)
+        self.assertIn("typical move \u00b15.8%, worst \u221216.2%", text)
+        self.assertIn("too few past releases to size the move", text)
+        self.assertNotIn("in 72 days", text)
+        self.assertNotIn("Earnings in the next", self.build(markdown=False))  # nothing upcoming: no section
+        markdown = self.build(signals=rows)
+        self.assertIn("`MU`", markdown)
+        self.assertIn("\\(in 26 days\\)", markdown)
 
     def test_the_message_stays_inside_telegrams_limit(self):
         many = [{"ticker": f"T{i}", "name": "N" * 200, "verdict": "BUY", "composite": 90 - i % 40, "confidence": "High"} for i in range(400)]
@@ -932,6 +998,208 @@ class TelegramBriefing(unittest.TestCase):
         for row in signals:
             if by_class[row["ticker"]] in {"etf", "index", "crypto"}:
                 self.assertEqual(row["confidence"], "Low", row["ticker"])  # technical only, by construction
+        upcoming = [row for row in signals if row["nextEarnings"]]
+        self.assertTrue(upcoming)  # the event layer reaches the briefing
+        for row in upcoming:
+            self.assertEqual(by_class[row["ticker"]], "equity")
+            self.assertGreaterEqual(row["nextEarnings"]["days"], 0)
+
+
+class SchemaV3History(unittest.TestCase):
+    """Five years of prices: one adjusted request, split into recent candles and older closes."""
+
+    @staticmethod
+    def rows(start: str, count: int, step_days: int = 1) -> list:
+        first = date.fromisoformat(start)
+        return [[(first + timedelta(days=i * step_days)).isoformat(), 10.0 + i, 11.0 + i, 9.0 + i, 10.5 + i, 100]
+                for i in range(count)]
+
+    def test_the_last_year_keeps_ohlcv_and_older_sessions_keep_the_close(self):
+        rows = self.rows("2021-11-20", 1827)  # five years of daily crypto sessions
+        candles, history = ff.split_history(rows)
+        self.assertEqual(len(candles), ff.CANDLE_WINDOW_DAYS)
+        self.assertEqual(len(candles) + len(history), len(rows))
+        self.assertTrue(all(len(row) == 6 for row in candles))
+        self.assertTrue(all(len(row) == 2 for row in history))
+        self.assertEqual(history[-1], [rows[len(history) - 1][0], rows[len(history) - 1][4]])  # the close, untouched
+        self.assertLess(history[-1][0], candles[0][0])
+        self.assertEqual(ff.validate_history(history, candles[0][0]), [])
+
+    def test_a_short_listing_has_little_or_no_history(self):
+        candles, history = ff.split_history(self.rows("2026-01-01", 250))
+        self.assertEqual((len(candles), history), (250, []))
+        self.assertEqual(ff.split_history([]), ([], []))
+
+    def test_dividends_are_read_from_the_same_price_frame(self):
+        index = pd.DatetimeIndex(["2026-01-05", "2026-04-06", "2026-07-06", "2026-10-05", "2026-11-20"], tz="America/New_York")
+        frame = pd.DataFrame({"Dividends": [0.0, 0.25, 0.0, 0.26, 0.27]}, index=index)
+        self.assertEqual(ff.dividend_rows(frame, "2026-11-19"), [["2026-04-06", 0.25], ["2026-10-05", 0.26]])
+        self.assertEqual(ff.dividend_rows(pd.DataFrame({"Close": [1.0]}, index=index[:1])), [])
+
+    def test_history_validation(self):
+        good = [["2021-11-22", 10.0], ["2021-11-23", 10.5]]
+        self.assertEqual(ff.validate_history(good, "2021-11-24"), [])
+        self.assertEqual(ff.validate_history([], "2021-11-24"), [])
+        cases = {
+            "unsorted": ([["2021-11-23", 10.0], ["2021-11-22", 10.5]], "2021-11-24"),
+            "overlapping the candles": (good, "2021-11-23"),
+            "a gap at the join": (good, "2021-12-10"),
+            "a zero close": ([["2021-11-22", 0.0]], "2021-11-24"),
+            "a three-field row": ([["2021-11-22", 10.0, 1]], "2021-11-24"),
+        }
+        for label, (history, first_candle) in cases.items():
+            self.assertTrue(ff.validate_history(history, first_candle), label)
+
+    def test_dividend_validation(self):
+        self.assertEqual(ff.validate_dividends([["2026-04-06", 0.25], ["2026-10-05", 0.26]]), [])
+        self.assertTrue(ff.validate_dividends([["2026-10-05", 0.26], ["2026-04-06", 0.25]]))
+        self.assertTrue(ff.validate_dividends([["2026-04-06", -0.25]]))
+
+
+class SchemaV3Events(unittest.TestCase):
+    """Earnings and ex-dividend dates, with each release placed against the exchange's session."""
+
+    NOW = datetime(2026, 11, 21, 22, 30, tzinfo=timezone.utc)
+
+    @staticmethod
+    def stamps(*values: str) -> pd.DataFrame:
+        # Like Yahoo's own frame: one New York time zone, with summer and winter offsets.
+        index = pd.DatetimeIndex([pd.Timestamp(v).tz_convert("America/New_York") for v in values])
+        return pd.DataFrame({"EPS Estimate": [1.0] * len(values)}, index=index)
+
+    def test_timing_is_judged_in_the_exchanges_own_hours(self):
+        cases = [
+            ("2026-09-30 16:00:00-04:00", "US", ("2026-09-30", "after-close")),
+            ("2026-10-31 06:00:00-04:00", "US", ("2026-10-31", "before-open")),
+            ("2026-10-31 12:00:00-04:00", "US", ("2026-10-31", "during-session")),
+            ("2026-08-05 00:00:00-04:00", "US", ("2026-08-05", "unknown")),        # Yahoo's date-only placeholder
+            ("2026-08-05 01:00:00-04:00", "SG", ("2026-08-05", "during-session")),  # 13:00 in Singapore
+            ("2026-11-04 19:00:00-05:00", "SG", ("2026-11-05", "before-open")),     # 08:00 the next morning
+            ("2026-11-04 02:00:00-05:00", "UK", ("2026-11-04", "before-open")),     # 07:00 in London
+        ]
+        for stamp, market, expected in cases:
+            self.assertEqual(ff.earnings_timing(pd.Timestamp(stamp), market), expected, (stamp, market))
+
+    def test_next_earnings_merges_both_sources_and_keeps_the_disagreement(self):
+        frame = self.stamps("2026-12-17 16:00:00-05:00", "2026-09-30 16:00:00-04:00", "2026-06-24 16:00:00-04:00",
+                            "2020-06-24 16:00:00-04:00")
+        calendar = {"Earnings Date": [date(2026, 12, 18)], "Ex-Dividend Date": date(2027, 1, 13)}
+        events = ff.build_events(calendar, frame, "US", self.NOW, history_start="2021-11-22")
+        self.assertEqual(events["status"], "fresh")
+        self.assertEqual(events["nextEarnings"], {"date": "2026-12-17", "dateTo": "2026-12-18", "timing": "after-close"})
+        self.assertEqual(events["nextExDividend"], {"date": "2027-01-13"})
+        self.assertEqual(events["earnings"], [{"date": "2026-09-30", "timing": "after-close"},
+                                              {"date": "2026-06-24", "timing": "after-close"}])  # 2020 predates the history
+        self.assertIsNone(events["note"])
+        self.assertEqual(ff.validate_events(events), [])
+
+    def test_a_past_ex_dividend_date_is_not_reported_as_next(self):
+        events = ff.build_events({"Ex-Dividend Date": date(2026, 10, 14)}, None, "US", self.NOW, None)
+        self.assertIsNone(events["nextExDividend"])
+        self.assertIsNone(events["nextEarnings"])
+        self.assertEqual(events["note"], "Yahoo lists no upcoming earnings date.")
+        self.assertEqual(ff.validate_events(events), [])
+
+    def test_dates_far_apart_are_separate_events(self):
+        calendar = {"Earnings Date": [date(2026, 12, 1), date(2027, 1, 20)]}
+        events = ff.build_events(calendar, None, "US", self.NOW, None)
+        self.assertEqual(events["nextEarnings"], {"date": "2026-12-01", "dateTo": None, "timing": "unknown"})
+
+    def test_assets_without_earnings_cost_no_request(self):
+        original = ff.yf.Ticker
+        ff.yf.Ticker = lambda *_a, **_k: self.fail("no request should be made")
+        try:
+            for asset_class in ("crypto", "index", "etf"):
+                events = ff.fetch_events({"ticker": "X", "assetClass": asset_class, "market": "US"}, None, settings(), self.NOW, None)
+                self.assertEqual(events["status"], "unavailable")
+                self.assertTrue(events["note"])
+                self.assertEqual(ff.validate_events(events), [])
+        finally:
+            ff.yf.Ticker = original
+
+    def test_a_failed_calendar_keeps_the_previous_block_marked_stale(self):
+        class Broken:
+            @property
+            def calendar(self):
+                raise urllib.error.URLError("down")
+
+            def get_earnings_dates(self, limit=None):
+                raise urllib.error.URLError("down")
+
+        previous = ff.build_events({"Earnings Date": [date(2026, 12, 18)]}, None, "US", self.NOW, None)
+        original = ff.yf.Ticker
+        ff.yf.Ticker = lambda *_a, **_k: Broken()
+        try:
+            entry = {"ticker": "MU", "assetClass": "equity", "market": "US"}
+            quick = settings(max_retries=1, retry_delay=0.0, events_timeout=2.0)
+            kept = ff.fetch_events(entry, previous, quick, self.NOW, None)
+            self.assertEqual(kept["status"], "stale")
+            self.assertEqual(kept["nextEarnings"], previous["nextEarnings"])
+            fresh_start = ff.fetch_events(entry, None, quick, self.NOW, None)
+            self.assertEqual(fresh_start["status"], "unavailable")
+        finally:
+            ff.yf.Ticker = original
+
+    def test_event_validation_rejects_malformed_blocks(self):
+        good = ff.build_events({"Earnings Date": [date(2026, 12, 18)]}, None, "US", self.NOW, None)
+        self.assertEqual(ff.validate_events(good), [])
+        broken = [
+            dict(good, nextEarnings={"date": "2026-12-18", "dateTo": "2026-12-17", "timing": "unknown"}),
+            dict(good, nextEarnings={"date": "2026-12-18", "dateTo": None, "timing": "lunchtime"}),
+            dict(good, earnings=[{"date": "2026-01-01", "timing": "unknown"}, {"date": "2026-06-01", "timing": "unknown"}]),
+            dict(ff.empty_events("x"), nextExDividend={"date": "2027-01-13"}),
+            dict(good, fetchedAt=None),
+            {k: v for k, v in good.items() if k != "note"},
+        ]
+        for block in broken:
+            self.assertTrue(ff.validate_events(block), block)
+
+
+class SchemaV3Snapshot(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.snapshot = ff.load_json(SNAPSHOT_PATH)
+
+    def test_the_committed_snapshot_is_v3_with_history_and_events(self):
+        self.assertEqual(self.snapshot["historyFields"], ff.HISTORY_FIELDS)
+        for asset in self.snapshot["assets"]:
+            self.assertEqual(ff.validate_history(asset["history"], asset["candles"][0][0]), [], asset["ticker"])
+            if asset["assetClass"] in {"crypto", "index"}:
+                self.assertEqual(asset["dividends"], [], asset["ticker"])
+            if asset["assetClass"] != "equity":
+                self.assertEqual(asset["events"]["status"], "unavailable", asset["ticker"])
+            if asset["history"]:
+                # One request, one adjustment: the join is an ordinary daily step, not a jump.
+                step = asset["candles"][0][4] / asset["history"][-1][1]
+                self.assertTrue(0.5 < step < 2.0, asset["ticker"])
+
+    def test_usd_sgd_history_spans_the_same_five_years(self):
+        earliest = min((a["history"] or a["candles"])[0][0] for a in self.snapshot["assets"])
+        first_rate = self.snapshot["fx"]["series"][0][0]
+        self.assertLessEqual((date.fromisoformat(first_rate) - date.fromisoformat(earliest)).days, 10)
+        self.assertEqual(ff.FX_HISTORY_PERIOD, "5y")
+
+    def test_a_v2_asset_is_upgraded_to_v3_and_carried_over_with_its_history(self):
+        old = copy.deepcopy(next(a for a in self.snapshot["assets"] if a["assetClass"] == "equity"))
+        for key in ("history", "dividends", "events"):
+            del old[key]
+        self.assertTrue(ff.validate_asset(old))
+        upgraded = ff.upgrade_asset(old)
+        self.assertEqual(ff.validate_asset(upgraded), [])
+        self.assertEqual((upgraded["history"], upgraded["dividends"], upgraded["events"]["status"]), ([], [], "unavailable"))
+
+        current = copy.deepcopy(next(a for a in self.snapshot["assets"] if a["events"]["status"] == "fresh"))
+        carried = ff.carry_over(current, {"lotSize": current["lotSize"], "binanceSymbol": None}, "test")
+        self.assertEqual(carried["history"], current["history"])
+        self.assertEqual(carried["dividends"], current["dividends"])
+        self.assertEqual(carried["events"]["status"], "stale")
+        self.assertEqual(ff.validate_asset(carried), [])
+
+    def test_history_and_dividends_render_one_row_per_line(self):
+        text = ff.render_snapshot(self.snapshot)
+        asset = next(a for a in self.snapshot["assets"] if a["history"])
+        first = json.dumps(asset["history"][0], separators=(",", ":"))
+        self.assertIn("\n        " + first + ",\n", text)
 
 
 if __name__ == "__main__":

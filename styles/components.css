@@ -3372,3 +3372,10 @@ th[aria-sort="ascending"] .board__sort::after {
 .palette__icon {
   margin: 0 6px 0 2px;
 }
+
+/* An upcoming earnings release, shown next to the ticker in the leaderboard. */
+.chip--event {
+  border-color: var(--status-warning);
+  color: var(--text-primary);
+  background: var(--status-warning-wash);
+}

@@ -19,8 +19,9 @@
 
 import { runMonteCarlo } from '../engines/monteCarloEngine.js';
 import { analyzePortfolio, sampleFrontier } from '../engines/portfolioEngine.js';
+import { backtestWatchlist } from '../engines/backtestEngine.js';
 
-export const JOB_TYPES = Object.freeze(['monteCarlo', 'portfolio', 'ping']);
+export const JOB_TYPES = Object.freeze(['monteCarlo', 'portfolio', 'backtest', 'ping']);
 
 /**
  * Run one job synchronously.
@@ -34,6 +35,8 @@ export function handleRequest(type, payload) {
   switch (type) {
     case 'monteCarlo':
       return runMonteCarlo(payload);
+    case 'backtest':
+      return backtestWatchlist(payload);
     case 'portfolio': {
       const analysis = analyzePortfolio(payload);
       const riskFree = payload.riskFree && typeof payload.riskFree.yield === 'number' ? payload.riskFree.yield : null;

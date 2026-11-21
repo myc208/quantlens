@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""QuantLens market-data pipeline (snapshot schema v2).
+"""QuantLens market-data pipeline (snapshot schema v3).
 
 Reads ``scripts/watchlist.json`` and writes ``data/market_snapshot.json`` with,
 for every asset (stocks, REITs, ETFs, indices and crypto):
 
-* one year of daily candles and fundamentals (Yahoo Finance via ``yfinance``),
+* five years of daily prices from one adjusted request: full OHLCV candles for
+  the most recent year, closes only for the four years before it, and every
+  dividend paid in those five years,
+* fundamentals (Yahoo Finance via ``yfinance``),
+* for stocks, an event calendar: the next earnings and ex-dividend dates and
+  the past earnings dates, each with its timing against the exchange's session,
 * the three most recent *unique* news stories with a sentiment score
   (Yahoo Finance RSS, de-duplicated with ``difflib``, scored with VADER),
 * a 30-calendar-day price projection with an 80% band and a backtest of how
@@ -15,9 +20,10 @@ plus two macro inputs: the US and Singapore 10-year government yields, used as
 risk-free rates, and one year of daily USD/SGD closes.
 
 With ``--notify`` it instead sends a short daily briefing about the snapshot to
-Telegram (top BUY and SELL signals, notable shifts in headline tone, and the
-pipeline's status). It never fails: missing credentials skip it silently, and
-an unreachable API is a warning.
+Telegram (top BUY and SELL signals, earnings in the next 30 days, notable shifts
+in headline tone, and the pipeline's status) to one chat or several:
+TELEGRAM_CHAT_ID may hold comma-separated ids. It never fails: missing
+credentials skip it silently, and an unreachable API is a warning.
 
 Design rules
 ------------
@@ -38,7 +44,8 @@ Units
 * ``marketCap`` and ``enterpriseValue`` are in the trading ``currency``.
 * Statement items are in ``financialCurrency``.
 * Ratios and yields are decimals (0.0514 means 5.14 %).
-* Candles are split- and dividend-adjusted, completed sessions only.
+* Candles and history are split- and dividend-adjusted, completed sessions only,
+  and come from the same request, so they join without a step.
 * Timestamps are ISO-8601 UTC (``2026-11-17T22:31:04Z``).
 
 Usage
@@ -75,7 +82,7 @@ import urllib.request
 import warnings
 import xml.etree.ElementTree as ElementTree
 import zlib
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -91,10 +98,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WATCHLIST = REPO_ROOT / "scripts" / "watchlist.json"
 DEFAULT_OUTPUT = REPO_ROOT / "data" / "market_snapshot.json"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CANDLE_FIELDS = ["date", "open", "high", "low", "close", "volume"]
+HISTORY_FIELDS = ["date", "close"]
 FORECAST_FIELDS = ["date", "yhat", "lower", "upper"]
 MIN_CANDLES = 200
+CANDLE_WINDOW_DAYS = 365      # the most recent year keeps full OHLCV; older sessions keep the close only
+FX_HISTORY_PERIOD = "5y"      # USD/SGD closes, as long as the asset history
+HISTORY_MAX_ROWS = 2000       # five years of daily crypto closes is about 1,460 rows
+SPLICE_MAX_GAP_DAYS = 10      # the last history row and the first candle are at most this far apart
+DIVIDEND_MAX_ROWS = 300
 
 FUNDAMENTAL_KEYS = [
     "marketCap", "enterpriseValue",
@@ -108,12 +121,14 @@ ASSET_KEYS = [
     "ticker", "name", "assetClass", "market", "currency", "financialCurrency",
     "sector", "industry", "scoringProfile", "lotSize", "binanceSymbol",
     "status", "statusNote", "fundamentalsPeriod", "quote", "fundamentals", "candles",
-    "news", "forecast",
+    "history", "dividends", "news", "forecast", "events",
 ]
 NEWS_KEYS = ["status", "fetchedAt", "headlineCount", "clusterCount", "newestAt", "sentiment", "clusters", "note"]
 CLUSTER_KEYS = ["title", "link", "publishedAt", "firstSeenAt", "duplicates", "scores", "label"]
 FORECAST_KEYS = ["status", "model", "modelVersion", "config", "trainedOn", "horizon", "backtest", "points", "note"]
 RISK_FREE_KEYS = ["name", "symbol", "yield", "asOf", "source", "status"]
+EVENTS_KEYS = ["status", "fetchedAt", "nextEarnings", "nextExDividend", "earnings", "note"]
+EARNINGS_TIMINGS = {"before-open", "during-session", "after-close", "unknown"}
 
 ASSET_CLASSES = {"equity", "crypto", "etf", "index"}
 MARKETS = {"US", "SG", "UK", "CRYPTO"}
@@ -130,6 +145,8 @@ SENTIMENT_LABELS = {"positive", "neutral", "negative"}
 # Local session close per market. A candle dated "today" is only kept once the
 # session has closed (plus a buffer for Yahoo's delayed quotes).
 SESSION_CLOSE = {"US": dtime(16, 0), "SG": dtime(17, 0), "UK": dtime(16, 30)}
+SESSION_OPEN = {"US": dtime(9, 30), "SG": dtime(9, 0), "UK": dtime(8, 0)}
+MARKET_TIMEZONES = {"US": "America/New_York", "SG": "Asia/Singapore", "UK": "Europe/London"}
 CLOSE_BUFFER_MINUTES = 20
 
 SECTOR_PROFILES = {"Financial Services": "FINANCIAL", "Real Estate": "REIT"}
@@ -164,6 +181,12 @@ NEWS_MAX_BYTES = 2_000_000
 NEWS_TITLE_LIMIT = 300
 SENTIMENT_THRESHOLD = 0.05       # VADER's conventional cut-off for positive / negative
 
+# --- Events (stocks only) ------------------------------------------------------------
+EARNINGS_LOOKUP = 24             # earnings dates requested: about six years of quarterly reports
+EVENTS_MAX_PAST = 30             # past earnings dates stored per asset
+EARNINGS_CLUSTER_DAYS = 7        # candidate dates this close together are one event with an uncertain day
+YAHOO_EVENT_TIMEZONE = "America/New_York"  # Yahoo stamps earnings in New York time, whatever the exchange
+
 # --- Forecast --------------------------------------------------------------------
 FORECAST_HORIZON_DAYS = 30           # calendar days projected, for every asset class
 FORECAST_HOLDOUT_DAYS = 30           # calendar days hidden from the model for its backtest
@@ -194,8 +217,12 @@ TELEGRAM_TIMEOUT = 10.0
 TELEGRAM_MAX_CHARS = 3800        # Telegram's hard limit is 4096 characters
 BRIEFING_TOP_SIGNALS = 5         # BUY and SELL signals listed in the briefing
 BRIEFING_MAX_SHIFTS = 5
+BRIEFING_EARNINGS_DAYS = 30      # list earnings releases this many calendar days ahead
+BRIEFING_MAX_EARNINGS = 5
 SENTIMENT_SHIFT_MIN = 0.25       # a move in headline tone at least this large is notable
 SIGNALS_SCRIPT = REPO_ROOT / "scripts" / "signals.mjs"
+# A Telegram chat id: a user or group number (groups and channels are negative), or a public @channel.
+CHAT_ID_RE = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$")
 SIGNALS_TIMEOUT = 60.0
 # The refresh job's steps, in order, with the environment variable carrying each outcome.
 PIPELINE_STEPS = (
@@ -429,6 +456,34 @@ def build_candles(history: pd.DataFrame, market: str, now_utc: datetime) -> list
             LOG.info("  dropped in-progress session %s", today_local)
             candles = candles[:-1]
     return candles
+
+
+def split_history(rows: list[list[Any]]) -> tuple[list[list[Any]], list[list[Any]]]:
+    """Split five years of completed sessions into recent candles and older closes.
+
+    The most recent CANDLE_WINDOW_DAYS keep full ``[date, o, h, l, c, v]`` rows;
+    everything before keeps ``[date, close]``. Both halves come from the same
+    adjusted request, so the series is continuous across the join.
+    """
+    if not rows:
+        return [], []
+    cutoff = (date.fromisoformat(rows[-1][0]) - timedelta(days=CANDLE_WINDOW_DAYS)).isoformat()
+    candles = [row for row in rows if row[0] > cutoff]
+    history = [[row[0], row[4]] for row in rows if row[0] <= cutoff][-HISTORY_MAX_ROWS:]
+    return candles, history
+
+
+def dividend_rows(history: pd.DataFrame, last_date: str | None = None) -> list[list[Any]]:
+    """Every dividend in the price history as ``[ex-date, amount per share]``, oldest first."""
+    if "Dividends" not in history.columns:
+        return []
+    by_date: dict[str, float | int] = {}
+    for stamp, amount in history["Dividends"].items():
+        value = clean_number(amount, digits=6)
+        day = stamp.strftime("%Y-%m-%d")
+        if value is not None and value > 0 and (last_date is None or day <= last_date):
+            by_date[day] = value
+    return [[day, by_date[day]] for day in sorted(by_date)][-DIVIDEND_MAX_ROWS:]
 
 
 def trailing_dividend_yield(history: pd.DataFrame, last_close: float) -> float | int | None:
@@ -682,9 +737,10 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
         f"{symbol} price history",
         lambda: fetch_history(symbol, history_cfg["period"], history_cfg["interval"], settings.request_timeout),
         settings.max_retries, settings.retry_delay, deadline)
-    candles = build_candles(history, entry["market"], now_utc)
+    candles, older = split_history(build_candles(history, entry["market"], now_utc))
     if len(candles) < MIN_CANDLES:
         raise FetchError(f"{symbol} has only {len(candles)} completed candles (minimum {MIN_CANDLES})")
+    dividends = dividend_rows(history, candles[-1][0]) if pays_out else []
     last_close = candles[-1][4]
     dividend_yield = trailing_dividend_yield(history, last_close) if pays_out else None
 
@@ -745,8 +801,11 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
         "quote": {"lastClose": last_close, "previousClose": candles[-2][4], "asOf": candles[-1][0]},
         "fundamentals": fundamentals,
         "candles": candles,
+        "history": older,
+        "dividends": dividends,
         "news": empty_news("News has not been fetched for this asset yet."),
         "forecast": empty_forecast("The forecast model has not been run for this snapshot."),
+        "events": empty_events("Events have not been fetched for this asset yet."),
     }
 
 
@@ -767,6 +826,13 @@ def upgrade_asset(asset: dict[str, Any]) -> dict[str, Any]:
         upgraded["news"] = empty_news("No news was stored in the previous snapshot.")
     if not isinstance(upgraded.get("forecast"), dict):
         upgraded["forecast"] = empty_forecast("No forecast was stored in the previous snapshot.")
+    # Schema v3: a v2 asset has one year of candles and nothing else.
+    if not isinstance(upgraded.get("history"), list):
+        upgraded["history"] = []
+    if not isinstance(upgraded.get("dividends"), list):
+        upgraded["dividends"] = []
+    if not isinstance(upgraded.get("events"), dict):
+        upgraded["events"] = empty_events("No events were stored in the previous snapshot.")
     return upgraded
 
 
@@ -779,6 +845,7 @@ def carry_over(previous: dict[str, Any], entry: dict[str, Any], reason: str) -> 
     asset["statusNote"] = f"Carried over from an earlier snapshot (last candle {previous['quote']['asOf']}): {reason}"
     asset["news"] = aged_section(previous["news"], "Carried over from an earlier snapshot.")
     asset["forecast"] = aged_section(previous["forecast"], "Carried over from an earlier snapshot.")
+    asset["events"] = aged_section(previous["events"], "Carried over from an earlier snapshot.")
     return asset
 
 
@@ -938,6 +1005,132 @@ def fetch_news(symbol: str, previous: dict[str, Any] | None, settings: argparse.
             return aged_section(previous, "The news feed could not be reached; these headlines are from an earlier run.")
         return empty_news("The news feed could not be reached.")
 
+
+
+# --------------------------------------------------------------------------- #
+# Events: earnings and ex-dividend dates (stocks only)
+# --------------------------------------------------------------------------- #
+
+def empty_events(note: str | None) -> dict[str, Any]:
+    return {"status": "unavailable", "fetchedAt": None, "nextEarnings": None,
+            "nextExDividend": None, "earnings": [], "note": note}
+
+
+NO_EVENTS_NOTES = {
+    "crypto": "Crypto has no earnings or ex-dividend dates.",
+    "index": "An index has no earnings or ex-dividend dates of its own.",
+    "etf": "Yahoo publishes no event calendar for ETFs. Ex-dividend timing can only be estimated from past payments.",
+}
+
+
+def earnings_timing(stamp: Any, market: str) -> tuple[str, str]:
+    """The exchange-local date of an earnings release and when it fell against the session.
+
+    Yahoo stamps every release in New York time. A stamp of exactly midnight is
+    its placeholder for "date known, time not known".
+    """
+    moment = pd.Timestamp(stamp)
+    if moment.tzinfo is None:
+        moment = moment.tz_localize(YAHOO_EVENT_TIMEZONE)
+    new_york = moment.tz_convert(YAHOO_EVENT_TIMEZONE)
+    if (new_york.hour, new_york.minute, new_york.second) == (0, 0, 0):
+        return new_york.strftime("%Y-%m-%d"), "unknown"
+    local = moment.tz_convert(MARKET_TIMEZONES.get(market, YAHOO_EVENT_TIMEZONE))
+    clock = local.time()
+    if clock < SESSION_OPEN.get(market, dtime(9, 30)):
+        timing = "before-open"
+    elif clock >= SESSION_CLOSE.get(market, dtime(16, 0)):
+        timing = "after-close"
+    else:
+        timing = "during-session"
+    return local.strftime("%Y-%m-%d"), timing
+
+
+def build_events(calendar: dict[str, Any] | None, earnings_frame: Any, market: str, now_utc: datetime,
+                 history_start: str | None) -> dict[str, Any]:
+    """Assemble the events block from Yahoo's calendar and its list of earnings dates.
+
+    The next earnings date takes every future candidate from both sources. When
+    they disagree by a few days (Yahoo's two endpoints often differ by one), the
+    block keeps the earliest as ``date`` and the latest as ``dateTo``. Past
+    earnings dates older than the stored price history are dropped: their moves
+    could not be measured anyway.
+    """
+    today = now_utc.date().isoformat()
+    future: dict[str, str] = {}
+    past: dict[str, str] = {}
+    if earnings_frame is not None and getattr(earnings_frame, "empty", True) is False:
+        for stamp in earnings_frame.index:
+            try:
+                day, timing = earnings_timing(stamp, market)
+                moment = pd.Timestamp(stamp)
+                moment = moment.tz_localize(YAHOO_EVENT_TIMEZONE) if moment.tzinfo is None else moment
+            except (ValueError, TypeError):
+                continue
+            target = future if moment.tz_convert("UTC").to_pydatetime() > now_utc else past
+            if day not in target or target[day] == "unknown":
+                target[day] = timing
+
+    calendar = calendar if isinstance(calendar, dict) else {}
+    candidates = dict(future)
+    for value in calendar.get("Earnings Date") or []:
+        if isinstance(value, date):
+            candidates.setdefault(value.isoformat(), "unknown")
+    upcoming = sorted(day for day in candidates if day >= today)
+    next_earnings = None
+    if upcoming:
+        first = upcoming[0]
+        limit = (date.fromisoformat(first) + timedelta(days=EARNINGS_CLUSTER_DAYS)).isoformat()
+        cluster = [day for day in upcoming if day <= limit]
+        known = [candidates[day] for day in cluster if candidates[day] != "unknown"]
+        next_earnings = {"date": first, "dateTo": cluster[-1] if len(cluster) > 1 else None,
+                         "timing": known[0] if known else "unknown"}
+
+    ex_dividend = calendar.get("Ex-Dividend Date")
+    next_ex_dividend = ({"date": ex_dividend.isoformat()}
+                        if isinstance(ex_dividend, date) and ex_dividend.isoformat() >= today else None)
+
+    earnings = [{"date": day, "timing": past[day]} for day in sorted(past, reverse=True)
+                if day < today and (history_start is None or day >= history_start)][:EVENTS_MAX_PAST]
+
+    note = None
+    if next_earnings is None:
+        note = "Yahoo lists no upcoming earnings date."
+    elif not earnings:
+        note = "No past earnings dates fall inside the stored price history, so a typical earnings move cannot be measured."
+    return {"status": "fresh", "fetchedAt": iso_timestamp(now_utc), "nextEarnings": next_earnings,
+            "nextExDividend": next_ex_dividend, "earnings": earnings, "note": note}
+
+
+def fetch_events(entry: dict[str, Any], previous: dict[str, Any] | None, settings: argparse.Namespace,
+                 now_utc: datetime, history_start: str | None) -> dict[str, Any]:
+    """The events block for one asset. Never raises; costs two requests for a stock and none otherwise."""
+    asset_class = entry["assetClass"]
+    if asset_class != "equity":
+        return empty_events(NO_EVENTS_NOTES.get(asset_class))
+    symbol = entry["ticker"]
+    ticker = yf.Ticker(symbol)
+    deadline = time.monotonic() + settings.events_timeout
+
+    def calendar_call() -> dict[str, Any]:
+        value = ticker.calendar
+        return value if isinstance(value, dict) else {}
+
+    def earnings_call() -> Any:
+        return ticker.get_earnings_dates(limit=EARNINGS_LOOKUP)
+
+    results: dict[str, Any] = {}
+    for name, call in (("calendar", calendar_call), ("earnings dates", earnings_call)):
+        try:
+            results[name] = with_retry(f"{symbol} {name}", call, settings.max_retries, settings.retry_delay, deadline)
+        except FetchError as exc:
+            LOG.info("  %s: %s unavailable (%s)", symbol, name, str(exc)[:120])
+            results[name] = None
+    if results["calendar"] is None and results["earnings dates"] is None:
+        if isinstance(previous, dict) and previous.get("status") in {"fresh", "stale"}:
+            return aged_section(previous, "The event calendar could not be refreshed in this run.")
+        return empty_events("The event calendar could not be fetched.")
+    return build_events(results["calendar"], results["earnings dates"], entry["market"], now_utc, history_start)
 
 # --------------------------------------------------------------------------- #
 # Forecast: a deliberately small Prophet model, with its own track record
@@ -1329,7 +1522,8 @@ def fetch_fx(config: dict[str, str], previous: dict[str, Any] | None, settings: 
     symbol = config["yahooSymbol"]
     deadline = time.monotonic() + settings.macro_timeout
     try:
-        history = with_retry(f"{symbol} FX rate", lambda: fetch_history(symbol, "1y", "1d", settings.request_timeout),
+        # Five years, like the asset history, so a 5-year portfolio converts each day at that day's rate.
+        history = with_retry(f"{symbol} FX rate", lambda: fetch_history(symbol, FX_HISTORY_PERIOD, "1d", settings.request_timeout),
                              settings.max_retries, settings.retry_delay, deadline)
         closes = history["Close"].dropna()
         series_by_date: dict[str, float] = {}
@@ -1476,6 +1670,79 @@ def validate_forecast(forecast: Any) -> list[str]:
     return errors
 
 
+def validate_history(history: Any, first_candle: str | None) -> list[str]:
+    if not isinstance(history, list):
+        return ["history must be a list"]
+    if len(history) > HISTORY_MAX_ROWS:
+        return [f"history has more than {HISTORY_MAX_ROWS} rows"]
+    previous_date = ""
+    for row in history:
+        ok = (isinstance(row, list) and len(row) == len(HISTORY_FIELDS) and is_iso_date(row[0])
+              and row[0] > previous_date and is_finite_number(row[1]) and row[1] > 0)
+        if not ok:
+            return ["history rows must be [date, close], strictly ascending, with positive closes"]
+        previous_date = row[0]
+    if history and first_candle:
+        if previous_date >= first_candle:
+            return ["history must end before the first candle"]
+        gap = (date.fromisoformat(first_candle) - date.fromisoformat(previous_date)).days
+        if gap > SPLICE_MAX_GAP_DAYS:
+            return [f"history ends {gap} days before the first candle (at most {SPLICE_MAX_GAP_DAYS} allowed)"]
+    return []
+
+
+def validate_dividends(dividends: Any) -> list[str]:
+    if not isinstance(dividends, list) or len(dividends) > DIVIDEND_MAX_ROWS:
+        return [f"dividends must be a list of at most {DIVIDEND_MAX_ROWS} rows"]
+    previous_date = ""
+    for row in dividends:
+        ok = (isinstance(row, list) and len(row) == 2 and is_iso_date(row[0]) and row[0] > previous_date
+              and is_finite_number(row[1]) and row[1] > 0)
+        if not ok:
+            return ["dividends rows must be [ex-date, amount], strictly ascending, with positive amounts"]
+        previous_date = row[0]
+    return []
+
+
+def validate_events(events: Any) -> list[str]:
+    if not isinstance(events, dict) or sorted(events) != sorted(EVENTS_KEYS):
+        return ["events must contain exactly the documented keys"]
+    errors: list[str] = []
+    if events["status"] not in SECTION_STATUSES:
+        errors.append(f"events.status must be one of {sorted(SECTION_STATUSES)}")
+    if events["fetchedAt"] is not None and parse_timestamp(events["fetchedAt"]) is None:
+        errors.append("events.fetchedAt must be an ISO-8601 UTC timestamp or null")
+    if events["note"] is not None and not isinstance(events["note"], str):
+        errors.append("events.note must be a string or null")
+    upcoming = events["nextEarnings"]
+    if upcoming is not None:
+        if not isinstance(upcoming, dict) or sorted(upcoming) != ["date", "dateTo", "timing"]:
+            errors.append("events.nextEarnings must contain date, dateTo and timing")
+        elif (not is_iso_date(upcoming["date"]) or upcoming["timing"] not in EARNINGS_TIMINGS
+              or (upcoming["dateTo"] is not None and (not is_iso_date(upcoming["dateTo"]) or upcoming["dateTo"] <= upcoming["date"]))):
+            errors.append("events.nextEarnings has an invalid date, dateTo or timing")
+    ex_dividend = events["nextExDividend"]
+    if ex_dividend is not None and (not isinstance(ex_dividend, dict) or sorted(ex_dividend) != ["date"]
+                                    or not is_iso_date(ex_dividend["date"])):
+        errors.append("events.nextExDividend must be {date} or null")
+    earnings = events["earnings"]
+    if not isinstance(earnings, list) or len(earnings) > EVENTS_MAX_PAST:
+        errors.append(f"events.earnings must be a list of at most {EVENTS_MAX_PAST} entries")
+    else:
+        previous_date = "9999-12-31"
+        for item in earnings:
+            if (not isinstance(item, dict) or sorted(item) != ["date", "timing"] or not is_iso_date(item["date"])
+                    or item["date"] >= previous_date or item["timing"] not in EARNINGS_TIMINGS):
+                errors.append("events.earnings entries must be {date, timing}, newest first, without repeats")
+                break
+            previous_date = item["date"]
+    if events["status"] == "unavailable" and (upcoming is not None or ex_dividend is not None or earnings):
+        errors.append("unavailable events may not carry dates")
+    if events["status"] != "unavailable" and events["fetchedAt"] is None:
+        errors.append("events that were fetched need a fetchedAt timestamp")
+    return errors
+
+
 def validate_asset(asset: Any) -> list[str]:
     if not isinstance(asset, dict):
         return ["asset is not an object"]
@@ -1526,7 +1793,8 @@ def validate_asset(asset: Any) -> list[str]:
             if value is not None and not is_finite_number(value):
                 err(f"fundamentals.{key} must be a finite number or null (got {value!r})")
 
-    for message in validate_news(asset["news"]) + validate_forecast(asset["forecast"]):
+    for message in (validate_news(asset["news"]) + validate_forecast(asset["forecast"])
+                    + validate_events(asset["events"]) + validate_dividends(asset["dividends"])):
         err(message)
 
     candles = asset["candles"]
@@ -1556,6 +1824,9 @@ def validate_asset(asset: Any) -> list[str]:
         if not is_finite_number(volume) or volume < 0:
             err(f"candle {date} has an invalid volume")
             break
+    first_candle = candles[0][0] if candles and isinstance(candles[0], list) and candles[0] else None
+    for message in validate_history(asset["history"], first_candle if is_iso_date(first_candle) else None):
+        err(message)
 
     quote = asset["quote"]
     if not isinstance(quote, dict) or sorted(quote) != ["asOf", "lastClose", "previousClose"]:
@@ -1599,7 +1870,7 @@ def validate_snapshot(snapshot: Any) -> list[str]:
     if not isinstance(snapshot, dict):
         return ["snapshot is not a JSON object"]
     errors: list[str] = []
-    for key in ("schemaVersion", "generatedAt", "fx", "macro", "candleFields", "forecastFields", "assets"):
+    for key in ("schemaVersion", "generatedAt", "fx", "macro", "candleFields", "historyFields", "forecastFields", "assets"):
         if key not in snapshot:
             errors.append(f"missing top-level key '{key}'")
     if errors:
@@ -1613,6 +1884,8 @@ def validate_snapshot(snapshot: Any) -> list[str]:
         errors.append(f"candleFields must be {CANDLE_FIELDS}")
     if snapshot["forecastFields"] != FORECAST_FIELDS:
         errors.append(f"forecastFields must be {FORECAST_FIELDS}")
+    if snapshot["historyFields"] != HISTORY_FIELDS:
+        errors.append(f"historyFields must be {HISTORY_FIELDS}")
 
     fx = snapshot["fx"]
     if not isinstance(fx, dict) or sorted(fx) != ["asOf", "base", "quote", "rate", "series"]:
@@ -1717,6 +1990,8 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
     clone["fx"]["series"] = compact(clone["fx"]["series"], 4, "fx")
     for index, asset in enumerate(clone["assets"]):
         asset["candles"] = compact(asset["candles"], 6, f"candles_{index}")
+        asset["history"] = compact(asset["history"], 6, f"history_{index}")
+        asset["dividends"] = compact(asset["dividends"], 6, f"dividends_{index}")
         asset["forecast"]["points"] = compact(asset["forecast"]["points"], 8, f"forecast_{index}")
     text = json.dumps(clone, indent=2, ensure_ascii=False, allow_nan=False)
     for token, block in replacements.items():
@@ -1875,8 +2150,15 @@ def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
         composite = row.get("composite") if is_finite_number(row.get("composite")) else None
         confidence = row.get("confidence") if row.get("confidence") in {"High", "Medium", "Low"} else None
         name = row.get("name") if isinstance(row.get("name"), str) else row["ticker"]
+        upcoming = row.get("nextEarnings")
+        next_earnings = None
+        if (isinstance(upcoming, dict) and is_iso_date(upcoming.get("date")) and isinstance(upcoming.get("days"), int)
+                and not isinstance(upcoming.get("days"), bool) and upcoming["days"] >= 0):
+            next_earnings = {"date": upcoming["date"], "days": upcoming["days"]}
         signals.append({"ticker": row["ticker"], "name": name, "verdict": verdict,
-                        "composite": composite, "confidence": confidence})
+                        "composite": composite, "confidence": confidence, "nextEarnings": next_earnings,
+                        "typicalMove": row.get("typicalMove") if is_finite_number(row.get("typicalMove")) else None,
+                        "worstMove": row.get("worstMove") if is_finite_number(row.get("worstMove")) else None})
     return signals
 
 
@@ -1983,6 +2265,17 @@ def build_briefing(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]
                 confidence = f" · {row['confidence']} confidence" if row["confidence"] else ""
                 lines.append(fmt.text(f"{position}. ") + fmt.code(row["ticker"])
                              + fmt.text(f" {row['name'][:32]} · {row['composite']:.0f}/100{confidence}"))
+        upcoming = sorted((row for row in signals if row.get("nextEarnings") and row["nextEarnings"]["days"] <= BRIEFING_EARNINGS_DAYS),
+                          key=lambda row: (row["nextEarnings"]["days"], row["ticker"]))
+        if upcoming:
+            lines += ["", fmt.bold(f"Earnings in the next {BRIEFING_EARNINGS_DAYS} days")]
+            for row in upcoming[:BRIEFING_MAX_EARNINGS]:
+                when = f" ~{short_date(row['nextEarnings']['date'])} (in {row['nextEarnings']['days']} days)"
+                if row.get("typicalMove") is not None and row.get("worstMove") is not None:
+                    size = f" \u00b7 typical move \u00b1{row['typicalMove'] * 100:.1f}%, worst {signed(row['worstMove'] * 100, 1)}%"
+                else:
+                    size = " \u00b7 too few past releases to size the move"
+                lines.append(fmt.text("\u26a0 ") + fmt.code(row["ticker"]) + fmt.text(when + size))
         tally = {verdict: sum(1 for row in signals if row["verdict"] == verdict) for verdict in ("BUY", "HOLD", "SELL")}
         lines += ["", fmt.text(f"All verdicts: {tally['BUY']} BUY · {tally['HOLD']} HOLD · {tally['SELL']} SELL")]
     elif outcome != "failed" or failed_step in {"data refresh", "commit"}:
@@ -2036,19 +2329,80 @@ def send_telegram(text: str, token: str, chat_id: str, parse_mode: str | None,
         return False, None, f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"
 
 
+def parse_chat_ids(raw: str | None) -> tuple[list[str], int]:
+    """Recipients from TELEGRAM_CHAT_ID: one id, or several separated by commas.
+
+    Spaces around each entry are stripped, empty entries ignored and repeats
+    dropped (the first one wins). Returns the valid ids and how many entries were
+    skipped because they are not chat ids. The values themselves are never logged:
+    GitHub masks the secret as a whole, not the pieces of it after a split.
+    """
+    ids: list[str] = []
+    invalid = 0
+    for entry in (raw or "").split(","):
+        value = entry.strip()
+        if not value:
+            continue
+        if not CHAT_ID_RE.match(value):
+            invalid += 1
+        elif value not in ids:
+            ids.append(value)
+    return ids, invalid
+
+
+def send_to_recipient(texts: dict[bool, str], token: str, chat_id: str, label: str,
+                      opener: Callable[..., Any] | None, pause: Callable[[float], None],
+                      redact: Callable[[str | None], str]) -> str:
+    """Send one briefing to one chat: Markdown first, plain text if Telegram rejects the formatting,
+    one retry on a network or server error. Returns 'sent', 'sent-plain' or 'failed'. Logs only `label`."""
+    for markdown in (True, False):
+        status = None
+        description = None
+        for attempt in range(2):
+            delivered, status, description = send_telegram(texts[markdown], token, chat_id, "MarkdownV2" if markdown else None, opener)
+            if delivered:
+                return "sent" if markdown else "sent-plain"
+            transient = status is None or status == 429 or status >= 500
+            if not transient or attempt == 1:
+                break
+            pause(3.0)
+        if status == 400 and markdown:
+            # Usually a formatting problem: send the same content without Markdown.
+            warn(f"Telegram rejected the Markdown briefing for {label} ({redact(description)}); retrying as plain text")
+            continue
+        warn(f"the daily briefing was not delivered to {label}: HTTP {status or '-'} {redact(description)}")
+        return "failed"
+    return "failed"
+
+
 def deliver_briefing(snapshot_path: Path, previous_path: Path | None, env: dict[str, str],
                      opener: Callable[..., Any] | None = None, now: datetime | None = None,
                      signals_source: Callable[[Path], list[dict[str, Any]] | None] = compute_signals,
                      pause: Callable[[float], None] = time.sleep) -> str:
-    """Build and send the briefing. Returns 'skipped', 'sent', 'sent-plain' or 'failed'. Never raises."""
+    """Build the briefing once and send it to every recipient in TELEGRAM_CHAT_ID.
+
+    Returns 'skipped' (not configured), 'sent' (every recipient, as Markdown),
+    'sent-plain' (every recipient, at least one as plain text), 'partial' (some
+    recipients) or 'failed' (none). Never raises.
+    """
     token = (env.get("TELEGRAM_BOT_TOKEN") or "").strip()
-    chat_id = (env.get("TELEGRAM_CHAT_ID") or "").strip()
-    if not token or not chat_id:
+    chat_ids, invalid = parse_chat_ids(env.get("TELEGRAM_CHAT_ID"))
+    if not token or (not chat_ids and not invalid):
         LOG.debug("Telegram is not configured; the daily briefing was not sent")
         return "skipped"
 
     def redact(message: str | None) -> str:
-        return (message or "no detail").replace(token, "***")[:300]
+        text = message or "no detail"
+        for secret in [token, *chat_ids]:
+            text = text.replace(secret, "***")
+        return text[:300]
+
+    if invalid:
+        warn(f"{invalid} TELEGRAM_CHAT_ID entr{'y was' if invalid == 1 else 'ies were'} skipped: not a chat id "
+             "(use numbers such as 123456789 or -1001234567890, or @channelname, separated by commas)")
+    if not chat_ids:
+        warn("the daily briefing was not sent: TELEGRAM_CHAT_ID holds no valid chat id")
+        return "failed"
 
     try:
         outcome, failed_step = pipeline_outcome(env)
@@ -2061,24 +2415,27 @@ def deliver_briefing(snapshot_path: Path, previous_path: Path | None, env: dict[
             shifts = sentiment_shifts(previous, snapshot) if previous else None
         moment = now or datetime.now(timezone.utc)
         links = briefing_links(env)
+        # Build both versions once: every recipient gets the same message.
+        texts = {markdown: build_briefing(snapshot, signals, shifts, outcome, failed_step, moment, links, BriefingFormat(markdown))
+                 for markdown in (True, False)}
 
-        for markdown in (True, False):
-            text = build_briefing(snapshot, signals, shifts, outcome, failed_step, moment, links, BriefingFormat(markdown))
-            for attempt in range(2):
-                delivered, status, description = send_telegram(text, token, chat_id, "MarkdownV2" if markdown else None, opener)
-                if delivered:
-                    LOG.info("daily briefing sent to Telegram%s", "" if markdown else " as plain text")
-                    return "sent" if markdown else "sent-plain"
-                transient = status is None or status == 429 or status >= 500
-                if not transient or attempt == 1:
-                    break
-                pause(3.0)
-            if status == 400 and markdown:
-                # Usually a formatting problem: send the same content without Markdown.
-                warn(f"Telegram rejected the Markdown briefing ({redact(description)}); retrying as plain text")
-                continue
-            warn(f"the daily briefing was not delivered: HTTP {status or '-'} {redact(description)}")
-            return "failed"
+        results = []
+        for position, chat_id in enumerate(chat_ids, start=1):
+            label = f"recipient {position} of {len(chat_ids)}"
+            try:
+                results.append(send_to_recipient(texts, token, chat_id, label, opener, pause, redact))
+            except Exception as exc:  # noqa: BLE001 - one recipient must never stop the others
+                warn(f"the daily briefing was not delivered to {label}: {type(exc).__name__}: {redact(str(exc))}")
+                results.append("failed")
+        delivered = sum(1 for result in results if result != "failed")
+        plain = any(result == "sent-plain" for result in results)
+        if delivered == len(results):
+            LOG.info("daily briefing sent to Telegram (%d recipient%s%s)", delivered, "" if delivered == 1 else "s",
+                     ", some as plain text" if plain else "")
+            return "sent-plain" if plain else "sent"
+        if delivered:
+            warn(f"the daily briefing reached {delivered} of {len(results)} recipients")
+            return "partial"
         return "failed"
     except Exception as exc:  # noqa: BLE001 - the briefing must never fail the pipeline
         warn(f"the daily briefing was not sent: {type(exc).__name__}: {redact(str(exc))}")
@@ -2090,8 +2447,10 @@ def run_notify(settings: argparse.Namespace) -> int:
     try:
         deliver_briefing(settings.output, settings.previous, dict(os.environ))
     except Exception as exc:  # noqa: BLE001 - belt and braces: deliver_briefing already never raises
-        token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-        detail = str(exc).replace(token, "***") if token else str(exc)
+        detail = str(exc)
+        secrets = [(os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip(), *parse_chat_ids(os.environ.get("TELEGRAM_CHAT_ID"))[0]]
+        for secret in filter(None, secrets):
+            detail = detail.replace(secret, "***")
         warn(f"the daily briefing was not sent: {type(exc).__name__}: {detail[:300]}")
     return 0
 
@@ -2111,10 +2470,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=float, default=10.0, help="timeout of one network request")
     parser.add_argument("--ticker-timeout", type=float, default=45.0, help="hard deadline for one ticker's prices and fundamentals")
     parser.add_argument("--news-timeout", type=float, default=15.0, help="deadline for one ticker's news")
+    parser.add_argument("--events-timeout", type=float, default=15.0, help="deadline for one stock's event calendar")
     parser.add_argument("--macro-timeout", type=float, default=30.0, help="deadline for each macro series")
     parser.add_argument("--time-budget", type=float, default=720.0, help="seconds after which remaining tickers are carried over")
     parser.add_argument("--rate-limit-trips", type=int, default=3, help="consecutive rate-limited tickers that stop the run")
     parser.add_argument("--skip-news", action="store_true", help="do not fetch news (headlines are carried over)")
+    parser.add_argument("--skip-events", action="store_true", help="do not fetch event calendars (they are carried over)")
     parser.add_argument("--skip-forecast", action="store_true", help="do not fit forecasts (projections are carried over)")
     parser.add_argument("--forecast-workers", type=int, default=2, help="processes used for model fitting")
     parser.add_argument("--forecast-timeout", type=float, default=60.0, help="longest wait for one asset's forecast, seconds")
@@ -2143,9 +2504,12 @@ def run_validation(path: Path) -> int:
     stale = [a["ticker"] for a in snapshot["assets"] if a["status"] != "fresh"]
     with_news = sum(1 for a in snapshot["assets"] if a["news"]["status"] != "unavailable")
     with_forecast = sum(1 for a in snapshot["assets"] if a["forecast"]["status"] != "unavailable")
-    LOG.info("%s is valid (schema v%d): %d assets, %d stale%s, %d with news, %d with a forecast",
+    with_events = sum(1 for a in snapshot["assets"] if a["events"]["nextEarnings"])
+    years = sum(len(a["history"]) + len(a["candles"]) for a in snapshot["assets"]) / max(1, len(snapshot["assets"]))
+    LOG.info("%s is valid (schema v%d): %d assets, %d stale%s, %d with news, %d with a forecast, "
+             "%d with an upcoming earnings date, %.0f sessions of history on average",
              path.name, snapshot["schemaVersion"], len(snapshot["assets"]), len(stale),
-             f" ({', '.join(stale)})" if stale else "", with_news, with_forecast)
+             f" ({', '.join(stale)})" if stale else "", with_news, with_forecast, with_events, years)
     return 0
 
 
@@ -2258,14 +2622,30 @@ def main(argv: list[str] | None = None) -> int:
                 asset["news"] = aged_section(old_news, "News was not refreshed in this run.") if old_news else empty_news("News was not fetched in this run.")
             else:
                 asset["news"] = fetch_news(symbol, old_news, settings, analyzer, now_utc)
+            old_events = previous_asset["events"] if previous_asset else None
+            history_start = (asset["history"] or asset["candles"])[0][0]
+            if settings.skip_events:
+                asset["events"] = (aged_section(old_events, "Events were not refreshed in this run.")
+                                   if old_events else empty_events("Events were not fetched in this run."))
+            else:
+                try:
+                    asset["events"] = run_with_deadline(
+                        f"{symbol} events",
+                        lambda e=entry, o=old_events, s=history_start: fetch_events(e, o, settings, now_utc, s),
+                        settings.events_timeout + 5)
+                except Exception as exc:  # noqa: BLE001 - events can never cost an asset its prices
+                    LOG.info("  %s: events skipped (%s)", symbol, str(exc)[:120])
+                    asset["events"] = (aged_section(old_events, "The event calendar could not be refreshed in this run.")
+                                       if old_events else empty_events("The event calendar could not be fetched."))
             refreshed.append(asset)  # forecast after the network stage, in separate processes
 
         assets.append(asset)
         news = asset["news"]
         tone = news["sentiment"]["label"] if news["sentiment"] else "-"
-        LOG.info("[%d/%d] %-8s %-5s %d candles · news %s (%d stories, %s) · %.1fs",
-                 position + 1, total, symbol, asset["status"], len(asset["candles"]),
-                 news["status"], news["clusterCount"], tone, time.monotonic() - ticker_started)
+        upcoming = (asset["events"].get("nextEarnings") or {}).get("date") or "-"
+        LOG.info("[%d/%d] %-8s %-5s %d candles + %d older closes · news %s (%d stories, %s) · earnings %s · %.1fs",
+                 position + 1, total, symbol, asset["status"], len(asset["candles"]), len(asset["history"]),
+                 news["status"], news["clusterCount"], tone, upcoming, time.monotonic() - ticker_started)
         if halted_reason is None and position + 1 < total:
             time.sleep(random.uniform(min(settings.pause_min, settings.pause_max), max(settings.pause_min, settings.pause_max)))
 
@@ -2285,6 +2665,7 @@ def main(argv: list[str] | None = None) -> int:
         "fx": fx,
         "macro": macro,
         "candleFields": CANDLE_FIELDS,
+        "historyFields": HISTORY_FIELDS,
         "forecastFields": FORECAST_FIELDS,
         "assets": assets,
     }

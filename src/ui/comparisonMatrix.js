@@ -39,6 +39,7 @@ const SECTIONS = Object.freeze([
       { id: 'verdict', lead: true },
       { id: 'compositeScore', meter: 'score' },
       { id: 'confidence' },
+      { id: 'verdictBacktest', label: 'Track record (backtest)' },
     ],
   },
   {
@@ -59,6 +60,30 @@ const SECTIONS = Object.freeze([
       { id: 'periodVolatility' },
       { id: 'maxDrawdown' },
       { id: 'periodRange', meter: 'fraction' },
+    ],
+  },
+  {
+    id: 'risk',
+    title: 'Risk',
+    note: (range) => `From the actual returns of the last ${range.label}: no bell-curve assumption`,
+    rows: [
+      { id: 'ewmaVolatility' },
+      { id: 'var95' },
+      { id: 'cvar95' },
+      { id: 'var99' },
+      { id: 'cvar99', pro: true },
+      { id: 'var95x10', pro: true },
+      { id: 'cvar95x10', pro: true },
+    ],
+  },
+  {
+    id: 'events',
+    title: 'Events',
+    note: 'Scheduled releases that can gap the price past a stop',
+    rows: [
+      { id: 'nextEarnings' },
+      { id: 'earningsMove' },
+      { id: 'nextExDividend' },
     ],
   },
   {
@@ -133,6 +158,9 @@ const SIZING_SECTION = Object.freeze({
     { id: 'positionSize', lead: true },
     { id: 'positionValue' },
     { id: 'amountAtRisk' },
+    { id: 'positionVar95' },
+    { id: 'positionCvar95', pro: true },
+    { id: 'gapRisk' },
     { id: 'riskBudget', pro: true },
     { id: 'riskPerUnit', pro: true },
   ],
@@ -250,12 +278,45 @@ export function mountComparisonMatrix(root, app) {
         return isNum(meta.returns) ? sub(`From ${meta.returns} daily returns${meta.returns < 40 ? ' · rough' : ''}`) : '';
       case 'maxDrawdown':
         return metric.value < 0 ? sub(`${h.shortDate(meta.peakDate)} to ${h.shortDate(meta.troughDate)}`) : sub('No fall from a high');
+      case 'ewmaVolatility':
+        return sub(`Equal-weighted ${h.formatPercent(meta.flat, 0)} · half-life ${h.formatNumber(meta.halfLifeDays, 0)} days`);
+      case 'var95':
+      case 'var99':
+      case 'cvar95':
+      case 'cvar99':
+      case 'var95x10':
+      case 'cvar95x10':
+        return sub(`Loss · ${meta.tail} worst of ${meta.observations} ${meta.horizon === 1 ? 'days' : '10-day windows'}`);
+      case 'positionVar95':
+      case 'positionCvar95':
+        return sub(`${h.formatPercent(meta.fraction, 1)} of the position · stop risks ${h.formatAmount(meta.amountAtRisk)}`);
       case 'periodRange':
         return sub(`Low ${h.formatAmount(h.money(meta.low, meta.currency).value)} · High ${h.formatAmount(h.money(meta.high, meta.currency).value)}`);
       case 'headlineTone':
         return sub(`${metric.value > 0 ? '+' : ''}${h.formatNumber(metric.value, 2)} on a −1 to +1 scale · ${meta.basis} stor${meta.basis === 1 ? 'y' : 'ies'}${meta.stale ? ' · old headlines' : ''}`);
-      case 'forecast30d':
-        return sub(`≈ ${amount(meta.endPrice, meta.currency)} by ${h.shortDate(meta.endDate)} · 80% band ${h.signedPercent(meta.lowerChange, 0)} to ${h.signedPercent(meta.upperChange, 0)}${meta.stale ? ' · older run' : ''}`);
+      case 'forecast30d': {
+        const earnings = app.trace(asset.ticker, 'nextEarnings');
+        const warning = earnings && earnings.status === 'ok' && earnings.meta.insideForecast
+          ? `<span class="cell__sub cell__sub--reason">⚠ Earnings ~${esc(h.shortDate(earnings.meta.date))} fall inside this window: the projection knows nothing about them</span>` : '';
+        return sub(`≈ ${amount(meta.endPrice, meta.currency)} by ${h.shortDate(meta.endDate)} · 80% band ${h.signedPercent(meta.lowerChange, 0)} to ${h.signedPercent(meta.upperChange, 0)}${meta.stale ? ' · older run' : ''}`) + warning;
+      }
+      case 'nextEarnings': {
+        const when = `~${h.shortDate(meta.date)}${meta.dateTo ? ` or ${h.shortDate(meta.dateTo)}` : ''}`;
+        const timing = { 'before-open': 'before the open', 'during-session': 'in session', 'after-close': 'after the close', unknown: 'time unknown' }[meta.timing] ?? '';
+        const scope = meta.insideSizing ? '⚠ inside the sizing horizon' : meta.insideForecast ? 'inside the 30-day projection' : `${meta.tradingDays} trading days away`;
+        return sub(`${when} · ${timing} · ${scope}`);
+      }
+      case 'earningsMove':
+        return sub(`Worst ${h.signedPercent(meta.worst, 1)} · ${h.formatNumber(meta.ratio, 1)}× a normal day · ${meta.count} releases`);
+      case 'verdictBacktest': {
+        const buy = meta.bands.BUY;
+        const verdictWord = meta.meaningful ? (metric.value > 0 ? 'a modest edge' : 'pointed the wrong way') : 'no reliable edge';
+        return sub(`BUY days ${h.signedPercent(buy.mean, 1)} vs ${h.signedPercent(meta.base.mean, 1)} on all days (${meta.horizon} sessions) · ${verdictWord} · ${meta.n} days`);
+      }
+      case 'nextExDividend':
+        return sub(`${h.shortDate(meta.date)}${meta.estimated ? ' (estimated)' : ''}${isNum(meta.dropFraction) ? ` · price drop ≈ ${h.formatPercent(meta.dropFraction, 2)}` : ''}`);
+      case 'gapRisk':
+        return sub(`Worst earnings fall ${h.formatPercent(-meta.worstFall, 1)} · stop risks ${h.formatAmount(meta.amountAtRisk)}${meta.inside ? ' · ⚠ earnings inside the horizon' : ''}`);
       case 'forecastBacktest':
         return sub(`Assuming no change missed by ${h.formatPercent(meta.naiveMape, 1)}${meta.beatsNaive ? ' · model was closer' : ' · the model added nothing'}`);
       default:
@@ -286,7 +347,8 @@ export function mountComparisonMatrix(root, app) {
   function metricCell(section, row, asset, state, comparison) {
     const metric = app.trace(asset.ticker, row.id);
     if (!metric) {
-      return '<td><div class="cell cell--static cell--na"><span class="cell__value">–</span></div></td>';
+      const pending = row.id === 'verdictBacktest' && app.backtest().status !== 'error';
+      return `<td><div class="cell cell--static cell--na"><span class="cell__value">${pending ? '<span class="cell__sub">Replaying past days in the background…</span>' : '–'}</span></div></td>`;
     }
     const label = rowLabel(row);
     let bar = '';
@@ -952,7 +1014,8 @@ export function mountComparisonMatrix(root, app) {
     const structural = next.snapshot !== previous.snapshot || next.selected !== previous.selected
       || next.currency !== previous.currency || next.mode !== previous.mode
       || next.account !== previous.account || next.live.fx !== previous.live.fx
-      || next.warnings !== previous.warnings || next.range !== previous.range;
+      || next.warnings !== previous.warnings || next.range !== previous.range
+      || next.compute.backtest !== previous.compute.backtest;
     // The matrix is only rebuilt while it is the visible view; otherwise it is marked stale
     // and rebuilt once when the user comes back to it.
     if (next.view !== 'compare') {

@@ -6,7 +6,7 @@
  *   {
  *     id, label,
  *     value,            // number | string (labels such as a verdict) | null
- *     unit,             // index | ratio | pct | currency | score | shares | label
+ *     unit,             // index | ratio | pct | currency | score | shares | label | days
  *     status,           // "ok" | "na"
  *     naReason,         // why the value is unavailable (null when ok)
  *     tone,             // healthy | neutral | caution | risky | null
@@ -27,7 +27,7 @@
 
 import { isNum } from './precisionMath.js';
 
-export const UNITS = Object.freeze(['index', 'ratio', 'pct', 'currency', 'score', 'shares', 'label']);
+export const UNITS = Object.freeze(['index', 'ratio', 'pct', 'currency', 'score', 'shares', 'label', 'days']);
 export const TONES = Object.freeze(['healthy', 'neutral', 'caution', 'risky']);
 
 const NON_FINITE_REASON = 'The calculation did not produce a finite number.';

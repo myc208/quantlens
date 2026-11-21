@@ -279,12 +279,27 @@ export function mountRiskSandboxModal(dialog, app) {
         <span>${esc(app.explain('monteCarlo').what)} The model assumes no trend at all: a year of returns is too little to predict the next. How widely the paths spread comes from the volatility of the selected time range. ${outcomes ? esc(explainer.healthy) : ''}</span>
       </div>`;
 
+    const earnings = app.trace(ticker, 'nextEarnings');
+    const earningsMove = app.trace(ticker, 'earningsMove');
+    const eventWarning = earnings && earnings.status === 'ok' && earnings.meta.insideSimulation.some(Boolean) ? `
+      <div class="banner banner--warning" role="note">
+        ${h.toneMark('caution')}
+        <div>
+          <p class="banner__title">${esc(ticker)} reports earnings around ${esc(h.shortDate(earnings.meta.date))}, about ${earnings.meta.tradingDays} trading days from now</p>
+          <p>These paths contain no earnings jump.${earningsMove && earningsMove.status === 'ok'
+    ? ` On past release days ${esc(ticker)} moved ${esc(h.formatPercent(earningsMove.value, 1))} either way (median), and fell as much as ${esc(h.formatPercent(-earningsMove.meta.worst, 1))}.` : ''} A gap can open below the stop.</p>
+        </div>
+      </div>` : '';
     const html = `
+      ${eventWarning}
       <div class="${stale ? 'is-stale' : ''}" data-role="simulation">
       <div>
         <div class="sandbox__block-title">
           <h3>Range of outcomes for ${esc(ticker)}</h3>
-          <span class="field__hint">${h.formatNumber(params.paths, 0)} simulated paths · prices in ${esc(asset.currency)} · volatility ${h.formatPercent(params.sigmaAnnual, 0)} a year, from the last ${esc(range.label)} · ${params.driftMode === 'zero' ? 'no trend assumed' : `the last ${esc(range.label)}'s trend assumed`}</span>
+          <span class="field__hint">${h.formatNumber(params.paths, 0)} simulated paths · prices in ${esc(asset.currency)} · ${params.model === 'bootstrap'
+    ? `real days from the last ${esc(range.label)}, resampled in ${params.blockLength}-day blocks and rescaled to today's volatility of ${h.formatPercent(params.sigmaAnnual, 0)} a year (${h.formatPercent(params.sampleSigmaAnnual, 0)} on average)`
+    : `normal model, volatility ${h.formatPercent(params.sigmaAnnual, 0)} a year from the last ${esc(range.label)}`} · ${params.driftMode === 'zero' ? 'no trend assumed' : `the last ${esc(range.label)}'s trend assumed`}</span>
+          ${params.fallbackNote ? `<p class="field__hint">${esc(params.fallbackNote)}</p>` : ''}
         </div>
         <div class="chart">
           <div class="chart__plot" data-role="fan" tabindex="0" role="img" aria-label="${esc(summary)}"></div>

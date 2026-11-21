@@ -139,10 +139,13 @@ export function mountLeaderboardView(root, app) {
   function assetCell(row) {
     const { asset } = row;
     const market = asset.market === 'CRYPTO' ? 'Crypto' : asset.market;
+    const earnings = app.trace(asset.ticker, 'nextEarnings');
+    const soon = earnings && earnings.status === 'ok' && earnings.meta.insideForecast
+      ? `<span class="chip chip--event" title="${esc(`Earnings around ${earnings.meta.date}: ${earnings.meta.tradingDays} trading days away`)}">Earnings ${esc(h.formatNumber(earnings.value, 0))}d</span>` : '';
     return `
       <th scope="row">
         <div class="board__asset">
-          <span class="board__ticker">${esc(asset.ticker)}<span class="chip">${esc(market)}</span></span>
+          <span class="board__ticker">${esc(asset.ticker)}<span class="chip">${esc(market)}</span>${soon}</span>
           <span class="board__name" title="${esc(asset.name)}">${esc(asset.name)}</span>
         </div>
       </th>`;
@@ -215,6 +218,16 @@ export function mountLeaderboardView(root, app) {
     for (const cell of root.querySelectorAll(selector)) cell.setAttribute('aria-current', 'true');
   }
 
+  /** One line on how the verdict has done across the whole watchlist, once the worker has replayed it. */
+  function backtestLine() {
+    const job = app.backtest();
+    if (!job.result) return job.status === 'running' ? '<p class="matrix__sub">Replaying the verdict over five years in the background…</p>' : '';
+    const s = job.result.summary;
+    if (!s.assets) return '';
+    const pct = (value) => esc(h.signedPercent(value, 2));
+    return `<p class="matrix__sub"><strong>Verdict track record</strong> (price-based half, ${s.horizon} sessions ahead, ${s.assets} assets): BUY days ${pct(s.buy.mean)}, HOLD ${pct(s.hold.mean)}, SELL ${pct(s.sell.mean)}, against ${pct(s.all.mean)} on all days. Mean rank IC ${esc(h.formatNumber(s.meanIc, 2))}; positive for ${s.positiveIc} of ${s.assets}.</p>`;
+  }
+
   function render() {
     const state = store.getState();
     if (!state.snapshot) {
@@ -257,6 +270,7 @@ export function mountLeaderboardView(root, app) {
           <div>
             <h1 class="matrix__title" id="leaderboard-title">Leaderboard</h1>
             <p class="matrix__sub">${rows.length} of ${total} assets${filtered ? ' (filtered)' : ''} · sorted by ${esc(sortedBy.label)} · amounts in ${esc(state.currency)} · period columns cover the last ${esc(range.label)}</p>
+            ${backtestLine()}
           </div>
           <div class="toolbar-actions">
             ${sort.key !== DEFAULT_SORT.key || sort.direction !== DEFAULT_SORT.direction ? '<button type="button" class="btn btn--sm" data-action="reset-sort" data-key="board|reset-sort">Sort by Composite</button>' : ''}
@@ -320,7 +334,8 @@ export function mountLeaderboardView(root, app) {
   store.subscribe((next, previous) => {
     const structural = next.snapshot !== previous.snapshot || next.filters !== previous.filters
       || next.selected !== previous.selected || next.currency !== previous.currency
-      || next.range !== previous.range || next.mode !== previous.mode || next.live.fx !== previous.live.fx;
+      || next.range !== previous.range || next.mode !== previous.mode || next.live.fx !== previous.live.fx
+      || next.compute.backtest !== previous.compute.backtest;
     if (next.view !== previous.view) {
       if (next.view === 'leaderboard' && (dirty || structural)) render();
       else if (structural) dirty = true;

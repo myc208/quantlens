@@ -36,6 +36,8 @@ import { startLiveFeeds } from './services/liveFeedService.js';
 import { getExplainer } from './services/glossaryService.js';
 import { createWorkerService, createJobRunner, jobKey } from './services/workerService.js';
 import { analyzeTechnicals, analyzeWindow } from './engines/technicalEngine.js';
+import { analyzeRisk, positionTailRisk } from './engines/riskEngine.js';
+import { analyzeEvents, gapRisk } from './engines/eventEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
 import { advise } from './engines/advisorEngine.js';
@@ -103,7 +105,11 @@ const RANGE_INFO = Object.freeze({
   '3m': Object.freeze({ id: '3m', short: '3M', label: '3 months', title: '3 months' }),
   '6m': Object.freeze({ id: '6m', short: '6M', label: '6 months', title: '6 months' }),
   '1y': Object.freeze({ id: '1y', short: '1Y', label: 'year', title: '1 year' }),
+  '5y': Object.freeze({ id: '5y', short: '5Y', label: '5 years', title: '5 years' }),
 });
+
+/** Ranges long enough for the full-year correlation rule (at least 60 overlapping returns). */
+const FULL_CORRELATION_RANGES = new Set(['1y', '5y']);
 
 /** Escape text for safe insertion into HTML. Every dynamic string goes through this. */
 function esc(value) {
@@ -172,6 +178,7 @@ function formatMetric(metric, { withCurrency = false, native = false } = {}) {
     case 'index': return formatNumber(value, 1);
     case 'pct': return SIGNED_IDS.has(metric.id) ? signedPercent(value, 1) : formatPercent(value, 1);
     case 'shares': return formatUnits(value);
+    case 'days': return `${formatNumber(value, 0)} ${value === 1 ? 'day' : 'days'}`;
     case 'currency': {
       const sourceCurrency = metric.meta ? metric.meta.currency : null;
       const shown = native ? { value, currency: sourceCurrency } : money(value, sourceCurrency);
@@ -243,7 +250,9 @@ function analyseAsset(asset, fxRate, now) {
   // Context only: neither of these ever reaches the verdict.
   const sentiment = analyzeSentiment(asset, { now });
   const forecast = analyzeForecast(asset);
-  return { asset, technical, fundamental, advisor, sentiment, forecast };
+  // Scheduled events: earnings and ex-dividend dates, and the typical earnings-day move.
+  const events = analyzeEvents(asset, { now });
+  return { asset, technical, fundamental, advisor, sentiment, forecast, events };
 }
 
 function verdicts() {
@@ -273,7 +282,9 @@ function windowFor(ticker, range = store.getState().range) {
   const key = `${ticker}|${info.id}`;
   let cached = windows.get(key);
   if (!cached) {
-    const series = sliceSeries(analysis.asset.series, info.id);
+    // 5Y reads the long close-only series; every shorter range is cut from the year of candles.
+    const source = info.id === '5y' ? analysis.asset.longSeries : analysis.asset.series;
+    const series = sliceSeries(source, info.id);
     const result = analyzeWindow(analysis.asset, series, info.label);
     cached = Object.freeze({
       range: info.id,
@@ -281,6 +292,8 @@ function windowFor(ticker, range = store.getState().range) {
       series,
       asset: { ...analysis.asset, series },
       metrics: result.metrics,
+      // EWMA volatility and historical VaR/CVaR over the same window.
+      risk: analyzeRisk(analysis.asset, series, info.label),
       from: result.from,
       to: result.to,
       observations: result.observations,
@@ -347,7 +360,7 @@ function priceMetric(ticker) {
 /* ------------------------------------------------------------------ */
 
 const EMPTY_COMPARISON = Object.freeze({
-  assets: [], tickers: [], fx: null, sizings: {}, sizingList: [],
+  assets: [], tickers: [], fx: null, sizings: {}, sizingList: [], tailRisks: {},
   correlation: analyzeCorrelation([]), heat: portfolioHeat([], null, 'USD'),
 });
 let correlationMemo = { key: null, value: null };
@@ -375,7 +388,7 @@ function comparison() {
     correlationMemo = {
       key: selectionKey,
       value: analyzeCorrelation(windowed, {
-        minOverlap: info.id === '1y' ? CORR_CONFIG.minOverlap : CORR_CONFIG.minWindowOverlap,
+        minOverlap: FULL_CORRELATION_RANGES.has(info.id) ? CORR_CONFIG.minOverlap : CORR_CONFIG.minWindowOverlap,
         windowLabel: info.label,
       }),
     };
@@ -403,7 +416,16 @@ function comparison() {
     return sizing;
   });
   const heat = portfolioHeat(sizingList, state.account, state.currency);
-  const value = { assets, tickers: assets.map((asset) => asset.ticker), fx, sizings, sizingList, correlation, heat, range: info };
+  // One-day 95% VaR and CVaR of each suggested position, from the selected range's returns.
+  const tailRisks = {};
+  for (const asset of assets) {
+    tailRisks[asset.ticker] = {
+      ...positionTailRisk({ sizing: sizings[asset.ticker], risk: windowFor(asset.ticker, info.id).risk, accountCurrency: state.currency }),
+      // An earnings gap can open below the stop: the loss of a gap like the worst one on record.
+      gapRisk: gapRisk({ sizing: sizings[asset.ticker], events: analyses.get(asset.ticker).events, accountCurrency: state.currency }),
+    };
+  }
+  const value = { assets, tickers: assets.map((asset) => asset.ticker), fx, sizings, sizingList, tailRisks, correlation, heat, range: info };
   comparisonMemo = { key, value };
   return value;
 }
@@ -477,6 +499,7 @@ function portfolioRequest(state) {
       ticker: view.asset.ticker,
       currency: view.asset.currency,
       assetClass: view.asset.assetClass,
+      market: view.asset.market,
       series: { dates: view.series.dates, close: view.series.close },
     };
   });
@@ -524,6 +547,29 @@ function schedulePortfolio(delay = 140) {
   }, delay);
 }
 
+// The verdict backtest replays about 1,000 days for every asset: it runs once per snapshot,
+// in the worker, so the page is usable while it computes.
+function submitBacktest(snapshot) {
+  const assets = snapshot.assets.map((asset) => ({
+    ticker: asset.ticker,
+    assetClass: asset.assetClass,
+    series: { dates: asset.series.dates, high: asset.series.high, low: asset.series.low, close: asset.series.close },
+    longSeries: asset.longSeries,
+  }));
+  jobs.submit('backtest', jobKey('backtest', snapshot.generatedAt, assets.length), 'backtest', { assets });
+}
+
+store.subscribe((next, previous) => {
+  if (next.status === 'ready' && next.snapshot && (next.snapshot !== previous.snapshot || next.status !== previous.status)) {
+    submitBacktest(next.snapshot);
+  }
+});
+
+/** The backtest slot: the result covers the whole watchlist. */
+function backtest() {
+  return store.getState().compute.backtest;
+}
+
 // Portfolio statistics are only computed while the Portfolio view is open. Slider
 // drags arrive many times a second, so they are debounced before reaching the worker.
 store.subscribe((next, previous) => {
@@ -555,18 +601,23 @@ function traceIndex(ticker) {
   const analysis = ticker ? analyses.get(ticker) ?? null : null;
   const view = analysis ? windowFor(ticker, state.range) : null;
   const sizing = ticker ? current.sizings[ticker] ?? null : null;
+  const tail = ticker && current.tailRisks ? current.tailRisks[ticker] ?? null : null;
   const simulated = state.compute.monteCarlo.result;
   const run = ticker && simulated && simulated.ticker === ticker ? simulated : null;
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
-  const parts = [analysis, view, sizing, run, price, current.correlation, current.heat, held];
+  const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
   const index = buildTraceIndex(
-    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics] : null,
+    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics] : null,
     view ? view.metrics : null,
+    view ? view.risk.metrics : null,
+    record ? record.metrics : null,
     sizing ? sizing.metrics : null,
+    tail,
     run ? run.metrics : null,
     price,
     current.correlation.pairs,
@@ -599,6 +650,7 @@ const app = {
   requestSimulation,
   simulation,
   portfolio,
+  backtest,
   traceIndex,
   trace,
   explain: (id, profile) => getExplainer(id, profile),

@@ -27,11 +27,12 @@ import {
   traced, notAvailable, input, step, threshold, interpretation, fmtN, fmtPct,
 } from '../core/derivationTracer.js';
 import { mulberry32 } from './monteCarloEngine.js';
+import { ledoitWolf, weeklyCloses } from './riskEngine.js';
 
 export const PORTFOLIO_CONFIG = Object.freeze({
   minObservations: 15, // a 1-month window of a stock has about 20 daily returns
   maxAssets: 8,
-  annualisation: Object.freeze({ equity: 252, crypto: 365 }),
+  annualisation: Object.freeze({ equity: 252, crypto: 365, weekly: 52 }),
   frontierSamples: 2000,
   detailedTraceAssets: 4, // above this the volatility trace summarises the cross terms
 });
@@ -228,22 +229,43 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
   const weightByTicker = new Map(normalised.map((entry) => [entry.ticker, entry.weight]));
   const w = tickers.map((ticker) => weightByTicker.get(ticker) ?? 0);
 
-  const aligned = alignPrices(list, { baseCurrency, fxSeries: fx ? fx.series : null, fxRate: fx ? fx.rate : null });
+  const fxArgs = { baseCurrency, fxSeries: fx ? fx.series : null, fxRate: fx ? fx.rate : null };
+  // Markets that close at different times (US, London, Singapore, crypto) are compared week by
+  // week: daily closes taken hours apart understate how closely the assets move.
+  const sessions = new Set(list.map((asset) => asset.market).filter(Boolean));
+  const mixedSessions = sessions.size > 1;
+  let aligned = null;
+  let frequency = 'daily';
+  if (mixedSessions) {
+    const weekly = alignPrices(list.map((asset) => ({ ...asset, series: weeklyCloses(asset.series) })), fxArgs);
+    if (weekly.ok && weekly.dates.length - 1 >= minObservations) {
+      aligned = weekly;
+      frequency = 'weekly';
+    }
+  }
+  const asynchronous = mixedSessions && frequency === 'daily';
+  if (!aligned) aligned = alignPrices(list, fxArgs);
   if (!aligned.ok) return fail(aligned.reason);
   const observations = aligned.dates.length - 1;
   if (observations < minObservations) {
-    return fail(`Only ${Math.max(0, observations)} days of overlapping returns are available; at least ${minObservations} are needed.`);
+    return fail(`Only ${Math.max(0, observations)} ${frequency === 'weekly' ? 'weeks' : 'days'} of overlapping returns are available; at least ${minObservations} are needed.`);
   }
 
   const returns = aligned.prices.map(simpleReturns);
   const moments = covarianceMatrix(returns);
   if (!moments) return fail('The return series could not be formed from these prices.');
+  // Ledoit-Wolf: pull the noisy sample covariances toward equal correlations (no effect with two assets).
+  const shrinkage = ledoitWolf(returns);
+  const baseCov = shrinkage ? shrinkage.shrunk : moments.cov;
 
-  const periods = list.every((asset) => asset.assetClass === 'crypto') ? PORTFOLIO_CONFIG.annualisation.crypto : PORTFOLIO_CONFIG.annualisation.equity;
+  let periods = list.every((asset) => asset.assetClass === 'crypto') ? PORTFOLIO_CONFIG.annualisation.crypto : PORTFOLIO_CONFIG.annualisation.equity;
+  if (frequency === 'weekly') periods = PORTFOLIO_CONFIG.annualisation.weekly;
   const mu = moments.means.map((value) => value * periods);
-  const cov = moments.cov.map((row) => row.map((value) => value * periods));
+  const cov = baseCov.map((row) => row.map((value) => value * periods));
+  const sampleCov = moments.cov.map((row) => row.map((value) => value * periods));
   const vols = cov.map((row, i) => Math.sqrt(Math.max(0, row[i])));
   const corr = cov.map((row, i) => row.map((value, j) => (i === j ? 1 : safeDiv(value, vols[i] * vols[j]))));
+  const delta = shrinkage ? shrinkage.delta : 0;
 
   const { ret, variance } = portfolioMoments(w, mu, cov);
   const volatility = safeSqrt(variance);
@@ -268,8 +290,12 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
 
   const from = aligned.dates[0];
   const to = aligned.dates[aligned.dates.length - 1];
-  const windowText = `${observations} daily returns, ${from} to ${to}`;
-  const fxNote = { none: null, history: `Prices were converted to ${baseCurrency} with each day's USD/SGD rate, so currency moves are included.`, constant: `No USD/SGD history is available, so today's rate was applied to every day. Currency moves are therefore NOT included.` }[aligned.fxMode];
+  const windowText = `${observations} ${frequency} returns, ${from} to ${to}`;
+  const fxNote = [
+    { none: null, history: `Prices were converted to ${baseCurrency} with each ${frequency === 'weekly' ? "week's" : "day's"} USD/SGD rate, so currency moves are included.`, constant: `No USD/SGD history is available, so today's rate was applied to every day. Currency moves are therefore NOT included.` }[aligned.fxMode],
+    frequency === 'weekly' ? `These markets close at different times (${[...sessions].join(', ')}), so the figures use weekly returns, which line them up.` : null,
+    asynchronous ? 'These markets close at different times, and this range has too few weeks to use weekly returns, so daily closes are used: they understate how closely the assets move. Choose 6M or longer.' : null,
+  ].filter(Boolean).join(' ') || null;
   const weightInputs = tickers.map((ticker, i) => input(`Weight of ${ticker}`, w[i], 'fraction', 'your allocation, scaled to total 100%'));
   const activeIndexes = tickers.map((_, i) => i).filter((i) => w[i] > 0);
 
@@ -277,7 +303,7 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
   const portfolioReturn = traced({
     id: 'portfolioReturn', label: 'Historical return (annualised)', value: ret, unit: 'pct', tone: null,
     meta: { periodsPerYear: periods, observations, from, to, baseCurrency },
-    formula: `Rp = Σ wᵢ × μᵢ, where μᵢ = mean daily simple return of asset i × ${periods}`,
+    formula: `Rp = Σ wᵢ × μᵢ, where μᵢ = mean ${frequency} simple return of asset i × ${periods}`,
     rawInputs: [
       ...weightInputs,
       ...tickers.map((ticker, i) => input(`Annualised mean return of ${ticker}`, mu[i], 'fraction', windowText, to)),
@@ -287,9 +313,9 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
       step('Add the contributions', activeIndexes.map((i) => fmtPct(w[i] * mu[i], 3)).join(' + '), fmtPct(ret, 3)),
     ],
     interpretation: interpretation(
-      `Held at these weights over the past period, the portfolio's average daily return scales to about ${fmtPct(ret)} a year in ${baseCurrency}.`,
+      `Held at these weights over the past period, the portfolio's average ${frequency} return scales to about ${fmtPct(ret)} a year in ${baseCurrency}.`,
       [],
-      `This describes the past ${observations} days. It is not a forecast: a single year of returns is a very noisy guide to the next.${fxNote ? ` ${fxNote}` : ''}`,
+      `This describes the past ${observations} ${frequency === 'weekly' ? 'weeks' : 'days'}. It is not a forecast: past average returns are a very noisy guide to the next period.${fxNote ? ` ${fxNote}` : ''}`,
     ),
   });
 
@@ -313,13 +339,20 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
   const portfolioVolatility = traced({
     id: 'portfolioVolatility', label: 'Portfolio volatility (annualised)', value: volatility, unit: 'pct',
     tone: volatility < 0.15 ? 'healthy' : volatility < 0.3 ? 'caution' : 'risky',
-    meta: { variance, periodsPerYear: periods, observations, weightedAverageVolatility: weightedVol },
-    formula: 'σp = √(wᵀ Σ w) = √( Σ wᵢ² σᵢ² + Σ 2 wᵢ wⱼ Σᵢⱼ )',
+    meta: { variance, periodsPerYear: periods, observations, weightedAverageVolatility: weightedVol, frequency, shrinkage: delta },
+    formula: 'σp = √(wᵀ Σ w) = √( Σ wᵢ² σᵢ² + Σ 2 wᵢ wⱼ Σᵢⱼ ), with Σ the Ledoit-Wolf shrunk covariance',
     rawInputs: [
       ...weightInputs,
       ...tickers.map((ticker, i) => input(`Annualised volatility of ${ticker}`, vols[i], 'fraction', windowText, to)),
     ],
     steps: [
+      ...(shrinkage && tickers.length > 2
+        ? [step(
+          'Shrink the sample covariance toward equal correlations (Ledoit-Wolf); variances are kept',
+          `Σ = δ × target + (1 − δ) × sample, average correlation r̄ = ${fmtN(shrinkage.meanCorrelation, 3)}`,
+          `δ = ${fmtPct(delta, 1)}`,
+        )]
+        : []),
       ...varianceSteps,
       ...crossSteps,
       step('Portfolio variance: add every term', 'wᵀ Σ w', variance),
@@ -331,7 +364,7 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
         ? `The portfolio swings about ${fmtPct(volatility)} a year, against ${fmtPct(weightedVol)} if its assets moved in lockstep. The difference is what diversification bought.`
         : `With a single asset the portfolio's volatility is simply that asset's: ${fmtPct(volatility)} a year.`,
       [threshold('Below 15%', 'Calm', 'healthy'), threshold('15% to 30%', 'Lively', 'caution'), threshold('Above 30%', 'Rough', 'risky')],
-      `Roughly two years in three would land within plus or minus this figure of the average, if the past is a guide.${fxNote ? ` ${fxNote}` : ''}`,
+      `Roughly two years in three would land within plus or minus this figure of the average, if the past is a guide.${tickers.length > 2 ? ` The covariances were shrunk ${fmtPct(delta, 0)} of the way toward equal correlations, which tames estimation noise.` : ''}${fxNote ? ` ${fxNote}` : ''}`,
     ),
   });
 
@@ -411,8 +444,11 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
     period: { from, to },
     periodsPerYear: periods,
     fxMode: aligned.fxMode,
+    frequency,
+    asynchronous,
+    shrinkage: { delta, meanCorrelation: shrinkage ? shrinkage.meanCorrelation : null },
     baseCurrency,
-    stats: { means: mu, volatilities: vols, covariance: cov, correlation: corr },
+    stats: { means: mu, volatilities: vols, covariance: cov, correlation: corr, sampleCovariance: sampleCov },
     contributions,
     metrics: { portfolioReturn, portfolioVolatility, sharpeRatio, diversificationRatio, riskFreeRate },
   };
