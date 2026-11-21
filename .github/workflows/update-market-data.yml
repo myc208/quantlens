@@ -182,7 +182,7 @@ jobs:
       id-token: write
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment_retry.outputs.page_url }}
     steps:
       - name: Check out the default branch (including the fresh snapshot)
         uses: actions/checkout@v7
@@ -207,6 +207,22 @@ jobs:
         with:
           path: _site
 
+      # deploy-pages looks the artifact up through the Actions API, which can lag a
+      # moment behind the upload ("No artifacts named github-pages were found",
+      # 21 Nov 2026). The upload itself succeeded, so the fix is to ask again a little
+      # later. Only the retry may fail the job.
       - name: Deploy
         id: deployment
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      - name: Wait for the artifact to become visible
+        if: steps.deployment.outcome == 'failure'
+        run: |
+          echo "::warning::The first deployment attempt failed; retrying in 30 seconds."
+          sleep 30
+
+      - name: Deploy (retry)
+        id: deployment_retry
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@v5
