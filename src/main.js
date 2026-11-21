@@ -38,6 +38,9 @@ import { createWorkerService, createJobRunner, jobKey } from './services/workerS
 import { analyzeTechnicals, analyzeWindow } from './engines/technicalEngine.js';
 import { analyzeRisk, positionTailRisk } from './engines/riskEngine.js';
 import { analyzeEvents, gapRisk } from './engines/eventEngine.js';
+import { analyzeRegime, describeRegime } from './engines/regimeEngine.js';
+import { analyzeFactors, benchmarkFor } from './engines/factorEngine.js';
+import { analyzeLiquidity } from './engines/liquidityEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
 import { advise } from './engines/advisorEngine.js';
@@ -55,6 +58,7 @@ import { mountPortfolioSandbox } from './ui/portfolioSandbox.js';
 import { mountDerivationDrawer } from './ui/derivationDrawer.js';
 import { mountRiskSandboxModal } from './ui/riskSandboxModal.js';
 import { mountCommandPalette } from './ui/commandPalette.js';
+import { mountRegimeBanner } from './ui/regimeBanner.js';
 
 /* ------------------------------------------------------------------ */
 /* Store and URL state                                                 */
@@ -92,8 +96,9 @@ const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'
 const TONES = ['healthy', 'neutral', 'caution', 'risky'];
 const TONE_WORDS = { healthy: 'healthy', neutral: 'neutral', caution: 'caution', risky: 'risky' };
 const MULTIPLE_IDS = new Set(['evEbitda', 'trailingPE', 'forwardPE', 'priceToBook', 'debtToEquity']);
+const FINE_PERCENT_IDS = new Set(['spreadEstimate', 'rangeSpread', 'volumeShare']);
 // Changes read better with an explicit sign: "+4.2%" cannot be mistaken for a level.
-const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown']);
+const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown', 'relativeStrength1m', 'relativeStrength3m']);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 /**
@@ -110,6 +115,8 @@ const RANGE_INFO = Object.freeze({
 
 /** Ranges long enough for the full-year correlation rule (at least 60 overlapping returns). */
 const FULL_CORRELATION_RANGES = new Set(['1y', '5y']);
+// The market a portfolio's beta is measured against (V3.1).
+const PORTFOLIO_BENCHMARK = '^GSPC';
 
 /** Escape text for safe insertion into HTML. Every dynamic string goes through this. */
 function esc(value) {
@@ -176,8 +183,13 @@ function formatMetric(metric, { withCurrency = false, native = false } = {}) {
   switch (unit) {
     case 'score': return formatNumber(value, 0);
     case 'index': return formatNumber(value, 1);
-    case 'pct': return SIGNED_IDS.has(metric.id) ? signedPercent(value, 1) : formatPercent(value, 1);
-    case 'shares': return formatUnits(value);
+    case 'pct':
+      if (SIGNED_IDS.has(metric.id)) return signedPercent(value, 1);
+      // Spreads and shares of daily volume are often far below 0.1%.
+      if (FINE_PERCENT_IDS.has(metric.id)) return formatPercent(value, value === 0 || value >= 0.001 ? 2 : value >= 0.0001 ? 3 : 4);
+      return formatPercent(value, 1);
+    // An average volume is a count of units per day, not a holding: whole units read better.
+    case 'shares': return metric.id === 'averageVolume' ? formatNumber(value, 0) : formatUnits(value);
     case 'days': return `${formatNumber(value, 0)} ${value === 1 ? 'day' : 'days'}`;
     case 'currency': {
       const sourceCurrency = metric.meta ? metric.meta.currency : null;
@@ -242,6 +254,8 @@ const h = Object.freeze({
 
 // ticker -> { asset, technical, fundamental, advisor, sentiment, forecast }
 const analyses = new Map();
+// The market regime: one reading per snapshot, shared by every view.
+let regimeAnalysis = analyzeRegime(null);
 
 function analyseAsset(asset, fxRate, now) {
   const technical = analyzeTechnicals(asset);
@@ -252,7 +266,9 @@ function analyseAsset(asset, fxRate, now) {
   const forecast = analyzeForecast(asset);
   // Scheduled events: earnings and ex-dividend dates, and the typical earnings-day move.
   const events = analyzeEvents(asset, { now });
-  return { asset, technical, fundamental, advisor, sentiment, forecast, events };
+  // Liquidity from the last 20 sessions: volume, traded value, Amihud and the tick-floor spread.
+  const liquidity = analyzeLiquidity(asset, { fxRate });
+  return { asset, technical, fundamental, advisor, sentiment, forecast, events, liquidity };
 }
 
 function verdicts() {
@@ -286,6 +302,18 @@ function windowFor(ticker, range = store.getState().range) {
     const source = info.id === '5y' ? analysis.asset.longSeries : analysis.asset.series;
     const series = sliceSeries(source, info.id);
     const result = analyzeWindow(analysis.asset, series, info.label);
+    // Beta, R², idiosyncratic volatility and relative strength against the asset's benchmark,
+    // over the same window (the benchmark is never benchmarked itself, so this recurses once).
+    const benchmarkTicker = benchmarkFor(analysis.asset);
+    const benchmarkView = benchmarkTicker && analyses.has(benchmarkTicker) ? windowFor(benchmarkTicker, info.id) : null;
+    const factors = analyzeFactors({
+      asset: analysis.asset,
+      series,
+      benchmark: benchmarkView ? analyses.get(benchmarkTicker).asset : null,
+      benchmarkSeries: benchmarkView ? benchmarkView.series : null,
+      windowLabel: info.label,
+      minOverlap: FULL_CORRELATION_RANGES.has(info.id) ? CORR_CONFIG.minOverlap : CORR_CONFIG.minWindowOverlap,
+    });
     cached = Object.freeze({
       range: info.id,
       info,
@@ -294,6 +322,7 @@ function windowFor(ticker, range = store.getState().range) {
       metrics: result.metrics,
       // EWMA volatility and historical VaR/CVaR over the same window.
       risk: analyzeRisk(analysis.asset, series, info.label),
+      factors,
       from: result.from,
       to: result.to,
       observations: result.observations,
@@ -411,6 +440,7 @@ function comparison() {
       comparedCount: assets.length,
       meanCorrelation: correlation.meanByTicker[asset.ticker],
       correlationIds: correlation.pairsByTicker[asset.ticker] ?? [],
+      liquidity: analysis.liquidity.summary,
     });
     sizings[asset.ticker] = sizing;
     return sizing;
@@ -504,11 +534,21 @@ function portfolioRequest(state) {
     };
   });
   const mix = weights.map((entry) => `${entry.ticker}:${entry.weight}`).join(',');
+  // The S&P 500 over the same window, for the portfolio's beta.
+  const market = windowFor(PORTFOLIO_BENCHMARK, info.id);
+  const benchmark = market ? {
+    ticker: market.asset.ticker,
+    currency: market.asset.currency,
+    assetClass: market.asset.assetClass,
+    market: market.asset.market,
+    series: { dates: market.series.dates, close: market.series.close },
+  } : null;
   return {
     key: jobKey('portfolio', state.snapshot.generatedAt, info.id, state.currency, mix, fx ? fx.rate : null, riskFree ? riskFree.yield : null),
     payload: {
       assets,
       weights,
+      benchmark,
       baseCurrency: state.currency,
       fx: fx ? { rate: fx.rate, series: state.snapshot.fx.series } : null,
       riskFree,
@@ -607,14 +647,15 @@ function traceIndex(ticker) {
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
   const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
-  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record];
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
   const index = buildTraceIndex(
-    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics] : null,
+    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics, analysis.liquidity.metrics] : null,
     view ? view.metrics : null,
     view ? view.risk.metrics : null,
+    view ? view.factors.metrics : null,
     record ? record.metrics : null,
     sizing ? sizing.metrics : null,
     tail,
@@ -623,6 +664,7 @@ function traceIndex(ticker) {
     current.correlation.pairs,
     current.heat,
     held ? held.metrics : null,
+    regimeAnalysis.metrics,
   );
   indexCache.set(cacheKey, { parts, index });
   return index;
@@ -651,6 +693,8 @@ const app = {
   simulation,
   portfolio,
   backtest,
+  regime: () => regimeAnalysis,
+  describeRegime: () => describeRegime(regimeAnalysis),
   traceIndex,
   trace,
   explain: (id, profile) => getExplainer(id, profile),
@@ -678,6 +722,7 @@ const elements = {
   screener: document.getElementById('screener'),
   workspace: document.getElementById('workspace'),
   status: document.getElementById('app-status'),
+  regimeBanner: document.getElementById('regime-banner'),
   matrix: document.getElementById('comparison-matrix'),
   leaderboard: document.getElementById('leaderboard'),
   portfolio: document.getElementById('portfolio'),
@@ -771,6 +816,7 @@ store.subscribe((next, previous) => {
 /* ------------------------------------------------------------------ */
 
 mountTelemetryBar(elements.telemetry, app);
+mountRegimeBanner(elements.regimeBanner, app);
 mountAppTabs(elements.tabs, app);
 mountScreenerPanel(elements.screener, app);
 mountComparisonMatrix(elements.matrix, app);
@@ -805,6 +851,7 @@ async function boot() {
     comparisonMemo = { key: null, value: EMPTY_COMPARISON };
     const now = new Date();
     for (const asset of snapshot.assets) analyses.set(asset.ticker, analyseAsset(asset, snapshot.fx.rate, now));
+    regimeAnalysis = analyzeRegime(snapshot.macro ? snapshot.macro.regime : null);
 
     store.dispatch(actions.snapshotLoaded(snapshot, snapshot.warnings));
     // Canonicalise the address bar: drop unknown tickers and malformed values from a hand-edited link.

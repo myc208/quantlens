@@ -45,6 +45,7 @@
           <p class="status-card__text">Prices and fundamentals are read from a file that is refreshed once a day.</p>
         </div>
       </div>
+      <div id="regime-banner" class="regime-banner" hidden></div>
       <section id="comparison-matrix" class="matrix view" role="tabpanel" aria-labelledby="tab-compare" tabindex="-1" hidden></section>
       <section id="leaderboard" class="view" role="tabpanel" aria-labelledby="tab-leaderboard" tabindex="-1" hidden></section>
       <section id="portfolio" class="view" role="tabpanel" aria-labelledby="tab-portfolio" tabindex="-1" hidden></section>
@@ -58,7 +59,7 @@
     </p>
     <p class="app-footer__sources">
       Daily candles, fundamentals, headlines and the US 10-year yield: Yahoo Finance, refreshed by GitHub Actions.
-      Singapore 10-year yield: MAS. Projections: Prophet, fitted in the same job and shown with their own track record.
+      Singapore 10-year yield: MAS. Market regime: the Cboe VIX, VIX9D and VIX3M indices via Yahoo Finance. Projections: Prophet, fitted in the same job and shown with their own track record.
       Live crypto: Binance public market data. USD/SGD: Frankfurter (ECB daily reference rate).
       Nothing you enter is stored or sent anywhere.
     </p>

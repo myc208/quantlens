@@ -18,7 +18,9 @@
 const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'financial companies', REIT: 'REITs', ETF: 'ETFs', INDEX: 'indices', CRYPTO: 'crypto' });
 
 // Metrics that belong to the portfolio as a whole rather than to one asset or one pair.
-const PORTFOLIO_METRICS = new Set(['portfolioReturn', 'portfolioVolatility', 'sharpeRatio', 'diversificationRatio', 'riskFreeRate']);
+const PORTFOLIO_METRICS = new Set(['portfolioReturn', 'portfolioVolatility', 'sharpeRatio', 'diversificationRatio', 'riskFreeRate', 'portfolioBeta', 'concentration', 'effectiveBets']);
+// Readings of the market as a whole (V3.1): the VIX curve.
+const MARKET_METRICS = new Set(['marketRegime', 'vixLevel', 'vixTermRatio', 'vixFrontRatio']);
 
 export function mountDerivationDrawer(root, app, scrim) {
   const { store, actions, h } = app;
@@ -238,6 +240,7 @@ export function mountDerivationDrawer(root, app, scrim) {
     let eyebrow = 'All compared assets';
     if (asset) eyebrow = `${asset.ticker} · ${asset.name}`;
     else if (PORTFOLIO_METRICS.has(drawer.trail[0])) eyebrow = 'Your portfolio';
+    else if (MARKET_METRICS.has(drawer.trail[0])) eyebrow = 'Whole market · VIX curve';
     const scrollTop = lastRenderedId === metric.id ? (root.querySelector('.drawer__body') || {}).scrollTop : 0;
 
     root.innerHTML = `

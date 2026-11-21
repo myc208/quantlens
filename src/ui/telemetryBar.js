@@ -1,7 +1,7 @@
 /**
  * telemetryBar.js: the sticky bar at the top of the page.
  *
- *   [brand] [BTC live] [ETH live] [feed status] [USD/SGD] [US 10Y] [SG 10Y] [data age]   [USD|SGD] [Guided|Pro]
+ *   [brand] [BTC live] [ETH live] [feed status] [regime] [USD/SGD] [US 10Y] [SG 10Y] [data age]   [USD|SGD] [Guided|Pro]
  *
  * It tells the user, at all times, where every number is coming from: which
  * feed is live, which has fallen back, how old the daily snapshot is and which
@@ -161,6 +161,29 @@ export function mountTelemetryBar(root, app) {
     }).join('');
   }
 
+  /** The market regime from the VIX curve. A button: it opens the derivation. */
+  function regimeTick() {
+    const regime = app.describeRegime();
+    const analysis = app.regime();
+    if (!regime.state) {
+      const reason = analysis.metrics.marketRegime.naReason ?? 'The VIX curve is not available.';
+      return `
+        <span class="tick" title="${h.esc(reason)}">
+          <span class="tick__label">Regime</span>
+          <span class="tick__price">N/A</span>
+        </span>`;
+    }
+    const title = `Market regime: ${regime.label.toLowerCase()}. ${regime.headline}. Context only: it changes no score, verdict or position size. Select to see how it is read.`;
+    return `
+      <button type="button" class="tick tick--button" data-trace="marketRegime" data-key="telemetry:marketRegime" data-regime="${regime.state}"
+        aria-label="${h.esc(title)}" title="${h.esc(title)}">
+        ${h.toneMark(regime.tone)}
+        <span class="tick__label">Regime</span>
+        <span class="tick__price">${h.esc(regime.label)}</span>
+        <span class="tick__meta">${h.esc(regime.pill)}</span>
+      </button>`;
+  }
+
   function dataTick(state) {
     const { snapshot } = state;
     const generated = Date.parse(snapshot.generatedAt);
@@ -198,6 +221,7 @@ export function mountTelemetryBar(root, app) {
     strip.innerHTML = [
       ...crypto.map((asset) => cryptoTick(state, asset)),
       crypto.length ? feedMarkup(state) : '',
+      regimeTick(),
       fxTick(state),
       yieldTicks(state),
       dataTick(state),
@@ -217,6 +241,13 @@ export function mountTelemetryBar(root, app) {
   }
 
   /* ---------------- wiring ---------------- */
+
+  strip.addEventListener('click', (event) => {
+    const control = event.target.closest('[data-trace]');
+    if (!control || !strip.contains(control)) return;
+    app.rememberTrigger(control.dataset.key);
+    store.dispatch(actions.openTrace(null, control.dataset.trace));
+  });
 
   store.subscribe((next, previous) => {
     if (next.currency !== previous.currency || next.mode !== previous.mode) syncControls(next);

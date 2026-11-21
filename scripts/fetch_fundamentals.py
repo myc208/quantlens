@@ -16,12 +16,13 @@ for every asset (stocks, REITs, ETFs, indices and crypto):
   the same model did over the previous 30 days (Prophet on ``log(close)``,
   weekly seasonality only, fitted by optimisation),
 
-plus two macro inputs: the US and Singapore 10-year government yields, used as
-risk-free rates, and one year of daily USD/SGD closes.
+plus three macro inputs: the US and Singapore 10-year government yields, used as
+risk-free rates; five years of daily USD/SGD closes; and the market regime, read
+from the VIX term structure (^VIX9D, ^VIX, ^VIX3M) with five years of history.
 
 With ``--notify`` it instead sends a short daily briefing about the snapshot to
-Telegram (top BUY and SELL signals, earnings in the next 30 days, notable shifts
-in headline tone, and the pipeline's status) to one chat or several:
+Telegram (the market regime, top BUY and SELL signals, earnings in the next 30
+days, notable shifts in headline tone, and the pipeline's status) to one chat or several:
 TELEGRAM_CHAT_ID may hold comma-separated ids. It never fails: missing
 credentials skip it silently, and an unreachable API is a warning.
 
@@ -127,6 +128,8 @@ NEWS_KEYS = ["status", "fetchedAt", "headlineCount", "clusterCount", "newestAt",
 CLUSTER_KEYS = ["title", "link", "publishedAt", "firstSeenAt", "duplicates", "scores", "label"]
 FORECAST_KEYS = ["status", "model", "modelVersion", "config", "trainedOn", "horizon", "backtest", "points", "note"]
 RISK_FREE_KEYS = ["name", "symbol", "yield", "asOf", "source", "status"]
+REGIME_KEYS = ["status", "asOf", "source", "symbols", "levels", "slope", "ratio", "frontRatio", "state",
+               "inverted", "invertedStreak", "rules", "historyFields", "history", "note"]
 EVENTS_KEYS = ["status", "fetchedAt", "nextEarnings", "nextExDividend", "earnings", "note"]
 EARNINGS_TIMINGS = {"before-open", "during-session", "after-close", "unknown"}
 
@@ -206,6 +209,24 @@ MAS_YIELD_URL = "https://eservices.mas.gov.sg/statistics/fdanet/BenchmarkPricesA
 MAS_FIELD_PREFIX = "ctl00$ContentPlaceHolder1$"
 MAS_STALE_LIMIT_DAYS = 10        # an older MAS value is replaced by the US proxy
 YIELD_BOUNDS = (-0.02, 0.25)
+
+# Market regime: the VIX term structure. VIX is the market's 30-day implied volatility of the
+# S&P 500; VIX9D the 9-day and VIX3M the 3-month equivalent. Normally the curve slopes up
+# (contango: more time, more uncertainty). When the 30-day level rises above the 3-month one
+# the curve is inverted: traders pay more for protection now than later, a sign of stress.
+REGIME_SYMBOLS = {"short": "^VIX9D", "mid": "^VIX", "long": "^VIX3M"}
+REGIME_LEVEL_KEYS = ["vix9d", "vix", "vix3m"]
+REGIME_HISTORY_FIELDS = ["date", "vix9d", "vix", "vix3m"]
+REGIME_STATES = {"normal", "elevated", "stressed"}
+REGIME_RULES = {
+    "elevatedLevel": 20.0,   # VIX at or above this is elevated (its five-year median is about 18)
+    "elevatedRatio": 0.95,   # VIX ÷ VIX3M at or above this is a flat curve
+    "invertedRatio": 1.0,    # VIX ÷ VIX3M at or above this is an inverted curve: stressed
+}
+REGIME_HISTORY_PERIOD = "5y"
+REGIME_HISTORY_MAX_ROWS = 1400   # five years of sessions is about 1,255
+REGIME_STALE_LIMIT_DAYS = 5      # an older reading is not carried over
+REGIME_LEVEL_BOUNDS = (1.0, 200.0)
 MONTHS = {name: number for number, name in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
 
@@ -1517,6 +1538,125 @@ def build_macro(previous: dict[str, Any] | None, settings: argparse.Namespace, n
     return {"riskFree": {"USD": usd, "SGD": sgd}}
 
 
+# --------------------------------------------------------------------------- #
+# Market regime: the VIX term structure
+# --------------------------------------------------------------------------- #
+
+def classify_regime(vix: float, vix3m: float, rules: dict[str, float] = REGIME_RULES) -> str:
+    """normal | elevated | stressed, from the VIX level and the VIX ÷ VIX3M ratio.
+
+    stressed  the ratio is at or above `invertedRatio`: the curve is inverted
+    normal    VIX below `elevatedLevel` and the ratio below `elevatedRatio`
+    elevated  everything in between
+
+    The browser applies the same rules (read from the block) to the same stored
+    levels, and a test checks that the two agree on the committed snapshot.
+    """
+    ratio = vix / vix3m
+    if ratio >= rules["invertedRatio"]:
+        return "stressed"
+    if vix < rules["elevatedLevel"] and ratio < rules["elevatedRatio"]:
+        return "normal"
+    return "elevated"
+
+
+def plausible_level(value: Any) -> bool:
+    return is_finite_number(value) and REGIME_LEVEL_BOUNDS[0] <= value <= REGIME_LEVEL_BOUNDS[1]
+
+
+def empty_regime(note: str) -> dict[str, Any]:
+    return {"status": "unavailable", "asOf": None, "source": None, "symbols": dict(REGIME_SYMBOLS),
+            "levels": {key: None for key in REGIME_LEVEL_KEYS}, "slope": None, "ratio": None, "frontRatio": None,
+            "state": None, "inverted": None, "invertedStreak": None, "rules": dict(REGIME_RULES),
+            "historyFields": list(REGIME_HISTORY_FIELDS), "history": [], "note": note}
+
+
+def regime_closes(frame: pd.DataFrame, now_utc: datetime) -> dict[str, float]:
+    """Completed daily closes of one VIX index by date. Today's value is dropped until the
+    US close plus the usual buffer: before then it is an intraday level, not a close."""
+    closes: dict[str, float] = {}
+    for stamp, value in frame["Close"].items():
+        level = clean_number(value, digits=2)
+        if plausible_level(level):
+            closes[stamp.strftime("%Y-%m-%d")] = level
+    new_york = pd.Timestamp(now_utc).tz_convert(MARKET_TIMEZONES["US"])
+    today = new_york.strftime("%Y-%m-%d")
+    close_at = SESSION_CLOSE["US"]
+    if today in closes and new_york.hour * 60 + new_york.minute < close_at.hour * 60 + close_at.minute + CLOSE_BUFFER_MINUTES:
+        del closes[today]
+    return closes
+
+
+def regime_block(series: dict[str, dict[str, float]]) -> dict[str, Any]:
+    """The regime block from completed closes by role ('short', 'mid', 'long').
+
+    VIX and VIX3M decide the state and must share dates; VIX9D is context and may be
+    missing on some days (or entirely), in which case it is null there.
+    """
+    mid, long_ = series.get("mid") or {}, series.get("long") or {}
+    short = series.get("short") or {}
+    dates = sorted(set(mid) & set(long_))[-REGIME_HISTORY_MAX_ROWS:]
+    if not dates:
+        raise FetchError("VIX and VIX3M have no completed sessions in common")
+    history = [[day, short.get(day), mid[day], long_[day]] for day in dates]
+    as_of, vix9d, vix, vix3m = history[-1]
+    state = classify_regime(vix, vix3m)
+    streak = 0
+    for row in reversed(history):
+        if row[2] / row[3] < REGIME_RULES["invertedRatio"]:
+            break
+        streak += 1
+    return {
+        "status": "fresh", "asOf": as_of, "source": "yahoo", "symbols": dict(REGIME_SYMBOLS),
+        "levels": {"vix9d": vix9d, "vix": vix, "vix3m": vix3m},
+        "slope": clean_number(vix3m - vix, digits=2),
+        "ratio": clean_number(vix / vix3m, digits=6),
+        "frontRatio": clean_number(vix9d / vix, digits=6) if vix9d is not None else None,
+        "state": state, "inverted": state == "stressed", "invertedStreak": streak,
+        "rules": dict(REGIME_RULES), "historyFields": list(REGIME_HISTORY_FIELDS), "history": history,
+        "note": None if vix9d is not None else "VIX9D has no close for the latest session, so the front of the curve is not shown.",
+    }
+
+
+def fetch_regime(settings: argparse.Namespace, now_utc: datetime) -> dict[str, Any]:
+    """Five years of VIX9D, VIX and VIX3M closes: three requests sharing one deadline."""
+    deadline = time.monotonic() + settings.macro_timeout
+    series: dict[str, dict[str, float]] = {}
+    for role, symbol in REGIME_SYMBOLS.items():
+        try:
+            frame = with_retry(f"{symbol} level",
+                               lambda symbol=symbol: fetch_history(symbol, REGIME_HISTORY_PERIOD, "1d", settings.request_timeout),
+                               settings.max_retries, settings.retry_delay, deadline)
+            series[role] = regime_closes(frame, now_utc)
+        except Exception as exc:  # noqa: BLE001
+            if role != "short":
+                raise FetchError(f"{symbol} unavailable: {str(exc)[:160]}") from exc
+            warn(f"{symbol} unavailable ({str(exc)[:160]}); the regime is classified without it")
+            series[role] = {}
+    return regime_block(series)
+
+
+def build_regime(previous: dict[str, Any] | None, settings: argparse.Namespace, now_utc: datetime,
+                 fetcher: Callable[[argparse.Namespace, datetime], dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The market regime. Never raises: a fresh reading -> the previous one (stale, if at most
+    five days old) -> unavailable."""
+    try:
+        block = (fetcher or fetch_regime)(settings, now_utc)
+        errors = validate_regime(block)
+        if errors:
+            raise FetchError("; ".join(errors[:3]))
+        return block
+    except Exception as exc:  # noqa: BLE001
+        warn(f"market regime unavailable ({type(exc).__name__}: {str(exc)[:160]})")
+    macro = previous.get("macro") if isinstance(previous, dict) else None
+    old = macro.get("regime") if isinstance(macro, dict) else None
+    if isinstance(old, dict) and not validate_regime(old) and old["status"] != "unavailable":
+        age = (now_utc.date() - date.fromisoformat(old["asOf"])).days
+        if age <= REGIME_STALE_LIMIT_DAYS:
+            return {**old, "status": "stale", "note": "The VIX curve could not be refreshed in this run; this is the previous reading."}
+    return empty_regime("The VIX curve could not be read in this run.")
+
+
 def fetch_fx(config: dict[str, str], previous: dict[str, Any] | None, settings: argparse.Namespace) -> dict[str, Any]:
     """Latest USD/SGD rate plus one year of daily closes (for multi-currency portfolio maths)."""
     symbol = config["yahooSymbol"]
@@ -1862,6 +2002,73 @@ def validate_macro(macro: Any) -> list[str]:
                 errors.append(f"{where}.yield must be null when the rate is unavailable")
         elif not plausible_yield(entry["yield"]) or not is_iso_date(entry["asOf"]):
             errors.append(f"{where} needs a plausible yield and an asOf date")
+    # Optional, so that a snapshot written before V3.1 still validates; the pipeline always writes it.
+    if "regime" in macro:
+        errors.extend(validate_regime(macro["regime"]))
+    return errors
+
+
+def validate_regime(regime: Any) -> list[str]:
+    where = "macro.regime"
+    if not isinstance(regime, dict) or sorted(regime) != sorted(REGIME_KEYS):
+        return [f"{where} must contain exactly the documented keys"]
+    errors: list[str] = []
+    if regime["status"] not in SECTION_STATUSES:
+        errors.append(f"{where}.status must be one of {sorted(SECTION_STATUSES)}")
+    if regime["symbols"] != REGIME_SYMBOLS:
+        errors.append(f"{where}.symbols must name ^VIX9D, ^VIX and ^VIX3M")
+    if regime["historyFields"] != REGIME_HISTORY_FIELDS:
+        errors.append(f"{where}.historyFields must be {REGIME_HISTORY_FIELDS}")
+    if regime["note"] is not None and not isinstance(regime["note"], str):
+        errors.append(f"{where}.note must be a string or null")
+    rules = regime["rules"]
+    if not isinstance(rules, dict) or sorted(rules) != sorted(REGIME_RULES) \
+            or not all(is_finite_number(rules[key]) and rules[key] > 0 for key in rules):
+        return errors + [f"{where}.rules must hold the three positive thresholds"]
+    history = regime["history"]
+    if not isinstance(history, list) or len(history) > REGIME_HISTORY_MAX_ROWS:
+        errors.append(f"{where}.history must be a list of at most {REGIME_HISTORY_MAX_ROWS} rows")
+        history = []
+    last_day = ""
+    for row in history:
+        if not (isinstance(row, list) and len(row) == 4 and is_iso_date(row[0]) and row[0] > last_day
+                and plausible_level(row[2]) and plausible_level(row[3]) and (row[1] is None or plausible_level(row[1]))):
+            errors.append(f"{where}.history rows must be ascending [date, vix9d or null, vix, vix3m] with plausible levels")
+            break
+        last_day = row[0]
+    levels = regime["levels"]
+    if not isinstance(levels, dict) or sorted(levels) != sorted(REGIME_LEVEL_KEYS):
+        return errors + [f"{where}.levels must contain exactly {REGIME_LEVEL_KEYS}"]
+    reading = ("asOf", "source", "slope", "ratio", "frontRatio", "state", "inverted", "invertedStreak")
+    if regime["status"] == "unavailable":
+        if any(value is not None for value in levels.values()) or any(regime[key] is not None for key in reading):
+            errors.append(f"{where} must carry no reading when it is unavailable")
+        return errors
+    vix9d, vix, vix3m = levels["vix9d"], levels["vix"], levels["vix3m"]
+    if not (is_iso_date(regime["asOf"]) and plausible_level(vix) and plausible_level(vix3m)
+            and (vix9d is None or plausible_level(vix9d))):
+        return errors + [f"{where} needs an asOf date and plausible VIX and VIX3M levels"]
+    if not history or history[-1] != [regime["asOf"], vix9d, vix, vix3m]:
+        errors.append(f"{where}.history must end with the reported levels")
+    if not (is_finite_number(regime["slope"]) and abs(regime["slope"] - (vix3m - vix)) < 0.006):
+        errors.append(f"{where}.slope must be VIX3M − VIX")
+    if not (is_finite_number(regime["ratio"]) and abs(regime["ratio"] - vix / vix3m) < 1e-6):
+        errors.append(f"{where}.ratio must be VIX ÷ VIX3M")
+    front = regime["frontRatio"]
+    if vix9d is None:
+        if front is not None:
+            errors.append(f"{where}.frontRatio must be null without VIX9D")
+    elif not (is_finite_number(front) and abs(front - vix9d / vix) < 1e-6):
+        errors.append(f"{where}.frontRatio must be VIX9D ÷ VIX")
+    expected = classify_regime(vix, vix3m, rules)
+    if regime["state"] != expected:
+        errors.append(f"{where}.state must be {expected} for these levels and rules")
+    if regime["inverted"] is not (vix / vix3m >= rules["invertedRatio"]):
+        errors.append(f"{where}.inverted must say whether VIX ÷ VIX3M reaches the inverted ratio")
+    streak = regime["invertedStreak"]
+    if not (isinstance(streak, int) and not isinstance(streak, bool) and 0 <= streak <= len(history)) \
+            or (streak > 0) != bool(regime["inverted"]):
+        errors.append(f"{where}.invertedStreak must count the inverted sessions ending at asOf")
     return errors
 
 
@@ -1988,6 +2195,9 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
         return token
 
     clone["fx"]["series"] = compact(clone["fx"]["series"], 4, "fx")
+    regime = clone["macro"].get("regime")
+    if isinstance(regime, dict) and isinstance(regime.get("history"), list):
+        regime["history"] = compact(regime["history"], 6, "regime")
     for index, asset in enumerate(clone["assets"]):
         asset["candles"] = compact(asset["candles"], 6, f"candles_{index}")
         asset["history"] = compact(asset["history"], 6, f"history_{index}")
@@ -2025,6 +2235,16 @@ def load_previous(path: Path) -> dict[str, Any] | None:
     return previous if isinstance(previous, dict) else None
 
 
+def regime_summary(regime: Any) -> str:
+    """One plain line for logs and the step summary."""
+    if not isinstance(regime, dict) or regime.get("status") not in {"fresh", "stale"}:
+        return "unavailable"
+    levels = regime["levels"]
+    front = f"VIX9D {levels['vix9d']} · " if levels["vix9d"] is not None else ""
+    return (f"{regime['state']} ({front}VIX {levels['vix']} · VIX3M {levels['vix3m']}, "
+            f"VIX ÷ VIX3M {regime['ratio']:.3f}; {regime['status']}, {regime['asOf']})")
+
+
 def write_step_summary(snapshot: dict[str, Any], elapsed: float) -> None:
     target = os.environ.get("GITHUB_STEP_SUMMARY")
     if not target:
@@ -2041,6 +2261,7 @@ def write_step_summary(snapshot: dict[str, Any], elapsed: float) -> None:
         "",
         f"Generated {snapshot['generatedAt']} in {elapsed:.0f}s · USD/SGD {snapshot['fx']['rate']} ({snapshot['fx']['asOf']})",
         f"Risk-free: USD {rate(rates['USD'])} · SGD {rate(rates['SGD'])}",
+        f"Market regime: {regime_summary(snapshot['macro'].get('regime'))}",
         "",
         "| Ticker | Status | Candles | Last candle | Last close | Period | News | Tone | Forecast |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -2210,6 +2431,32 @@ def short_date(iso: str | None) -> str:
     return f"{moment.day} {moment.strftime('%b')}" if moment else "?"
 
 
+def ordinal(number: int) -> str:
+    suffix = "th" if 10 <= number % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{number}{suffix}"
+
+
+def regime_line(regime: Any) -> str | None:
+    """The briefing's first line: the market regime from the VIX curve. None for a snapshot
+    written before V3.1 (it has no regime block at all)."""
+    if regime is None:
+        return None
+    if not isinstance(regime, dict) or regime.get("status") not in {"fresh", "stale"}:
+        return "⚪ Market regime unavailable: the VIX curve could not be read"
+    vix, vix3m = regime["levels"]["vix"], regime["levels"]["vix3m"]
+    if regime["state"] == "stressed":
+        streak = regime["invertedStreak"] or 1
+        run = "first inverted session" if streak == 1 else f"{ordinal(streak)} session in a row"
+        line = f"🔴 Market regime: stressed · VIX curve inverted (VIX {vix:.1f} above VIX3M {vix3m:.1f}), {run}"
+    else:
+        shape = "flat" if regime["ratio"] >= regime["rules"]["elevatedRatio"] else "in contango"
+        mark = "🟡" if regime["state"] == "elevated" else "🟢"
+        line = f"{mark} Market regime: {regime['state']} · VIX {vix:.1f}, curve {shape} (VIX3M {vix3m:.1f})"
+    if regime["status"] == "stale":
+        line += f" · reading of {short_date(regime['asOf'])}"
+    return line
+
+
 def briefing_links(env: dict[str, str]) -> list[tuple[str, str]]:
     """The site and the workflow run, derived from GitHub's own variables (none locally)."""
     repository = (env.get("GITHUB_REPOSITORY") or "").strip()
@@ -2228,6 +2475,13 @@ def build_briefing(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]
                    now: datetime, links: list[tuple[str, str]], fmt: BriefingFormat) -> str:
     """The message text. `shifts` is None when there was nothing to compare against."""
     lines = [fmt.bold("QuantLens daily briefing"), fmt.text(now.strftime("%a %d %b %Y").replace(" 0", " "))]
+    # The regime follows the same rule as the signals: data that failed a check is not reported.
+    held_back = outcome == "failed" and failed_step not in {"data refresh", "commit"}
+    if isinstance(snapshot, dict) and not held_back:
+        macro = snapshot.get("macro")
+        line = regime_line(macro.get("regime") if isinstance(macro, dict) else None)
+        if line:
+            lines.append(fmt.text(line))
 
     assets = snapshot.get("assets", []) if isinstance(snapshot, dict) else []
     stale = [asset["ticker"] for asset in assets if asset.get("status") != "fresh"]
@@ -2565,6 +2819,8 @@ def main(argv: list[str] | None = None) -> int:
     for currency, entry in macro["riskFree"].items():
         shown = "unavailable" if entry["yield"] is None else f"{entry['yield'] * 100:.2f}%"
         LOG.info("risk-free %s: %s [%s] %s", currency, shown, entry["status"], entry["name"])
+    macro["regime"] = build_regime(previous, settings, now_utc)
+    LOG.info("market regime: %s, %d sessions of history", regime_summary(macro["regime"]), len(macro["regime"]["history"]))
 
     assets: list[dict[str, Any]] = []
     refreshed: list[dict[str, Any]] = []

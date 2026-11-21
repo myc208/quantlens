@@ -82,6 +82,7 @@ export function mountPortfolioSandbox(root, app) {
   const results = root.querySelector('[data-role="results"]');
 
   const pct = (value, digits = 1) => h.formatPercent(value, digits);
+  const listNames = (names) => (names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
   const weightText = (value) => `${h.formatNumber(value, Number.isInteger(value) ? 0 : 2)}%`;
 
   /* ------------------------------------------------------------------ */
@@ -238,14 +239,46 @@ export function mountPortfolioSandbox(root, app) {
     if (rateMeta.status === 'proxy') rateNote = `${rateName} · used as a stand-in`;
     else if (rateMeta.status === 'stale') rateNote = `${rateName} · older reading`;
     if (rateMeta.asOf) rateNote += ` · ${h.shortDate(rateMeta.asOf)}`;
-    const periods = analysis.periodsPerYear ? `× ${analysis.periodsPerYear} days a year` : 'annualised';
+    const unit = analysis.frequency === 'weekly' ? 'weekly' : 'daily';
+    const periods = analysis.periodsPerYear ? `× ${analysis.periodsPerYear} ${unit === 'weekly' ? 'weeks' : 'days'} a year` : 'annualised';
+    const beta = metrics.portfolioBeta;
+    const betaNote = beta && beta.status === 'ok'
+      ? `Beta-adjusted exposure ${pct(beta.value, 0)} of capital · ${beta.meta.frequency}` : '';
+    const concentration = metrics.concentration;
+    let concentrationNote = '';
+    if (concentration && concentration.status === 'ok') {
+      const meta = concentration.meta;
+      if (meta.crowded) concentrationNote = `${listNames(meta.crowd)} move as one`;
+      else if (meta.dominant) concentrationNote = `Mostly ${meta.dominant} on its own`;
+      else concentrationNote = 'No dominant common driver';
+    }
+    const bets = metrics.effectiveBets;
     return `
       <div class="stat-grid">
         ${tile(metrics.sharpeRatio, 'Return above the risk-free rate, per unit of risk', { lead: true })}
-        ${tile(metrics.portfolioReturn, `Average daily return ${periods}`)}
-        ${tile(metrics.portfolioVolatility, `From ${analysis.observations} daily returns`)}
+        ${tile(metrics.portfolioReturn, `Average ${unit} return ${periods}`)}
+        ${tile(metrics.portfolioVolatility, `From ${analysis.observations} ${unit} returns`)}
         ${tile(metrics.diversificationRatio, '1.00 means no benefit from mixing')}
+        ${beta ? tile(beta, betaNote) : ''}
+        ${concentration ? tile(concentration, concentrationNote) : ''}
+        ${bets && state.mode === 'pro' ? tile(bets, bets.status === 'ok' ? `From ${bets.meta.holdings} holdings` : '') : ''}
         ${tile(rate, rateNote)}
+      </div>`;
+  }
+
+  /** A plain warning when several holdings are one bet in disguise. */
+  function crowdBanner(analysis) {
+    const metric = analysis.metrics.concentration;
+    if (!metric || metric.status !== 'ok' || !metric.meta.crowded) return '';
+    const bets = analysis.metrics.effectiveBets;
+    const betsText = bets && bets.status === 'ok' ? ` The portfolio behaves like about ${h.formatNumber(bets.value, 1)} independent bets.` : '';
+    return `
+      <div class="banner banner--danger" role="note">
+        ${h.toneMark('risky')}
+        <div>
+          <p class="banner__title">One crowded bet: ${esc(listNames(metric.meta.crowd))}</p>
+          <p>${esc(metric.trace.interpretation.summary)}${esc(betsText)} When one of them falls, the others have tended to fall with it.</p>
+        </div>
       </div>`;
   }
 
@@ -272,9 +305,9 @@ export function mountPortfolioSandbox(root, app) {
       </div>`).join('');
     const table = `
       <table class="data-table pro-only">
-        <caption class="sr-only">Each asset's weight, annualised return and volatility, and its share of the portfolio's return and risk</caption>
+        <caption class="sr-only">Each asset's weight, annualised return and volatility, its share of the portfolio's return and risk, its beta to the S&amp;P 500, and its correlation with the portfolio's largest common driver</caption>
         <thead>
-          <tr><th scope="col">Asset</th><th scope="col">Weight</th><th scope="col">Return</th><th scope="col">Volatility</th><th scope="col">Adds to return</th><th scope="col">Share of risk</th></tr>
+          <tr><th scope="col">Asset</th><th scope="col">Weight</th><th scope="col">Return</th><th scope="col">Volatility</th><th scope="col">Adds to return</th><th scope="col">Share of risk</th><th scope="col">Beta</th><th scope="col">Moves with the driver</th></tr>
         </thead>
         <tbody>
           ${rows.map((row) => `
@@ -285,6 +318,8 @@ export function mountPortfolioSandbox(root, app) {
               <td>${esc(pct(row.annualVolatility, 1))}</td>
               <td>${esc(h.signedPercent(row.returnContribution, 2))}</td>
               <td>${isNum(row.riskShare) ? esc(pct(row.riskShare, 1)) : 'N/A'}</td>
+              <td>${isNum(row.beta) ? esc(h.formatNumber(row.beta, 2)) : 'N/A'}</td>
+              <td>${isNum(row.driverCorrelation) ? esc(h.formatNumber(row.driverCorrelation, 2)) : 'N/A'}</td>
             </tr>`).join('')}
         </tbody>
       </table>`;
@@ -611,6 +646,7 @@ export function mountPortfolioSandbox(root, app) {
           ${analysis.asynchronous ? '<p class="alloc__note">These markets close at different times, and this range is too short for weekly returns, so daily closes are used: correlations are understated and diversification looks better than it is. Choose 6M or longer.</p>' : ''}
         </div>
         ${tiles(analysis, state)}
+        ${crowdBanner(analysis)}
         <p class="alloc__note"><span data-role="status-line">${esc(statusLine(job))}</span>${fxNote ? ` · ${esc(fxNote)}` : ''}</p>
       </div>
       ${state.mode === 'guided' ? `

@@ -1202,5 +1202,211 @@ class SchemaV3Snapshot(unittest.TestCase):
         self.assertIn("\n        " + first + ",\n", text)
 
 
+class MarketRegime(unittest.TestCase):
+    """macro.regime: the VIX term structure, its state, fallbacks, validation and briefing line."""
+
+    @staticmethod
+    def series(rows):
+        """{role: {date: level}} from [date, vix9d, vix, vix3m] rows (None = no close that day)."""
+        out = {"short": {}, "mid": {}, "long": {}}
+        for day, short, mid, long_ in rows:
+            for role, value in (("short", short), ("mid", mid), ("long", long_)):
+                if value is not None:
+                    out[role][day] = value
+        return out
+
+    ROWS = [
+        ["2026-11-13", 17.82, 19.30, 20.62],
+        ["2026-11-16", 23.15, 22.91, 23.02],
+        ["2026-11-17", 26.70, 25.46, 24.98],
+        ["2026-11-18", 23.95, 24.56, 24.29],
+        ["2026-11-19", 29.26, 28.44, 27.03],
+        ["2026-11-20", 40.72, 35.89, 30.94],
+    ]
+
+    def block(self, rows=None):
+        return ff.regime_block(self.series(rows or self.ROWS))
+
+    def test_the_state_follows_the_published_rules_at_their_boundaries(self):
+        self.assertEqual(ff.classify_regime(25.0, 25.0), "stressed")        # VIX ÷ VIX3M exactly 1: inverted
+        self.assertEqual(ff.classify_regime(24.99, 25.0), "elevated")       # just below: flat, not inverted
+        self.assertEqual(ff.classify_regime(19.0, 20.0), "elevated")        # ratio exactly 0.95: flat curve
+        self.assertEqual(ff.classify_regime(18.99, 20.0), "normal")
+        self.assertEqual(ff.classify_regime(20.0, 25.0), "elevated")        # VIX exactly 20: elevated level
+        self.assertEqual(ff.classify_regime(19.99, 25.0), "normal")
+        self.assertEqual(ff.classify_regime(15.0, 20.0, {**ff.REGIME_RULES, "elevatedLevel": 14.0}), "elevated")
+
+    def test_a_block_reports_the_latest_session_and_counts_the_inverted_run(self):
+        block = self.block()
+        self.assertEqual(ff.validate_regime(block), [])
+        self.assertEqual(block["status"], "fresh")
+        self.assertEqual(block["asOf"], "2026-11-20")
+        self.assertEqual(block["levels"], {"vix9d": 40.72, "vix": 35.89, "vix3m": 30.94})
+        self.assertEqual(block["slope"], -4.95)                              # VIX3M − VIX
+        self.assertAlmostEqual(block["ratio"], 35.89 / 30.94, places=6)
+        self.assertAlmostEqual(block["frontRatio"], 40.72 / 35.89, places=6)
+        self.assertEqual(block["state"], "stressed")
+        self.assertTrue(block["inverted"])
+        self.assertEqual(block["invertedStreak"], 4)                         # 16 Nov was 0.995: the run starts on the 17th
+        self.assertEqual(block["history"][-1], ["2026-11-20", 40.72, 35.89, 30.94])
+        self.assertEqual(block["rules"], ff.REGIME_RULES)
+
+    def test_vix9d_is_optional_and_vix_with_vix3m_must_share_dates(self):
+        rows = [r[:] for r in self.ROWS]
+        rows[-1][1] = None                                                   # no VIX9D close on the last day
+        block = self.block(rows)
+        self.assertEqual(ff.validate_regime(block), [])
+        self.assertIsNone(block["levels"]["vix9d"])
+        self.assertIsNone(block["frontRatio"])
+        self.assertIn("VIX9D", block["note"])
+        self.assertEqual(block["state"], "stressed")                         # the state never needed VIX9D
+        lonely = self.series(self.ROWS)
+        lonely["long"] = {"2026-01-02": 20.0}
+        with self.assertRaises(ff.FetchError):
+            ff.regime_block(lonely)
+
+    def test_a_normal_day_has_no_streak(self):
+        block = self.block([["2026-11-12", 13.1, 14.2, 17.1]])
+        self.assertEqual((block["state"], block["inverted"], block["invertedStreak"]), ("normal", False, 0))
+        self.assertEqual(ff.validate_regime(block), [])
+
+    def test_todays_value_is_an_intraday_level_until_the_us_close(self):
+        index = pd.DatetimeIndex([pd.Timestamp("2026-11-19", tz="America/Chicago"), pd.Timestamp("2026-11-20", tz="America/Chicago")])
+        frame = pd.DataFrame({"Close": [28.44, 35.89]}, index=index)
+        during = datetime(2026, 11, 20, 20, 0, tzinfo=timezone.utc)          # 15:00 in New York
+        after = datetime(2026, 11, 20, 21, 25, tzinfo=timezone.utc)          # 16:25 in New York
+        self.assertEqual(ff.regime_closes(frame, during), {"2026-11-19": 28.44})
+        self.assertEqual(ff.regime_closes(frame, after), {"2026-11-19": 28.44, "2026-11-20": 35.89})
+        odd = pd.DataFrame({"Close": [float("nan"), 0.0]}, index=index)
+        self.assertEqual(ff.regime_closes(odd, after), {})
+
+    def test_a_failed_vix9d_costs_only_the_front_of_the_curve_and_a_failed_vix_costs_the_reading(self):
+        original = ff.fetch_history
+        frame = pd.DataFrame({"Close": [24.56, 28.44]}, index=pd.DatetimeIndex([pd.Timestamp("2026-11-18"), pd.Timestamp("2026-11-19")]))
+
+        def fake(symbol, *_args, **_kwargs):
+            if symbol == broken:
+                raise ValueError("empty price history")
+            return frame
+
+        try:
+            ff.fetch_history = fake
+            broken = "^VIX9D"
+            with self.assertLogs(ff.LOG, level="WARNING"):
+                block = ff.fetch_regime(settings(max_retries=1), NOW)
+            self.assertEqual(ff.validate_regime(block), [])
+            self.assertTrue(all(row[1] is None for row in block["history"]))
+            broken = "^VIX"
+            with self.assertRaises(ff.FetchError):
+                ff.fetch_regime(settings(max_retries=1), NOW)
+        finally:
+            ff.fetch_history = original
+
+    def test_a_failed_fetch_keeps_a_recent_reading_as_stale_then_gives_up(self):
+        def down(*_args):
+            raise ff.FetchError("Yahoo is down")
+
+        recent = {"macro": {"regime": self.block()}}                         # asOf 20 Nov
+        moment = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)          # 3 days later
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            kept = ff.build_regime(recent, settings(), moment, fetcher=down)
+        self.assertEqual(ff.validate_regime(kept), [])
+        self.assertEqual(kept["status"], "stale")
+        self.assertEqual(kept["levels"], recent["macro"]["regime"]["levels"])
+        self.assertIn("previous reading", kept["note"])
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            old = ff.build_regime(recent, settings(), moment + timedelta(days=3), fetcher=down)   # 6 days: too old
+        self.assertEqual(old["status"], "unavailable")
+        self.assertEqual(ff.validate_regime(old), [])
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(ff.build_regime(None, settings(), moment, fetcher=down)["status"], "unavailable")
+
+    def test_an_inconsistent_fetch_is_treated_as_a_failure(self):
+        def wrong(*_args):
+            block = self.block()
+            block["state"] = "normal"
+            return block
+
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(ff.build_regime(None, settings(), NOW, fetcher=wrong)["status"], "unavailable")
+
+    def test_validation_rejects_readings_that_do_not_add_up(self):
+        def broken(change):
+            block = copy.deepcopy(self.block())
+            change(block)
+            return ff.validate_regime(block)
+
+        self.assertTrue(broken(lambda b: b.update(state="elevated")))
+        self.assertTrue(broken(lambda b: b.update(ratio=0.9)))
+        self.assertTrue(broken(lambda b: b.update(slope=4.95)))               # sign: VIX3M − VIX
+        self.assertTrue(broken(lambda b: b.update(inverted=False)))
+        self.assertTrue(broken(lambda b: b.update(invertedStreak=0)))
+        self.assertTrue(broken(lambda b: b["levels"].update(vix=3500.0)))    # basis points, not a level
+        self.assertTrue(broken(lambda b: b["history"].append(["2026-11-19", 1.0, 20.0, 20.0])))  # not ascending
+        self.assertTrue(broken(lambda b: b["history"].pop()))                # no longer ends with the levels
+        self.assertTrue(broken(lambda b: b.update(extra=1)))
+        self.assertTrue(broken(lambda b: b.update(symbols={"mid": "^VIX"})))
+        empty = ff.empty_regime("down")
+        self.assertEqual(ff.validate_regime(empty), [])
+        empty["levels"]["vix"] = 20.0
+        self.assertTrue(ff.validate_regime(empty))
+
+    def test_macro_validation_accepts_a_snapshot_without_a_regime(self):
+        rates = {"USD": ff.risk_free_entry("US 10-year Treasury yield", "^TNX", 0.05, "2026-11-16", "yahoo", "fresh"),
+                 "SGD": ff.risk_free_entry("Singapore 10-year SGS benchmark yield", None, 0.023, "2026-11-16", "mas", "fresh")}
+        self.assertEqual(ff.validate_macro({"riskFree": rates}), [])         # written before V3.1
+        self.assertEqual(ff.validate_macro({"riskFree": rates, "regime": self.block()}), [])
+        self.assertTrue(ff.validate_macro({"riskFree": rates, "regime": {"status": "fresh"}}))
+
+    def test_the_history_renders_one_session_per_line(self):
+        snapshot = copy.deepcopy(ff.load_json(SNAPSHOT_PATH))
+        snapshot["macro"]["regime"] = self.block()
+        text = ff.render_snapshot(snapshot)
+        self.assertEqual(json.loads(text), snapshot)
+        self.assertIn('\n        ["2026-11-20",40.72,35.89,30.94]\n', text)
+
+    def test_ordinals(self):
+        self.assertEqual([ff.ordinal(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 101, 111)],
+                         ["1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "23rd", "101st", "111th"])
+
+    def test_the_briefing_line_says_the_state_in_plain_words(self):
+        stressed = self.block()
+        self.assertEqual(ff.regime_line(stressed),
+                         "🔴 Market regime: stressed · VIX curve inverted (VIX 35.9 above VIX3M 30.9), 4th session in a row")
+        first = self.block(self.ROWS[:3])                                    # 17 Nov: the first inverted day
+        self.assertTrue(ff.regime_line(first).endswith("first inverted session"))
+        flat = self.block([["2026-11-16", 23.15, 22.91, 23.02]])
+        self.assertEqual(ff.regime_line(flat), "🟡 Market regime: elevated · VIX 22.9, curve flat (VIX3M 23.0)")
+        high = self.block([["2026-10-01", 21.0, 22.0, 25.0]])
+        self.assertEqual(ff.regime_line(high), "🟡 Market regime: elevated · VIX 22.0, curve in contango (VIX3M 25.0)")
+        calm = self.block([["2026-11-12", 13.1, 14.2, 17.1]])
+        self.assertEqual(ff.regime_line(calm), "🟢 Market regime: normal · VIX 14.2, curve in contango (VIX3M 17.1)")
+        self.assertTrue(ff.regime_line({**calm, "status": "stale"}).endswith("· reading of 12 Nov"))
+        self.assertEqual(ff.regime_line(ff.empty_regime("down")), "⚪ Market regime unavailable: the VIX curve could not be read")
+        self.assertIsNone(ff.regime_line(None))                              # a snapshot from before V3.1
+
+    def test_the_regime_heads_the_briefing_and_is_escaped_for_markdown(self):
+        snapshot = {"generatedAt": "2026-11-21T11:18:28Z", "assets": [], "macro": {"regime": self.block()}}
+        signals = [{"ticker": "MU", "name": "Micron", "verdict": "BUY", "composite": 70.0, "confidence": "High"}]
+        plain = ff.build_briefing(snapshot, signals, None, "passed", None, NOW, [], ff.BriefingFormat(False)).split("\n")
+        self.assertTrue(plain[2].startswith("🔴 Market regime: stressed"))   # title, date, then the regime
+        markdown = ff.build_briefing(snapshot, signals, None, "passed", None, NOW, [], ff.BriefingFormat(True)).split("\n")
+        self.assertIn(r"\(VIX 35\.9 above VIX3M 30\.9\)", markdown[2])
+        held = ff.build_briefing(snapshot, None, None, "failed", "the browser test gate (Gate 2)", NOW, [], ff.BriefingFormat(False))
+        self.assertNotIn("Market regime", held)                              # unpublished data is not reported
+        refresh_failed = ff.build_briefing(snapshot, signals, None, "failed", "data refresh", NOW, [], ff.BriefingFormat(False))
+        self.assertIn("Market regime: stressed", refresh_failed)             # the last good snapshot's regime
+        old = {"generatedAt": "2026-11-20T00:00:00Z", "assets": [], "macro": {"riskFree": {}}}
+        self.assertNotIn("Market regime", ff.build_briefing(old, signals, None, "passed", None, NOW, [], ff.BriefingFormat(False)))
+
+    def test_the_committed_snapshot_regime_is_consistent_with_its_own_rules(self):
+        regime = ff.load_json(SNAPSHOT_PATH)["macro"].get("regime")
+        if regime is None:
+            self.skipTest("the committed snapshot predates the regime block")
+        self.assertEqual(ff.validate_regime(regime), [])
+        if regime["status"] != "unavailable":
+            self.assertGreater(len(regime["history"]), 1000)                 # five years, not one
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

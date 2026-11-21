@@ -138,6 +138,65 @@ export function sessionName(market) {
 }
 
 /**
+ * Eigenvalues and eigenvectors of a small symmetric matrix (cyclic Jacobi rotations).
+ * Exact to rounding for the at most 8 × 8 covariance matrices used here, with no
+ * dependency. Values are sorted largest first; `vectors[k]` is the unit eigenvector
+ * of `values[k]`.
+ * @param {number[][]} matrix symmetric
+ * @returns {{ values:number[], vectors:number[][], sweeps:number } | null}
+ */
+export function symmetricEigen(matrix, { tolerance = 1e-14, maxSweeps = 100 } = {}) {
+  const n = Array.isArray(matrix) ? matrix.length : 0;
+  if (n === 0 || matrix.some((row) => !Array.isArray(row) || row.length !== n || !row.every(isNum))) return null;
+  const a = matrix.map((row) => [...row]);
+  const v = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (__, j) => (i === j ? 1 : 0)));
+  let sweeps = 0;
+  for (; sweeps < maxSweeps; sweeps += 1) {
+    let off = 0;
+    let diagonal = 0;
+    for (let i = 0; i < n; i += 1) {
+      diagonal += a[i][i] * a[i][i];
+      for (let j = i + 1; j < n; j += 1) off += a[i][j] * a[i][j];
+    }
+    if (off <= tolerance * tolerance * (diagonal + 2 * off)) break;
+    for (let p = 0; p < n - 1; p += 1) {
+      for (let q = p + 1; q < n; q += 1) {
+        if (a[p][q] === 0) continue;
+        // Rotate in the (p, q) plane so that a[p][q] becomes zero.
+        const theta = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+        const t = (theta >= 0 ? 1 : -1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+        const c = 1 / Math.sqrt(t * t + 1);
+        const s = t * c;
+        for (let k = 0; k < n; k += 1) {
+          const kp = a[k][p];
+          const kq = a[k][q];
+          a[k][p] = c * kp - s * kq;
+          a[k][q] = s * kp + c * kq;
+        }
+        for (let k = 0; k < n; k += 1) {
+          const pk = a[p][k];
+          const qk = a[q][k];
+          a[p][k] = c * pk - s * qk;
+          a[q][k] = s * pk + c * qk;
+        }
+        for (let k = 0; k < n; k += 1) {
+          const kp = v[k][p];
+          const kq = v[k][q];
+          v[k][p] = c * kp - s * kq;
+          v[k][q] = s * kp + c * kq;
+        }
+      }
+    }
+  }
+  const order = Array.from({ length: n }, (_, i) => i).sort((x, y) => a[y][y] - a[x][x]);
+  return {
+    values: order.map((i) => a[i][i]),
+    vectors: order.map((i) => v.map((row) => row[i])),
+    sweeps,
+  };
+}
+
+/**
  * Ledoit-Wolf shrinkage toward a constant-correlation target ("Honey, I shrunk the
  * sample covariance matrix", 2004). The target keeps every asset's own variance and
  * replaces each correlation by the average one; δ says how far to move toward it,

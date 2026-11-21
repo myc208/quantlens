@@ -41,6 +41,9 @@ export const BOARD_COLUMNS = Object.freeze([
   { id: 'periodReturn', label: 'Return', metric: 'periodReturn', tier: 'a', first: 'descending', ranged: true },
   { id: 'periodVolatility', label: 'Volatility', metric: 'periodVolatility', tier: 'b', first: 'ascending', ranged: true },
   { id: 'maxDrawdown', label: 'Drawdown', metric: 'maxDrawdown', tier: 'c', first: 'descending', ranged: true },
+  { id: 'beta', label: 'Beta', metric: 'beta', tier: 'c', first: 'descending', ranged: true },
+  { id: 'relativeStrength3m', label: 'RS 3M', metric: 'relativeStrength3m', tier: 'c', first: 'descending' },
+  { id: 'dollarVolume', label: 'Traded value', metric: 'dollarVolume', tier: 'c', first: 'descending' },
   { id: 'headlineTone', label: 'News tone', metric: 'headlineTone', tier: 'c', first: 'descending' },
   { id: 'forecast30d', label: '30d projection', metric: 'forecast30d', tier: 'c', first: 'descending' },
 ].map((column) => Object.freeze(column)));
@@ -95,6 +98,8 @@ export function mountLeaderboardView(root, app) {
       if (column.id === 'verdict') values.verdict = metric && metric.status === 'ok' ? VERDICT_RANK[metric.value] ?? null : null;
       // Prices are compared in the display currency, so SGD and USD assets sort on one scale.
       else if (column.id === 'price') values.price = metric && metric.status === 'ok' ? h.money(metric.value, asset.currency).value : null;
+      // Traded value is compared in one currency too.
+      else if (column.id === 'dollarVolume') values.dollarVolume = metric && metric.status === 'ok' ? h.money(metric.value, metric.meta.currency).value : null;
       else values[column.id] = valueOf(metric);
     }
     return { ticker: asset.ticker, asset, metrics, values };

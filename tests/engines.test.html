@@ -190,6 +190,9 @@
     import * as risk from '../src/engines/riskEngine.js';
     import * as eventsEngine from '../src/engines/eventEngine.js';
     import * as backtest from '../src/engines/backtestEngine.js';
+    import * as regimes from '../src/engines/regimeEngine.js';
+    import * as factors from '../src/engines/factorEngine.js';
+    import * as liquidityEngine from '../src/engines/liquidityEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -1875,6 +1878,10 @@
         Object.keys(eventsEngine.analyzeEvents(anyAsset).metrics).forEach((id) => ids.add(id));
         ids.add(eventsEngine.gapRisk({ sizing: null, events: null, accountCurrency: 'USD' }).id);
         Object.keys(backtest.backtestAsset(anyAsset).metrics).forEach((id) => ids.add(id));
+        // V3.1: the market regime.
+        regimes.REGIME_METRIC_IDS.forEach((id) => ids.add(id));
+        factors.FACTOR_METRIC_IDS.forEach((id) => ids.add(id));
+        liquidityEngine.LIQUIDITY_METRIC_IDS.forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -3713,6 +3720,541 @@
         expect(storeModule.COMPUTE_JOBS).toContain('backtest');
         expect(storeModule.createInitialState('').compute.backtest.status).toBe('idle');
         expect(mathWorker.JOB_TYPES).toContain('backtest');
+      });
+    });
+
+    /* ================================================================== */
+    /* 27. V3.1 market regime: the VIX term structure                       */
+    /* ================================================================== */
+
+    // A compact block in the pipeline's format: [date, vix9d, vix, vix3m] rows.
+    function regimeBlock(rows, overrides = {}) {
+      const last = rows[rows.length - 1];
+      const ratio = last[2] / last[3];
+      const rules = { elevatedLevel: 20, elevatedRatio: 0.95, invertedRatio: 1 };
+      const state = regimes.classifyRegime(last[2], last[3], rules);
+      let streak = 0;
+      for (let i = rows.length - 1; i >= 0 && rows[i][2] / rows[i][3] >= 1; i -= 1) streak += 1;
+      return {
+        status: 'fresh', asOf: last[0], source: 'yahoo', symbols: { short: '^VIX9D', mid: '^VIX', long: '^VIX3M' },
+        levels: { vix9d: last[1], vix: last[2], vix3m: last[3] },
+        slope: Math.round((last[3] - last[2]) * 100) / 100, ratio, frontRatio: last[1] === null ? null : last[1] / last[2],
+        state, inverted: state === 'stressed', invertedStreak: streak, rules,
+        historyFields: ['date', 'vix9d', 'vix', 'vix3m'], history: rows, note: null,
+        ...overrides,
+      };
+    }
+    const NOVEMBER = [
+      ['2026-11-13', 17.82, 19.30, 20.62],
+      ['2026-11-16', 23.15, 22.91, 23.02],
+      ['2026-11-17', 26.70, 25.46, 24.98],
+      ['2026-11-18', 23.95, 24.56, 24.29],
+      ['2026-11-19', 29.26, 28.44, 27.03],
+      ['2026-11-20', 40.72, 35.89, 30.94],
+    ];
+
+    suite('market regime: reading macro.regime from the snapshot', () => {
+      test('a valid block is kept, column-wise and frozen', () => {
+        const { regime, problem } = snapshotService.normaliseRegime(regimeBlock(NOVEMBER));
+        expect(problem).toBeNull();
+        expect(regime.status).toBe('fresh');
+        expect(regime.levels).toEqual({ vix9d: 40.72, vix: 35.89, vix3m: 30.94 });
+        expect(regime.history.dates.length).toBe(6);
+        expect(regime.history.vix[5]).toBe(35.89);
+        expect(Object.isFrozen(regime.history.vix)).toBeTrue();
+      });
+      test('a snapshot from before V3.1 simply has no regime, with no warning', () => {
+        const { regime, problem } = snapshotService.normaliseRegime(undefined);
+        expect(problem).toBeNull();
+        expect(regime.status).toBe('unavailable');
+        expect(regime.note).toMatch(/before the market regime/);
+        expect(snapshotService.normaliseMacro({ riskFree: {} }).macro.regime.status).toBe('unavailable');
+      });
+      test('a malformed block becomes unavailable with a reason, never a wrong reading', () => {
+        const cases = [
+          regimeBlock(NOVEMBER, { levels: { vix9d: 40.72, vix: 3589, vix3m: 30.94 } }),        // basis points, not a level
+          regimeBlock(NOVEMBER, { asOf: '20/11/2026' }),
+          regimeBlock(NOVEMBER, { state: 'panic' }),
+          regimeBlock(NOVEMBER, { history: NOVEMBER.slice(0, 5) }),                            // does not end with the levels
+          regimeBlock(NOVEMBER, { history: [NOVEMBER[1], NOVEMBER[0], ...NOVEMBER.slice(2)] }), // out of order
+          regimeBlock(NOVEMBER, { rules: null }),
+          { status: 'sideways' },
+        ];
+        for (const raw of cases) {
+          const { regime, problem } = snapshotService.normaliseRegime(raw);
+          expect(regime.status).toBe('unavailable');
+          expect(problem).toMatch(/market regime/);
+        }
+        const down = snapshotService.normaliseRegime({ status: 'unavailable', note: 'The VIX curve could not be read in this run.' });
+        expect(down.problem).toBeNull();
+        expect(down.regime.note).toMatch(/could not be read/);
+      });
+    });
+
+    suite('regimeEngine: normal, elevated, stressed', () => {
+      test('the state follows the published rules at their boundaries (same cases as the pipeline)', () => {
+        expect(regimes.classifyRegime(25, 25)).toBe('stressed');          // ratio exactly 1: inverted
+        expect(regimes.classifyRegime(24.99, 25)).toBe('elevated');
+        expect(regimes.classifyRegime(19, 20)).toBe('elevated');          // ratio exactly 0.95: flat
+        expect(regimes.classifyRegime(18.99, 20)).toBe('normal');
+        expect(regimes.classifyRegime(20, 25)).toBe('elevated');          // VIX exactly 20
+        expect(regimes.classifyRegime(19.99, 25)).toBe('normal');
+        expect(regimes.classifyRegime(15, 20, { elevatedLevel: 14, elevatedRatio: 0.95, invertedRatio: 1 })).toBe('elevated');
+        expect(regimes.classifyRegime(null, 20)).toBeNull();
+      });
+      test('an inverted curve: ratio, slope, run length and counts, all traced', () => {
+        const { regime } = snapshotService.normaliseRegime(regimeBlock(NOVEMBER));
+        const result = regimes.analyzeRegime(regime);
+        expect(result.state).toBe('stressed');
+        expect(result.streak).toBe(4);                                     // 16 Nov was 0.995
+        const { marketRegime, vixLevel, vixTermRatio, vixFrontRatio } = result.metrics;
+        expect(marketRegime.value).toBe('Stressed');
+        expect(marketRegime.tone).toBe('risky');
+        expect(marketRegime.meta.agreesWithPipeline).toBeTrue();
+        expect(vixTermRatio.value).toBeCloseTo(35.89 / 30.94, 1e-12);
+        expect(vixTermRatio.meta.slope).toBeCloseTo(-4.95, 1e-9);
+        expect(vixTermRatio.meta.invertedYear).toBe(4);
+        expect(vixLevel.meta.dailyMove).toBeCloseTo(35.89 / Math.sqrt(252), 1e-12);
+        expect(vixLevel.meta.yearRank).toBe(1);                           // the highest of the six
+        expect(vixFrontRatio.value).toBeCloseTo(40.72 / 35.89, 1e-12);
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(marketRegime.trace.interpretation.caveat).toMatch(/Context only/);
+      });
+      test('normal and elevated days, and a percentile computed by hand', () => {
+        const calm = regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock([['2026-11-12', 13.1, 14.2, 17.1]])).regime);
+        expect(calm.state).toBe('normal');
+        expect(calm.metrics.marketRegime.tone).toBe('healthy');
+        expect(calm.streak).toBe(0);
+        const flat = regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock([['2026-11-16', 23.15, 22.91, 23.02]])).regime);
+        expect(flat.state).toBe('elevated');
+        expect(regimes.percentileRank([10, 20, 30, 40], 30)).toBe(0.75);
+        expect(regimes.percentileRank([], 30)).toBeNull();
+      });
+      test('without VIX9D only the front of the curve is N/A; without a block everything is', () => {
+        const rows = NOVEMBER.map((row, i) => (i === NOVEMBER.length - 1 ? [row[0], null, row[2], row[3]] : row));
+        const partial = regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock(rows, { note: 'VIX9D has no close for the latest session, so the front of the curve is not shown.' })).regime);
+        expect(partial.state).toBe('stressed');
+        expect(partial.metrics.vixFrontRatio.status).toBe('na');
+        expect(partial.metrics.vixFrontRatio.naReason).toMatch(/VIX9D/);
+        const none = regimes.analyzeRegime(snapshotService.normaliseRegime(undefined).regime);
+        expect(none.state).toBeNull();
+        for (const id of regimes.REGIME_METRIC_IDS) {
+          expect(none.metrics[id].status).toBe('na');
+          expect(tracer.validateTrace(none.metrics[id])).toEqual([]);
+        }
+      });
+      test('a stale reading says whose day it is', () => {
+        const { regime } = snapshotService.normaliseRegime(regimeBlock(NOVEMBER, { status: 'stale' }));
+        const result = regimes.analyzeRegime(regime);
+        expect(result.metrics.marketRegime.trace.interpretation.caveat).toMatch(/reading of 2026-11-20/);
+        expect(regimes.describeRegime(result).pill).toMatch(/2026-11-20/);
+      });
+      test('the telemetry pill and the banner text', () => {
+        const stressed = regimes.describeRegime(regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock(NOVEMBER)).regime));
+        expect(stressed.label).toBe('Stressed');
+        expect(stressed.pill).toBe('VIX 35.9 · inverted');
+        expect(stressed.headline).toBe('VIX curve inverted (VIX 35.9 above VIX3M 30.9), 4th session in a row');
+        expect(stressed.banner).toBeTrue();
+        const calm = regimes.describeRegime(regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock([['2026-11-12', 13.1, 14.2, 17.1]])).regime));
+        expect(calm.headline).toBe('VIX 14.2, curve in contango (VIX3M 17.1)');
+        expect(calm.banner).toBeFalse();
+        expect(regimes.describeRegime(regimes.analyzeRegime(null)).label).toBe('N/A');
+      });
+      test('real snapshot: the browser reads the same regime as the pipeline wrote', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const result = regimes.analyzeRegime(snapshot.macro.regime);
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        if (!raw.macro || !raw.macro.regime || raw.macro.regime.status === 'unavailable') {
+          expect(result.state).toBeNull();
+          return;
+        }
+        expect(result.state).toBe(raw.macro.regime.state);
+        expect(result.streak).toBe(raw.macro.regime.invertedStreak);
+        expect(result.metrics.vixTermRatio.value).toBeCloseTo(raw.macro.regime.ratio, 1e-6);
+        expect(snapshot.macro.regime.history.vix.length).toBeGreaterThan(1000);   // five years
+        expect(snapshot.warnings.some((warning) => /regime/.test(warning))).toBeFalse();
+      });
+    });
+
+    /* ================================================================== */
+    /* 28. V3.1 beta, R², idiosyncratic volatility, relative strength       */
+    /* ================================================================== */
+
+    // Business days from 2025-01-01 with closes built from given simple returns.
+    function seriesFrom(returns, { start = '2025-01-01', every = 'weekday', first = 100 } = {}) {
+      const dates = [];
+      const close = [first];
+      let time = Date.parse(`${start}T00:00:00Z`);
+      const accept = (d) => every === 'day' || (d.getUTCDay() !== 0 && d.getUTCDay() !== 6);
+      while (!accept(new Date(time))) time += 86400000;
+      dates.push(new Date(time).toISOString().slice(0, 10));
+      for (const r of returns) {
+        do time += 86400000; while (!accept(new Date(time)));
+        dates.push(new Date(time).toISOString().slice(0, 10));
+        close.push(close[close.length - 1] * (1 + r));
+      }
+      return { dates, close };
+    }
+    function noise(count, seed, scale) {
+      const uniform = monteCarlo.mulberry32(seed);
+      return Array.from({ length: count }, () => (uniform() - 0.5) * scale);
+    }
+
+    suite('factorEngine: beta, R² and residual risk', () => {
+      test('the regression matches NumPy least squares to the last digit', () => {
+        const fit = factors.regress([0.01, -0.02, 0.03, 0.00, 0.01, -0.015], [0.005, -0.01, 0.02, -0.005, 0.01, -0.004]);
+        expect(fit.beta).toBeCloseTo(1.5561497326203206, 1e-12);
+        expect(fit.alpha).toBeCloseTo(-0.0016497326203208545, 1e-14);
+        expect(fit.rSquared).toBeCloseTo(0.8944979203802733, 1e-12);
+        expect(fit.standardError).toBeCloseTo(0.26721585890558697, 1e-12);
+        expect(Math.sqrt(fit.residualVariance)).toBeCloseTo(0.006671483331281897, 1e-14);
+      });
+      test('identities: a series against itself, a scaled copy, and R² = 1 − unexplained ÷ total', () => {
+        const market = noise(120, 7, 0.04);
+        const self = factors.regress(market, market);
+        expect(self.beta).toBeCloseTo(1, 1e-12);
+        expect(self.rSquared).toBeCloseTo(1, 1e-12);
+        const doubled = factors.regress(market.map((r) => 2 * r + 0.001), market);
+        expect(doubled.beta).toBeCloseTo(2, 1e-12);
+        const shocks = noise(120, 8, 0.03);
+        const noisy = market.map((r, i) => 1.5 * r + shocks[i]);
+        const fit = factors.regress(noisy, market);
+        const sst = fit.varianceA * (fit.n - 1);
+        const sse = fit.residualVariance * (fit.n - 2);
+        expect(fit.rSquared).toBeCloseTo(1 - sse / sst, 1e-12);
+        expect(factors.regress([0.01, 0.02], [0.01, 0.02])).toBeNull();          // fewer than three points
+        expect(factors.regress([0.01, 0.02, 0.03], [0, 0, 0])).toBeNull();       // the benchmark never moved
+      });
+      test('each asset gets its natural benchmark, and a benchmark gets none', () => {
+        const of = (ticker, market, assetClass = 'equity') => factors.benchmarkFor({ ticker, market, assetClass });
+        expect(of('MU', 'US')).toBe('^GSPC');
+        expect(of('CSPX.L', 'UK', 'etf')).toBe('^GSPC');
+        expect(of('^IXIC', 'US', 'index')).toBe('^GSPC');
+        expect(of('D05.SI', 'SG')).toBe('^STI');
+        expect(of('ETH-USD', 'CRYPTO', 'crypto')).toBe('BTC-USD');
+        expect(of('BTC-USD', 'CRYPTO', 'crypto')).toBeNull();
+        expect(of('^GSPC', 'US', 'index')).toBeNull();
+        expect(of('^STI', 'SG', 'index')).toBeNull();
+      });
+      test('relative strength over calendar days: (1 + 10%) ÷ (1 + 5%) − 1', () => {
+        const asset = { dates: ['2026-08-21', '2026-09-01', '2026-09-21'], close: [100, 104, 110] };
+        const bench = { dates: ['2026-08-20', '2026-08-21', '2026-09-21'], close: [99, 100, 105] };
+        const rs = factors.relativeStrength(asset, bench, 31);                     // back to 21 Aug
+        expect(rs.assetReturn).toBeCloseTo(0.1, 1e-12);
+        expect(rs.benchmarkReturn).toBeCloseTo(0.05, 1e-12);
+        expect(rs.value).toBeCloseTo(1.1 / 1.05 - 1, 1e-12);
+        expect(rs.from).toBe('2026-08-21');
+        expect(factors.relativeStrength(asset, bench, 400)).toBeNull();           // no close that far back
+      });
+      test('a synthetic stock with beta 1.5 is measured as such, with a traced band', () => {
+        const market = noise(250, 11, 0.03);
+        const shocks = noise(250, 12, 0.02);
+        const stock = market.map((r, i) => 1.5 * r + shocks[i]);
+        const asset = { ticker: 'STK', market: 'US', assetClass: 'equity', currency: 'USD', series: seriesFrom(stock) };
+        const bench = { ticker: '^GSPC', market: 'US', assetClass: 'index', currency: 'USD', series: seriesFrom(market) };
+        const out = factors.analyzeFactors({ asset, series: asset.series, benchmark: bench, benchmarkSeries: bench.series });
+        const { beta, rSquared, idioVolatility } = out.metrics;
+        expect(beta.meta.frequency).toBe('daily');
+        expect(beta.value).toBeAtLeast(1.35);
+        expect(beta.value).toBeAtMost(1.65);
+        expect(beta.meta.low < 1.5 && beta.meta.high > 1.5).toBeTrue();
+        expect(rSquared.value).toBeAtLeast(0.8);
+        expect(idioVolatility.value).toBeAtMost(idioVolatility.meta.total);
+        for (const metric of Object.values(out.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('different sessions use weekly returns, and a short range says to choose 6M', () => {
+        const market = noise(250, 13, 0.02);
+        const london = { ticker: 'LDN.L', market: 'UK', assetClass: 'etf', currency: 'USD', series: seriesFrom(market.map((r) => r * 0.95)) };
+        const bench = { ticker: '^GSPC', market: 'US', assetClass: 'index', currency: 'USD', series: seriesFrom(market) };
+        const full = factors.analyzeFactors({ asset: london, series: london.series, benchmark: bench, benchmarkSeries: bench.series });
+        expect(full.metrics.beta.meta.frequency).toBe('weekly');
+        expect(full.metrics.beta.value).toBeCloseTo(0.95, 0.05);
+        const cut = (s) => snapshotService.sliceSeries(s, '3m');
+        const short = factors.analyzeFactors({ asset: london, series: cut(london.series), benchmark: bench, benchmarkSeries: cut(bench.series), windowLabel: '3 months', minOverlap: 15 });
+        expect(short.metrics.beta.status).toBe('na');
+        expect(short.metrics.beta.naReason).toMatch(/Choose 6M or longer/);
+        expect(short.metrics.relativeStrength3m.status).toBe('ok');               // relative strength keeps its own span
+      });
+      test('a benchmark explains why it has no beta', () => {
+        const coin = { ticker: 'BTC-USD', market: 'CRYPTO', assetClass: 'crypto', currency: 'USD', series: seriesFrom(noise(100, 3, 0.05), { every: 'day' }) };
+        const out = factors.analyzeFactors({ asset: coin, series: coin.series });
+        for (const id of factors.FACTOR_METRIC_IDS) {
+          expect(out.metrics[id].status).toBe('na');
+          expect(out.metrics[id].naReason).toMatch(/benchmark for crypto/);
+        }
+      });
+      test('real snapshot: every asset against its benchmark, with invariants that hold on any day', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const benchmarkTicker = factors.benchmarkFor(asset);
+          const bench = benchmarkTicker ? snapshot.byTicker[benchmarkTicker] : null;
+          const out = factors.analyzeFactors({ asset, series: asset.series, benchmark: bench, benchmarkSeries: bench ? bench.series : null });
+          for (const metric of Object.values(out.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+          const { beta, rSquared, idioVolatility, relativeStrength3m } = out.metrics;
+          if (rSquared.status === 'ok') {
+            expect(rSquared.value).toBeAtLeast(0);
+            expect(rSquared.value).toBeAtMost(1);
+            expect(idioVolatility.value).toBeAtMost(idioVolatility.meta.total * 1.01);
+          }
+          if (relativeStrength3m.status === 'ok') {
+            const { assetReturn, benchmarkReturn } = relativeStrength3m.meta;
+            expect(relativeStrength3m.value).toBeCloseTo((1 + assetReturn) / (1 + benchmarkReturn) - 1, 1e-12);
+          }
+          if (asset.market === 'UK') expect(beta.meta.frequency).toBe('weekly');
+          if (!benchmarkTicker) expect(beta.status).toBe('na');
+        }
+        // A fund holding the index it is measured against: robust on any day.
+        const voo = snapshot.byTicker.VOO;
+        const gspc = snapshot.byTicker['^GSPC'];
+        const tracked = factors.analyzeFactors({ asset: voo, series: voo.series, benchmark: gspc, benchmarkSeries: gspc.series }).metrics;
+        expect(tracked.rSquared.value).toBeAtLeast(0.95);
+        expect(tracked.beta.value).toBeCloseTo(1, 0.1);
+      });
+    });
+
+    /* ================================================================== */
+    /* 29. V3.1 portfolio beta and concentration                            */
+    /* ================================================================== */
+
+    suite('symmetric eigen-decomposition (Jacobi)', () => {
+      const A = [[4, 1, 0.5, 0.2], [1, 3, 0.3, 0.1], [0.5, 0.3, 2, 0.4], [0.2, 0.1, 0.4, 1]];
+      test('matches NumPy eigh', () => {
+        const { values, vectors } = risk.symmetricEigen(A);
+        const expected = [4.766339371741691, 2.3826023856099914, 1.9916334906696649, 0.8594247519786524];
+        values.forEach((value, i) => expect(value).toBeCloseTo(expected[i], 1e-12));
+        const v1 = vectors[0].reduce((s, x) => s + x, 0) >= 0 ? vectors[0] : vectors[0].map((x) => -x);
+        [0.8283276073361877, 0.510317604303966, 0.21670484579262497, 0.08055015501016594].forEach((x, i) => expect(v1[i]).toBeCloseTo(x, 1e-12));
+      });
+      test('orthonormal vectors that rebuild the matrix', () => {
+        const { values, vectors } = risk.symmetricEigen(A);
+        for (let i = 0; i < 4; i += 1) {
+          for (let j = 0; j < 4; j += 1) {
+            const dot = vectors[i].reduce((s, x, k) => s + x * vectors[j][k], 0);
+            expect(dot).toBeCloseTo(i === j ? 1 : 0, 1e-12);
+            const rebuilt = values.reduce((s, lambda, k) => s + lambda * vectors[k][i] * vectors[k][j], 0);
+            expect(rebuilt).toBeCloseTo(A[i][j], 1e-12);
+          }
+        }
+      });
+      test('constant correlation: λ₁ = 1 + (n − 1)ρ along the equal-weight direction', () => {
+        const n = 5;
+        const rho = 0.4;
+        const C = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (__, j) => (i === j ? 1 : rho)));
+        const { values, vectors } = risk.symmetricEigen(C);
+        expect(values[0]).toBeCloseTo(1 + (n - 1) * rho, 1e-12);
+        for (let k = 1; k < n; k += 1) expect(values[k]).toBeCloseTo(1 - rho, 1e-12);
+        for (const x of vectors[0]) expect(Math.abs(x)).toBeCloseTo(1 / Math.sqrt(n), 1e-12);
+        expect(risk.symmetricEigen([[1, 2], [3]])).toBeNull();
+      });
+    });
+
+    suite('portfolioEngine: market beta and crowding', () => {
+      const tickers4 = ['A', 'B', 'C', 'D'];
+      test('concentration matches NumPy: share, effective bets and each holding\'s tie to the driver', () => {
+        const A = [[4, 1, 0.5, 0.2], [1, 3, 0.3, 0.1], [0.5, 0.3, 2, 0.4], [0.2, 0.1, 0.4, 1]];
+        const out = portfolio.concentrationMetrics({ tickers: tickers4, w: [0.25, 0.25, 0.25, 0.25], sampleCov: A });
+        expect(out.concentration.value).toBeCloseTo(0.8503688051649178, 1e-12);
+        expect(out.effectiveBets.value).toBeCloseTo(1.6925391366528333, 1e-12);
+        [0.9042002470549073, 0.6432390528875854, 0.33453850038418437, 0.17585667655030288].forEach((x, i) => expect(out.loadings[i].correlation).toBeCloseTo(x, 1e-12));
+        expect(out.concentration.meta.crowded).toBeFalse();                    // only A is tied to the driver
+        expect(out.concentration.meta.dominant).toBe('A');
+        expect(out.concentration.tone).toBe('caution');
+        expect(out.concentration.meta.shares.reduce((s, x) => s + x, 0)).toBeCloseTo(1, 1e-12);
+      });
+      test('four holdings correlated 0.9: one bet, all named, one effective bet', () => {
+        const S = tickers4.map((_, i) => tickers4.map((__, j) => (i === j ? 0.04 : 0.036)));
+        const out = portfolio.concentrationMetrics({ tickers: tickers4, w: [0.25, 0.25, 0.25, 0.25], sampleCov: S });
+        expect(out.concentration.value).toBeCloseTo(1, 1e-12);
+        expect(out.concentration.meta.crowded).toBeTrue();
+        expect(out.concentration.meta.crowd).toEqual(tickers4);
+        for (const entry of out.loadings) expect(entry.correlation).toBeCloseTo(Math.sqrt(0.925), 1e-12);
+        expect(out.effectiveBets.value).toBeCloseTo(1, 1e-9);
+        expect(out.concentration.trace.interpretation.summary).toMatch(/A, B, C and D are effectively one bet/);
+      });
+      test('a hedge is not a crowd', () => {
+        const out = portfolio.concentrationMetrics({ tickers: ['LONG', 'HEDGE'], w: [0.5, 0.5], sampleCov: [[1, -0.9], [-0.9, 1]] });
+        expect(out.concentration.meta.crowded).toBeFalse();
+        expect(out.concentration.value).toBeAtMost(1e-12);                     // the big driver cancels out
+        expect(out.concentration.tone).toBe('healthy');
+        const single = portfolio.concentrationMetrics({ tickers: ['ONLY', 'OFF'], w: [1, 0], sampleCov: [[1, 0], [0, 1]] });
+        expect(single.concentration.naReason).toMatch(/one bet by definition/);
+      });
+      test('portfolio beta is the weighted sum of betas, measured daily in one session', () => {
+        const market = noise(200, 21, 0.03);
+        const pack = (ticker, returns, marketName = 'US') => ({ ticker, currency: 'USD', market: marketName, assetClass: 'equity', series: seriesFrom(returns) });
+        const high = pack('HIGH', market.map((r) => 2 * r));
+        const shocks = noise(200, 22, 0.002);
+        const low = pack('LOW', market.map((r, i) => 0.5 * r + shocks[i]));
+        const bench = { ...pack('^GSPC', market), assetClass: 'index' };
+        const result = portfolio.analyzePortfolio({ assets: [high, low], weights: [{ ticker: 'HIGH', weight: 50 }, { ticker: 'LOW', weight: 50 }], baseCurrency: 'USD', benchmark: bench });
+        const beta = result.metrics.portfolioBeta;
+        expect(beta.meta.frequency).toBe('daily');
+        expect(result.contributions[0].beta).toBeCloseTo(2, 1e-9);
+        const sum = beta.meta.contributions.reduce((s, row) => s + row.contribution, 0);
+        expect(beta.value).toBeCloseTo(sum, 1e-12);
+        expect(beta.value).toBeCloseTo(1 + 0.5 * result.contributions[1].beta, 1e-12);
+        expect(tracer.validateTrace(beta)).toEqual([]);
+        const none = portfolio.analyzePortfolio({ assets: [high, low], weights: [{ ticker: 'HIGH', weight: 1 }, { ticker: 'LOW', weight: 1 }], baseCurrency: 'USD' });
+        expect(none.metrics.portfolioBeta.naReason).toMatch(/not in this snapshot/);
+      });
+      test('real snapshot: a chip portfolio, with invariants that hold on any day', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const pack = (a) => ({ ticker: a.ticker, currency: a.currency, market: a.market, assetClass: a.assetClass, series: { dates: a.series.dates, close: a.series.close } });
+        const set = ['MU', 'AMD', 'SNDK', 'ORCL', 'D05.SI'].filter((ticker) => snapshot.byTicker[ticker]);
+        const result = portfolio.analyzePortfolio({
+          assets: set.map((ticker) => pack(snapshot.byTicker[ticker])),
+          weights: set.map((ticker) => ({ ticker, weight: 1 })),
+          baseCurrency: 'SGD',
+          fx: { rate: snapshot.fx.rate, series: snapshot.fx.series },
+          benchmark: pack(snapshot.byTicker['^GSPC']),
+        });
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        const { portfolioBeta, concentration, effectiveBets } = result.metrics;
+        expect(portfolioBeta.meta.frequency).toBe('weekly');                   // D05.SI closes in Singapore
+        expect(portfolioBeta.value).toBeCloseTo(portfolioBeta.meta.contributions.reduce((s, row) => s + row.contribution, 0), 1e-12);
+        expect(concentration.meta.shares.reduce((s, x) => s + x, 0)).toBeCloseTo(1, 1e-9);
+        expect(concentration.meta.matrix).toBe('sample');
+        expect(effectiveBets.value).toBeAtLeast(1);
+        expect(effectiveBets.value).toBeAtMost(set.length);
+        expect(concentration.meta.crowded).toBe(concentration.value >= 0.6 && concentration.meta.crowd.length >= 2);
+      });
+    });
+
+    /* ================================================================== */
+    /* 30. V3.1 liquidity and tradability                                   */
+    /* ================================================================== */
+
+    // An asset with 25 sessions of given closes, highs, lows and volumes.
+    function liquidAsset({ closes, highs, lows, volumes, ...overrides }) {
+      const asset = makeAsset({ closes, highs: highs ?? closes.map((c) => c * 1.002), lows: lows ?? closes.map((c) => c * 0.998), ...overrides });
+      asset.series.volume = volumes;
+      return asset;
+    }
+
+    suite('liquidityEngine: volume, traded value, Amihud and the spread', () => {
+      test('the SGX and US price grids at their boundaries', () => {
+        const sg = { market: 'SG', assetClass: 'equity' };
+        expect(liquidityEngine.tickSize(sg, 0.199)).toBe(0.001);
+        expect(liquidityEngine.tickSize(sg, 0.2)).toBe(0.005);
+        expect(liquidityEngine.tickSize(sg, 0.999)).toBe(0.005);
+        expect(liquidityEngine.tickSize(sg, 1)).toBe(0.01);
+        expect(liquidityEngine.tickSize({ market: 'US', assetClass: 'etf' }, 635)).toBe(0.01);
+        expect(liquidityEngine.tickSize({ market: 'US', assetClass: 'equity' }, 0.5)).toBe(0.0001);
+        expect(liquidityEngine.tickSize({ market: 'UK', assetClass: 'etf' }, 760)).toBeNull();
+        expect(liquidityEngine.tickSize({ market: 'CRYPTO', assetClass: 'crypto' }, 58000)).toBeNull();
+        expect(liquidityEngine.tickSize({ market: 'US', assetClass: 'index' }, 6900)).toBeNull();
+      });
+      test('Corwin–Schultz matches an independent Python implementation', () => {
+        const trend = liquidityEngine.corwinSchultz([10.20, 10.30, 10.40, 10.20, 9.95, 10.10], [9.90, 10.05, 10.30, 9.80, 9.70, 9.95], [10.00, 10.25, 10.35, 9.85, 9.90, 10.05]);
+        expect(trend[0]).toBeCloseTo(0.009653927482754362, 1e-15);
+        expect(trend.slice(1)).toEqual([0, 0, 0, 0]);                       // negative two-day estimates are set to zero
+        const bounce = liquidityEngine.corwinSchultz([10.05, 10.06, 10.05, 10.06, 10.05], [10.00, 10.01, 10.00, 10.01, 10.00], [10.03, 10.02, 10.04, 10.01, 10.03]);
+        for (const value of bounce) expect(value).toBeCloseTo(0.002578049376733319, 1e-15);
+        expect(liquidityEngine.corwinSchultz([10.0, 10.6], [9.9, 10.4], [10.0, 10.5])).toEqual([0]);   // the overnight gap is removed first
+      });
+      test('volume, traded value and Amihud by hand', () => {
+        const closes = Array.from({ length: 25 }, (_, i) => 10 + (i % 2 ? 0.1 : 0));
+        const volumes = Array.from({ length: 25 }, (_, i) => 1000 + 10 * i);
+        const result = liquidityEngine.analyzeLiquidity(liquidAsset({ closes, volumes }));
+        const last = (list) => list.slice(-20);
+        const adv = last(volumes).reduce((s, v) => s + v, 0) / 20;
+        const value = last(volumes).reduce((s, v, i) => s + v * last(closes)[i], 0) / 20;
+        expect(result.metrics.averageVolume.value).toBeCloseTo(adv, 1e-9);
+        expect(result.metrics.dollarVolume.value).toBeCloseTo(value, 1e-6);
+        let impact = 0;
+        for (let i = 1; i < 20; i += 1) impact += Math.abs(last(closes)[i] / last(closes)[i - 1] - 1) / (last(closes)[i] * last(volumes)[i]);
+        expect(result.metrics.amihud.value).toBeCloseTo((impact / 19) * 1e10, 1e-6);   // per dollar × 10⁶ × 10⁴
+        expect(result.metrics.spreadEstimate.value).toBeCloseTo(0.01 / closes[closes.length - 1], 1e-12); // a US$0.01 tick on the last close
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('crypto volume is already in US dollars; units divide by the close', () => {
+        const closes = Array.from({ length: 25 }, () => 50000);
+        const volumes = Array.from({ length: 25 }, () => 2e9);
+        const coin = liquidAsset({ ticker: 'BTC-USD', closes, volumes, assetClass: 'crypto', market: 'CRYPTO' });
+        const result = liquidityEngine.analyzeLiquidity(coin);
+        expect(result.metrics.dollarVolume.value).toBe(2e9);
+        expect(result.metrics.averageVolume.value).toBe(40000);
+        expect(result.metrics.spreadEstimate.status).toBe('na');
+        expect(result.metrics.spreadEstimate.naReason).toMatch(/no tick floor/);
+        expect(result.metrics.rangeSpread.status).toBe('ok');
+      });
+      test('thin trading is flagged, indices are not traded, SGD converts for Amihud', () => {
+        const closes = Array.from({ length: 25 }, () => 2.12);
+        const volumes = Array.from({ length: 25 }, (_, i) => (i % 6 === 0 ? 0 : 50000));
+        const reit = liquidAsset({ ticker: 'REIT.SI', closes, volumes, market: 'SG', currency: 'SGD', lotSize: 100 });
+        const result = liquidityEngine.analyzeLiquidity(reit, { fxRate: 1.25 });
+        expect(result.metrics.averageVolume.meta.thin).toBeTrue();
+        expect(result.metrics.averageVolume.tone).toBe('caution');
+        expect(result.metrics.dollarVolume.meta.usd).toBeCloseTo(result.metrics.dollarVolume.value / 1.25, 1e-9);
+        expect(result.metrics.spreadEstimate.value).toBeCloseTo(0.01 / 2.12, 1e-12);   // S$0.01 tick from S$1
+        expect(result.metrics.spreadEstimate.tone).toBe('caution');
+        const index = liquidityEngine.analyzeLiquidity(liquidAsset({ ticker: '^STI', closes, volumes, assetClass: 'index' }));
+        for (const id of liquidityEngine.LIQUIDITY_METRIC_IDS) expect(index.metrics[id].naReason).toMatch(/not traded/);
+      });
+      test('real snapshot: every traded asset has liquidity figures, and the spread is the tick floor where the grid is known', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const result = liquidityEngine.analyzeLiquidity(asset, { fxRate: snapshot.fx.rate });
+          for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+          if (asset.assetClass === 'index') {
+            expect(result.metrics.dollarVolume.status).toBe('na');
+            continue;
+          }
+          expect(result.metrics.averageVolume.value).toBeGreaterThan(0);
+          expect(result.metrics.dollarVolume.meta.usd).toBeGreaterThan(0);
+          const last = asset.series.close[asset.series.close.length - 1];
+          const tick = liquidityEngine.tickSize(asset, last);
+          if (tick === null) expect(result.metrics.spreadEstimate.status).toBe('na');
+          else expect(result.metrics.spreadEstimate.value).toBeCloseTo(tick / last, 1e-12);
+        }
+      });
+    });
+
+    suite('position sizing with liquidity: the volume cap and the spread cost', () => {
+      const liquidity = (averageVolume, spread = 0.001) => ({ averageVolume, spread, tick: 0.1, asOf: '2026-11-20', unitName: 'shares' });
+      test('a large account is capped at 5% of daily volume, with a tenth step in the trace', () => {
+        const result = size({ account: { equity: 1e8, maxPositionPct: 100 }, liquidity: liquidity(10000) });
+        expect(result.summary.liquidityBinding).toBeTrue();
+        expect(result.summary.units).toBe(500);
+        expect(result.metrics.positionSize.trace.steps.length).toBe(10);
+        expect(result.metrics.positionSize.trace.steps[8].description).toMatch(/Liquidity cap/);
+        expect(result.metrics.volumeShare.value).toBeCloseTo(0.05, 1e-12);
+        expect(result.metrics.positionSize.trace.interpretation.summary).toMatch(/5% of an average day's volume/);
+      });
+      test('above 1% of volume the position is flagged but not cut', () => {
+        const result = size({ liquidity: liquidity(1000) });                // 20 shares of a 1,000-share day: 2%
+        expect(result.summary.liquidityBinding).toBeFalse();
+        expect(result.metrics.volumeShare.value).toBeCloseTo(result.summary.units / 1000, 1e-12);
+        expect(result.metrics.volumeShare.meta.flagged).toBeTrue();
+        expect(result.metrics.volumeShare.tone).toBe('caution');
+      });
+      test('the spread cost is position value × the minimum spread, set against the amount at risk', () => {
+        const result = size({ liquidity: liquidity(1e7, 0.0047) });
+        const { positionValue, amountAtRisk } = result.summary;
+        expect(result.metrics.spreadCost.value).toBeCloseTo(positionValue * 0.0047, 1e-9);
+        expect(result.metrics.spreadCost.meta.ofRisk).toBeCloseTo((positionValue * 0.0047) / amountAtRisk, 1e-12);
+        expect(result.metrics.volumeShare.meta.flagged).toBeFalse();
+        for (const id of ['volumeShare', 'spreadCost']) expect(tracer.validateTrace(result.metrics[id])).toEqual([]);
+      });
+      test('without liquidity data nothing changes and the new rows say why', () => {
+        const result = size();
+        expect(result.metrics.positionSize.trace.steps.length).toBe(9);
+        expect(result.metrics.volumeShare.status).toBe('na');
+        expect(result.metrics.spreadCost.status).toBe('na');
+      });
+      test('invariant: across account sizes and volumes the cap is never exceeded and units are whole lots', () => {
+        for (const equity of [1e3, 1e5, 1e7, 1e9]) {
+          for (const averageVolume of [150, 5000, 2e6]) {
+            const result = size({ account: { equity, maxPositionPct: 100 }, asset: { lotSize: 100 }, liquidity: liquidity(averageVolume) });
+            const { units } = result.summary;
+            expect(units).toBeAtMost(0.05 * averageVolume + 1e-9);
+            expect(units % 100).toBe(0);
+          }
+        }
       });
     });
 

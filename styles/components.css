@@ -284,6 +284,38 @@ code,
   font-size: var(--text-xs);
 }
 
+.tick--button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  align-items: center;
+}
+
+.tick--button:hover {
+  background: var(--surface-1);
+}
+
+.tick[data-regime="elevated"] {
+  border-color: var(--status-warning);
+}
+
+.tick[data-regime="stressed"] {
+  border-color: var(--status-critical);
+  background: var(--status-critical-wash);
+}
+
+.regime-banner {
+  margin-bottom: var(--space-3);
+}
+
+.regime-banner .banner {
+  margin-bottom: 0;
+}
+
+.regime-banner__actions {
+  margin-top: var(--space-1);
+}
+
 .tick[data-freshness="aging"] {
   border-color: var(--status-warning);
 }
