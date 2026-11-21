@@ -669,6 +669,13 @@ const ENTRIES = {
     healthy: 'Within the planned amount at risk.',
     risky: 'Several times the planned amount, especially with earnings inside the next 21 trading days.',
   },
+  crashReplay: {
+    term: 'Crash replay',
+    what: 'Your allocation bought at the close on an S&P 500 high and held, at the same weights with no rebalancing, to the low that followed: the 2022 rate-hike bear market, the August 2024 yen carry unwind, the 2025 tariff shock and the autumn 2026 sell-off (to the latest close). Prices are in your display currency at each day\'s exchange rate, set against the S&P 500 replayed the same way.',
+    why: 'Volatility and VaR summarise ordinary days. A replay shows what this exact mix would have done in a real, fast fall: how deep it went, its worst day, and whether it held up better or worse than the market.',
+    healthy: 'A smaller loss than the S&P 500 over the same window.',
+    risky: 'A loss much deeper than the market\'s. The windows were chosen after the fact, and a holding with no prices at the start is left out and the rest scaled up, as each card says.',
+  },
   scoreBacktest: {
     term: 'Technical score track record',
     what: 'How the Technical score would have done over the stored years: each past day is rescored from the year behind it and compared with the next 21 trading days. The headline is the rank IC, the correlation between the score and what followed, with the highest and lowest third of days by score.',
@@ -760,8 +767,16 @@ const FALLBACK = Object.freeze({
  * @param {string} [profile] CORPORATE | FINANCIAL | REIT | CRYPTO
  * @returns {{ id:string, term:string, what:string, why:string, healthy:string, risky:string, note:string|null }}
  */
+/** Pair ids ("corr:AMD|MU") and crash-replay ids ("replay:bear2022") share one explainer each. */
+function explainerKey(id) {
+  if (typeof id !== 'string') return id;
+  if (id.startsWith('corr:')) return 'correlation';
+  if (id.startsWith('replay:')) return 'crashReplay';
+  return id;
+}
+
 export function getExplainer(id, profile) {
-  const key = typeof id === 'string' && id.startsWith('corr:') ? 'correlation' : id;
+  const key = explainerKey(id);
   const entry = ENTRIES[key];
   if (!entry) return { id: String(id), ...FALLBACK };
   const note = entry.profileNotes && profile && entry.profileNotes[profile] ? entry.profileNotes[profile] : null;
@@ -769,7 +784,7 @@ export function getExplainer(id, profile) {
 }
 
 export function hasExplainer(id) {
-  const key = typeof id === 'string' && id.startsWith('corr:') ? 'correlation' : id;
+  const key = explainerKey(id);
   return Object.prototype.hasOwnProperty.call(ENTRIES, key);
 }
 

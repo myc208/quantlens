@@ -18,6 +18,10 @@
  * calculation is running the previous result stays on screen, dimmed.
  *
  * Every statistic is a button that opens its derivation in the drawer.
+ *
+ * V3.3 adds crash replays: the same weights bought at four S&P 500 highs and held to the
+ * lows that followed, in the display currency, against the S&P 500 replayed the same way.
+ * They come from app.crashReplays() (computed on the main thread and cached), not the worker.
  */
 
 import { MAX_PORTFOLIO_ASSETS, hasCustomPortfolio } from '../core/store.js';
@@ -344,6 +348,112 @@ export function mountPortfolioSandbox(root, app) {
   }
 
   /* ------------------------------------------------------------------ */
+  /* Results: crash replays (V3.3)                                        */
+  /* ------------------------------------------------------------------ */
+
+  /** The mix (solid) and the S&P 500 (dashed) through one window, both starting at 0%. */
+  function replaySpark(path) {
+    const series = [path.portfolio, ...(path.benchmark ? [path.benchmark] : [])];
+    const all = series.flat();
+    const low = Math.min(...all, 1);
+    const high = Math.max(...all, 1);
+    const span = high - low || 1;
+    const last = path.portfolio.length - 1 || 1;
+    const y = (value) => (2 + (1 - (value - low) / span) * 32).toFixed(2);
+    const line = (values) => values.map((value, i) => `${i ? 'L' : 'M'}${((i / last) * 100).toFixed(2)} ${y(value)}`).join(' ');
+    return `
+      <svg class="replay__spark" viewBox="0 0 100 36" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+        <line class="replay__zero" x1="0" x2="100" y1="${y(1)}" y2="${y(1)}"></line>
+        ${path.benchmark ? `<path class="replay__bench" d="${line(path.benchmark)}"></path>` : ''}
+        <path class="replay__line" d="${line(path.portfolio)}"></path>
+      </svg>`;
+  }
+
+  function replayCard(metric) {
+    const window = metric.meta.window;
+    const key = `pf|${metric.id}`;
+    const title = `${window.name}${window.ongoing ? ' (ongoing)' : ''}`;
+    if (metric.status !== 'ok') {
+      return `
+        <button type="button" class="replay" data-action="trace" data-trace="${esc(metric.id)}" data-key="${esc(key)}"
+          aria-label="${esc(`${title}: not available. ${metric.naReason} Show how it is calculated.`)}">
+          <span class="replay__name">${esc(title)}</span>
+          <span class="replay__dates">${esc(h.shortDate(window.from, true))} →</span>
+          <span class="badge badge--na">N/A</span>
+          <span class="replay__note">${esc(metric.naReason)}</span>
+        </button>`;
+    }
+    const m = metric.meta;
+    const bench = m.benchmark;
+    const end = m.window.to;
+    const versus = bench ? `${h.formatNumber(Math.abs(m.excess) * 100, 1)} pts ${m.excess >= 0 ? 'better' : 'worse'} than the S&P 500` : 'No S&P 500 history to compare';
+    const worst = m.worstDay ? `worst day ${h.signedPercent(m.worstDay.value, 1)} (${h.shortDate(m.worstDay.date, true)})` : '';
+    const label = `${title}, ${h.shortDate(window.from, true)} to ${h.shortDate(end, true)}: this mix ${h.signedPercent(m.totalReturn, 1)}`
+      + `${bench ? `, S&P 500 ${h.signedPercent(bench.totalReturn, 1)}, ${versus}` : ''}. Maximum drawdown ${h.signedPercent(m.maxDrawdown, 1)}${worst ? `, ${worst}` : ''}.`
+      + `${m.rescaleNote ? ` ${m.rescaleNote}` : ''} Show how it is calculated.`;
+    return `
+      <button type="button" class="replay" data-action="trace" data-trace="${esc(metric.id)}" data-key="${esc(key)}" aria-label="${esc(label)}">
+        <span class="replay__name">${esc(title)}</span>
+        <span class="replay__dates">${esc(h.shortDate(window.from, true))} → ${esc(h.shortDate(end, true))}${window.ongoing ? ' · latest close' : ''}</span>
+        <span class="replay__figures">
+          <span class="replay__figure"><span class="replay__label"><span class="replay__key replay__key--mix"></span>This mix</span>
+            <span class="replay__value">${h.toneMark(metric.tone)}${esc(h.signedPercent(m.totalReturn, 1))}</span></span>
+          ${bench ? `<span class="replay__figure"><span class="replay__label"><span class="replay__key replay__key--bench"></span>S&amp;P 500</span>
+            <span class="replay__value">${esc(h.signedPercent(bench.totalReturn, 1))}</span></span>` : ''}
+        </span>
+        <span class="replay__vs">${esc(versus)}</span>
+        ${replaySpark(m.path)}
+        <span class="replay__meta">Max drawdown ${esc(h.signedPercent(m.maxDrawdown, 1))}${worst ? ` · ${esc(worst)}` : ''}</span>
+        ${m.rescaleNote ? `<span class="replay__note">⚠ ${esc(m.rescaleNote)}</span>` : ''}
+      </button>`;
+  }
+
+  /** Pro: what each holding added to each replay, in percentage points of the mix's return. */
+  function replayTable(metrics, weights) {
+    const ok = metrics.filter((metric) => metric.status === 'ok');
+    if (!ok.length) return '';
+    const tickers = weights.filter((entry) => entry.weight > 0).map((entry) => entry.ticker);
+    const cell = (metric, ticker) => {
+      const row = metric.meta.holdings.find((item) => item.ticker === ticker);
+      if (!row) return '<td><span class="cell__sub">left out</span></td>';
+      return `<td>${esc(h.signedPercent(row.contribution, 1))}<span class="cell__sub"> own ${esc(h.signedPercent(row.ownReturn, 1))}</span></td>`;
+    };
+    return `
+      <table class="data-table pro-only">
+        <caption class="sr-only">What each holding added to each crash replay, with its own return over the window</caption>
+        <thead><tr><th scope="col">Asset</th>${ok.map((metric) => `<th scope="col">${esc(metric.meta.window.short)}</th>`).join('')}</tr></thead>
+        <tbody>
+          ${tickers.map((ticker) => `<tr><th scope="row">${esc(ticker)}</th>${ok.map((metric) => cell(metric, ticker)).join('')}</tr>`).join('')}
+          <tr><th scope="row">Mix</th>${ok.map((metric) => `<td><strong>${esc(h.signedPercent(metric.meta.totalReturn, 1))}</strong></td>`).join('')}</tr>
+        </tbody>
+      </table>`;
+  }
+
+  function crashBlock(state) {
+    const replays = app.crashReplays();
+    if (!replays || !replays.ok) return '';
+    const metrics = Object.values(replays.metrics);
+    return `
+      <section class="card portfolio__panel" aria-labelledby="crash-title">
+        <div class="sandbox__block-title">
+          <h2 class="panel-title" id="crash-title">Crash replays</h2>
+          <span class="field__hint">This mix bought at four S&amp;P 500 highs and held to the lows that followed, in ${esc(state.currency)}, at the weights you set. Unlike the statistics above, it ignores the time range.</span>
+        </div>
+        <div class="replay-grid">${metrics.map(replayCard).join('')}</div>
+        <div class="legend" aria-hidden="true">
+          <span class="legend__item"><span class="legend__key replay__key--mix"></span>This mix</span>
+          <span class="legend__item"><span class="legend__key replay__key--bench"></span>S&amp;P 500, same currency</span>
+        </div>
+        ${replayTable(metrics, app.portfolio().weights)}
+        ${state.mode === 'guided' ? `
+          <div class="guide-note guided-only">
+            <span class="guide-note__badge">Guided</span>
+            <span>${esc(app.explain('crashReplay').why)} The windows were picked after the fact from the S&amp;P 500's own highs and lows, so this is how the mix behaved in those falls, not a forecast of the next one. Select a card for the day-by-day arithmetic.</span>
+          </div>` : ''}
+      </section>`;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Results: sample of alternative mixes                                */
   /* ------------------------------------------------------------------ */
 
@@ -628,7 +738,8 @@ export function mountPortfolioSandbox(root, app) {
           ${h.toneMark('caution')}
           <div><p class="banner__title">Not enough to measure this portfolio</p><p>${esc(analysis.reason)}</p></div>
         </div>
-        ${tiles(analysis, state)}`;
+        ${tiles(analysis, state)}
+        ${crashBlock(state)}`;
       return;
     }
 
@@ -654,6 +765,7 @@ export function mountPortfolioSandbox(root, app) {
           <span class="guide-note__badge">Guided</span>
           <span>${esc(app.explain('sharpeRatio').what)} ${esc(app.explain('portfolioVolatility').why)} These figures describe the past window only. Select any tile to see its arithmetic.</span>
         </div>` : ''}
+      ${crashBlock(state)}
       ${riskBlock(analysis, state)}
       ${frontierBlock(analysis, frontier, state)}`;
 

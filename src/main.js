@@ -49,6 +49,7 @@ import { analyzeSentiment } from './engines/sentimentEngine.js';
 import { analyzeForecast } from './engines/forecastEngine.js';
 import { seedFromString } from './engines/monteCarloEngine.js';
 import { PORTFOLIO_CONFIG } from './engines/portfolioEngine.js';
+import { analyzeCrashReplays, REPLAY_PREFIX } from './engines/crashReplayEngine.js';
 import { mountTelemetryBar } from './ui/telemetryBar.js';
 import { mountAppTabs } from './ui/appTabs.js';
 import { mountScreenerPanel } from './ui/screenerPanel.js';
@@ -184,7 +185,7 @@ function formatMetric(metric, { withCurrency = false, native = false } = {}) {
     case 'score': return formatNumber(value, 0);
     case 'index': return formatNumber(value, 1);
     case 'pct':
-      if (SIGNED_IDS.has(metric.id)) return signedPercent(value, 1);
+      if (SIGNED_IDS.has(metric.id) || metric.id.startsWith(REPLAY_PREFIX)) return signedPercent(value, 1);
       // Spreads and shares of daily volume are often far below 0.1%.
       if (FINE_PERCENT_IDS.has(metric.id)) return formatPercent(value, value === 0 || value >= 0.001 ? 2 : value >= 0.0001 ? 3 : 4);
       return formatPercent(value, 1);
@@ -564,6 +565,29 @@ function portfolioRequest(state) {
   };
 }
 
+// Crash replays: the allocation bought at four S&P 500 highs and held to the lows (V3.3).
+// Small enough for the main thread; cached on exactly what it depends on (not the range).
+let replayMemo = { key: null, value: null };
+
+function crashReplays() {
+  const state = store.getState();
+  if (!state.snapshot) return null;
+  const weights = selectPortfolioWeights(state).filter((entry) => state.snapshot.byTicker[entry.ticker]);
+  const fx = selectFx(state);
+  const key = jobKey('replay', state.snapshot.generatedAt, state.currency, weights.map((entry) => `${entry.ticker}:${entry.weight}`).join(','),
+    state.snapshot.fx.series && state.snapshot.fx.series.dates.length ? 'history' : fx ? fx.rate : null);
+  if (replayMemo.key !== key) {
+    replayMemo = {
+      key,
+      value: analyzeCrashReplays({
+        weights, byTicker: state.snapshot.byTicker, baseCurrency: state.currency,
+        fx: { series: state.snapshot.fx.series ?? null, rate: fx ? fx.rate : null },
+      }),
+    };
+  }
+  return replayMemo.value;
+}
+
 /** The portfolio slot plus the allocation it belongs to. */
 function portfolio() {
   const state = store.getState();
@@ -653,8 +677,9 @@ function traceIndex(ticker) {
   const run = ticker && simulated && simulated.ticker === ticker ? simulated : null;
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
+  const replays = !ticker && state.view === 'portfolio' ? crashReplays() : null;
   const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
-  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis];
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis, replays];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
@@ -671,6 +696,7 @@ function traceIndex(ticker) {
     current.correlation.pairs,
     current.heat,
     held ? held.metrics : null,
+    replays ? replays.metrics : null,
     regimeAnalysis.metrics,
     macroAnalysis.metrics,
   );
@@ -700,6 +726,7 @@ const app = {
   requestSimulation,
   simulation,
   portfolio,
+  crashReplays,
   backtest,
   regime: () => regimeAnalysis,
   describeRegime: () => describeRegime(regimeAnalysis),
