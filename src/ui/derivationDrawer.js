@@ -18,7 +18,7 @@
 const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'financial companies', REIT: 'REITs', ETF: 'ETFs', INDEX: 'indices', CRYPTO: 'crypto' });
 
 // Metrics that belong to the portfolio as a whole rather than to one asset or one pair.
-const PORTFOLIO_METRICS = new Set(['portfolioReturn', 'portfolioVolatility', 'sharpeRatio', 'diversificationRatio', 'riskFreeRate']);
+const PORTFOLIO_METRICS = new Set(['portfolioReturn', 'portfolioVolatility', 'sharpeRatio', 'diversificationRatio', 'riskFreeRate', 'portfolioBeta', 'concentration', 'effectiveBets']);
 // Readings of the market as a whole (V3.1): the VIX curve.
 const MARKET_METRICS = new Set(['marketRegime', 'vixLevel', 'vixTermRatio', 'vixFrontRatio']);
 

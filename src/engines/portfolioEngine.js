@@ -14,6 +14,10 @@
  *      Sharpe ratio  S   = (Rp − Rf) ÷ σp     Rf = 10-year government yield
  *      Risk share    RCᵢ = wᵢ(Σw)ᵢ ÷ σp²      (sums to 1)
  *      Diversification ratio = Σ wᵢσᵢ ÷ σp    (1 = none, higher = better)
+ *   6. Market beta   βp = Σ wᵢβᵢ against the S&P 500 in the base currency (V3.1)
+ *   7. Concentration: the share of the portfolio's variance from its first principal
+ *      component, measured on the SAMPLE covariance, with each holding's correlation
+ *      to that common driver and the effective number of bets (V3.1)
  *
  * Honesty notes carried into every trace: one year of history is a description
  * of the past, not an expected return, and the weights are long-only.
@@ -27,7 +31,8 @@ import {
   traced, notAvailable, input, step, threshold, interpretation, fmtN, fmtPct,
 } from '../core/derivationTracer.js';
 import { mulberry32 } from './monteCarloEngine.js';
-import { ledoitWolf, weeklyCloses } from './riskEngine.js';
+import { ledoitWolf, weeklyCloses, symmetricEigen } from './riskEngine.js';
+import { regress } from './factorEngine.js';
 
 export const PORTFOLIO_CONFIG = Object.freeze({
   minObservations: 15, // a 1-month window of a stock has about 20 daily returns
@@ -35,7 +40,13 @@ export const PORTFOLIO_CONFIG = Object.freeze({
   annualisation: Object.freeze({ equity: 252, crypto: 365, weekly: 52 }),
   frontierSamples: 2000,
   detailedTraceAssets: 4, // above this the volatility trace summarises the cross terms
+  // V3.1: crowding. One common driver explaining at least `crowdedShare` of the variance,
+  // with at least two holdings correlated `crowdCorrelation` or more with it, is one bet.
+  crowdedShare: 0.6,
+  crowdCorrelation: 0.8,
 });
+
+const PORTFOLIO_BENCHMARK_NAME = 'the S&P 500';
 
 const SHARPE_THRESHOLDS = [
   threshold('1.0 or more', 'Strong: well paid for the risk taken', 'healthy'),
@@ -200,8 +211,172 @@ function unavailableAnalysis(reason, tickers, riskFree, baseCurrency) {
       sharpeRatio: na('sharpeRatio', 'Sharpe ratio', 'ratio', 'Sharpe = (Rp − Rf) ÷ σp'),
       diversificationRatio: na('diversificationRatio', 'Diversification ratio', 'ratio', 'DR = Σ wᵢσᵢ ÷ σp'),
       riskFreeRate: riskFreeMetric(riskFree, baseCurrency),
+      portfolioBeta: na('portfolioBeta', 'Portfolio beta (vs S&P 500)', 'ratio', BETA_FORMULA),
+      concentration: na('concentration', 'Concentration (largest common driver)', 'pct', CONCENTRATION_FORMULA),
+      effectiveBets: na('effectiveBets', 'Effective number of bets', 'ratio', BETS_FORMULA),
     },
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* V3.1: market beta and concentration                                  */
+/* ------------------------------------------------------------------ */
+
+const BETA_FORMULA = 'βp = Σ wᵢ × βᵢ, βᵢ = cov(rᵢ, r_m) ÷ var(r_m), r_m = S&P 500 (^GSPC) returns in the portfolio currency';
+const CONCENTRATION_FORMULA = 'Share = λ₁ × (v₁ · w)² ÷ (wᵀ S w), from the eigen-decomposition S = Σ λₖ vₖ vₖᵀ of the sample covariance';
+const BETS_FORMULA = 'Effective bets = exp(−Σ pₖ ln pₖ), pₖ = λₖ (vₖ · w)² ÷ (wᵀ S w): the share of variance from each common driver';
+
+function listNames(names) {
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/**
+ * The portfolio's beta to the S&P 500. Daily when every holding trades in the US session,
+ * weekly otherwise (closes hours apart would understate the link).
+ * @returns {{ metric:object, betas:number[]|null }}
+ */
+function portfolioBetaMetric({ list, tickers, w, benchmark, fxArgs, minObservations, baseCurrency }) {
+  const id = 'portfolioBeta';
+  const label = 'Portfolio beta (vs S&P 500)';
+  const fail = (reason) => ({ metric: notAvailable({ id, label, unit: 'ratio', formula: BETA_FORMULA, reason }), betas: null });
+  if (!benchmark || !benchmark.series || !Array.isArray(benchmark.series.dates)) {
+    return fail('The S&P 500 (^GSPC) is not in this snapshot, so there is no market to measure the portfolio against.');
+  }
+  const frequency = list.every((asset) => asset.market === benchmark.market) ? 'daily' : 'weekly';
+  const withMarket = [...list, benchmark];
+  const source = frequency === 'weekly' ? withMarket.map((asset) => ({ ...asset, series: weeklyCloses(asset.series) })) : withMarket;
+  const aligned = alignPrices(source, fxArgs);
+  if (!aligned.ok) return fail(aligned.reason);
+  const observations = aligned.dates.length - 1;
+  if (observations < minObservations) {
+    return fail(frequency === 'weekly'
+      ? `Some holdings close at a different time from the S&P 500, so beta is measured week by week, and this range has only ${Math.max(0, observations)} weekly returns (at least ${minObservations} are needed). Choose 6M or longer.`
+      : `Only ${Math.max(0, observations)} daily returns overlap with the S&P 500; at least ${minObservations} are needed.`);
+  }
+  const returns = aligned.prices.map(simpleReturns);
+  const market = returns[returns.length - 1];
+  const fits = list.map((_, i) => regress(returns[i], market));
+  if (fits.some((fit) => !fit)) return fail('A holding or the S&P 500 did not move over this period, so a beta cannot be estimated.');
+  const betas = fits.map((fit) => fit.beta);
+  const beta = betas.reduce((total, value, i) => total + w[i] * value, 0);
+  const portfolioReturns = market.map((_, t) => returns.slice(0, list.length).reduce((total, series, i) => total + w[i] * series[t], 0));
+  const whole = regress(portfolioReturns, market);
+  const rSquared = whole ? whole.rSquared : null;
+  const from = aligned.dates[0];
+  const to = aligned.dates[aligned.dates.length - 1];
+  const active = tickers.map((_, i) => i).filter((i) => w[i] > 0);
+  let tone = 'neutral';
+  if (beta > 2) tone = 'risky';
+  else if (beta > 1.2) tone = 'caution';
+  const currencyNote = aligned.fxMode === 'history' ? ` The S&P 500 is converted to ${baseCurrency} like the holdings, so currency moves are part of both.` : '';
+  const weeklyNote = frequency === 'weekly' ? ' Some holdings close at a different time from New York, so weekly returns are used.' : '';
+  return {
+    betas,
+    metric: traced({
+      id, label, value: beta, unit: 'ratio', tone,
+      meta: {
+        benchmark: '^GSPC', frequency, observations, from, to, rSquared, exposure: beta,
+        contributions: active.map((i) => ({ ticker: tickers[i], weight: w[i], beta: betas[i], contribution: w[i] * betas[i] })),
+      },
+      formula: BETA_FORMULA,
+      rawInputs: [
+        ...active.map((i) => input(`Weight of ${tickers[i]}`, w[i], 'fraction', 'your allocation, scaled to total 100%')),
+        ...active.map((i) => input(`Beta of ${tickers[i]} to the S&P 500`, betas[i], 'ratio', `${observations} ${frequency} returns, ${from} to ${to}`, to)),
+      ],
+      steps: [
+        ...active.map((i) => step(`${tickers[i]}: weight × beta`, `${fmtPct(w[i])} × ${fmtN(betas[i], 3)}`, fmtN(w[i] * betas[i], 3))),
+        step('Add the contributions', active.map((i) => fmtN(w[i] * betas[i], 3)).join(' + '), fmtN(beta, 3)),
+        step('Beta-adjusted exposure: beta × 100% of capital', `${fmtN(beta, 3)} × 100%`, fmtPct(beta, 0)),
+        ...(isNum(rSquared) ? [step('Share of the portfolio\'s variance the S&P 500 explains (R²)', 'squared correlation of the portfolio with the S&P 500', fmtPct(rSquared, 0))] : []),
+      ],
+      interpretation: interpretation(
+        `When ${PORTFOLIO_BENCHMARK_NAME} moved 1% over this period, the portfolio moved about ${fmtN(beta, 2)}% the same way: like holding ${fmtPct(beta, 0)} of its value in the index.`,
+        [threshold('Below 0.8', 'Less market risk than the index', 'neutral'), threshold('0.8 – 1.2', 'About the index\'s', 'neutral'), threshold('1.2 – 2.0', 'Amplified market risk', 'caution'), threshold('Above 2.0', 'Strongly amplified', 'risky')],
+        `Beta measures only the part of the risk that follows the US market${isNum(rSquared) ? `, which explains ${fmtPct(rSquared, 0)} of this portfolio's moves` : ''}. It describes the past window.${weeklyNote}${currencyNote}`,
+      ),
+    }),
+  };
+}
+
+/**
+ * Concentration from the sample covariance of the portfolio's own returns.
+ * @returns {{ concentration:object, effectiveBets:object, loadings:object[]|null }}
+ */
+export function concentrationMetrics({ tickers, w, sampleCov, frequency = 'daily', observations = 0 }) {
+  const active = tickers.map((_, i) => i).filter((i) => w[i] > 0);
+  const naBoth = (reason) => ({
+    concentration: notAvailable({ id: 'concentration', label: 'Concentration (largest common driver)', unit: 'pct', formula: CONCENTRATION_FORMULA, reason }),
+    effectiveBets: notAvailable({ id: 'effectiveBets', label: 'Effective number of bets', unit: 'ratio', formula: BETS_FORMULA, reason }),
+    loadings: null,
+  });
+  if (active.length < 2) return naBoth('A single holding is one bet by definition.');
+  const matrix = active.map((i) => active.map((j) => sampleCov[i][j]));
+  const weights = active.map((i) => w[i]);
+  const eigen = symmetricEigen(matrix);
+  const variance = portfolioMoments(weights, weights.map(() => 0), matrix).variance;
+  if (!eigen || !(variance > 1e-18) || !(eigen.values[0] > 0)) return naBoth('The portfolio showed no volatility over this period.');
+  const dot = (vector) => vector.reduce((total, value, k) => total + value * weights[k], 0);
+  // Orient the first component so the portfolio is long it: then a holding that moves with
+  // the driver has a positive correlation, and a hedge a negative one.
+  let first = eigen.vectors[0];
+  if (dot(first) < 0) first = first.map((value) => -value);
+  const shares = eigen.values.map((lambda, k) => Math.max(0, lambda) * dot(eigen.vectors[k]) ** 2 / variance);
+  const share = shares[0];
+  const loadings = active.map((i, k) => ({ ticker: tickers[i], weight: w[i], correlation: (first[k] * Math.sqrt(eigen.values[0])) / Math.sqrt(matrix[k][k]) }));
+  const crowd = loadings.filter((entry) => entry.correlation >= PORTFOLIO_CONFIG.crowdCorrelation).map((entry) => entry.ticker);
+  const crowded = share >= PORTFOLIO_CONFIG.crowdedShare && crowd.length >= 2;
+  const leader = loadings.reduce((top, entry) => (Math.abs(entry.correlation) > Math.abs(top.correlation) ? entry : top), loadings[0]).ticker;
+  const dominant = !crowded && share >= PORTFOLIO_CONFIG.crowdedShare ? (crowd[0] ?? leader) : null;
+  const entropy = shares.reduce((total, p) => (p > 0 ? total - p * Math.log(p) : total), 0);
+  const bets = Math.exp(entropy);
+  const sample = `${observations} ${frequency} returns`;
+  const eigenText = eigen.values.map((value) => fmtN(value, 4)).join(', ');
+  const tone = crowded ? 'risky' : dominant ? 'caution' : 'healthy';
+  let summary = `No single driver dominates: the largest common driver explains ${fmtPct(share, 0)} of the variance.`;
+  if (crowded) summary = `${listNames(crowd)} are effectively one bet: one common driver explains ${fmtPct(share, 0)} of this portfolio's variance, and each of them moves with it (correlation ${fmtN(PORTFOLIO_CONFIG.crowdCorrelation, 1)} or more).`;
+  else if (dominant) summary = `One common driver explains ${fmtPct(share, 0)} of the variance, but it is mostly ${dominant} on its own: ${dominant} carries most of this portfolio's risk.`;
+  const caveat = 'Measured on the sample covariance, not the shrunk one used for volatility: shrinkage pulls every correlation toward the average and would hide which holdings move together. The diversification ratio can still be above 1 here: correlations below 1 trim the volatility, even when one driver explains most of what is left. The driver is a statistical pattern of the past window, not a named economic factor.';
+  const concentration = traced({
+    id: 'concentration', label: 'Concentration (largest common driver)', value: share, unit: 'pct', tone,
+    meta: { crowded, crowd, dominant, loadings, shares, effectiveBets: bets, matrix: 'sample', frequency, observations },
+    formula: CONCENTRATION_FORMULA,
+    rawInputs: active.map((i) => input(`Weight of ${tickers[i]}`, w[i], 'fraction', 'your allocation, scaled to total 100%')),
+    steps: [
+      step('Eigenvalues of the sample covariance (largest first)', `${active.length} × ${active.length} matrix, ${sample}`, eigenText),
+      step('Portfolio exposure to the first component', 'v₁ · w', fmtN(dot(first), 4)),
+      step('Its share of the portfolio variance', `${fmtN(eigen.values[0], 4)} × ${fmtN(dot(first), 4)}² ÷ ${fmtN(variance, 6)}`, fmtPct(share, 1)),
+      ...loadings.map((entry) => step(`${entry.ticker}: correlation with the common driver`, 'v₁ᵢ × √λ₁ ÷ σᵢ', fmtN(entry.correlation, 2))),
+      step(`Crowded if the share is at least ${fmtPct(PORTFOLIO_CONFIG.crowdedShare, 0)} and two or more holdings correlate ${fmtN(PORTFOLIO_CONFIG.crowdCorrelation, 1)} or more`,
+        `${fmtPct(share, 0)}; ${crowd.length ? listNames(crowd) : 'none'} at ${fmtN(PORTFOLIO_CONFIG.crowdCorrelation, 1)}+`, crowded ? 'one crowded bet' : dominant ? `dominated by ${dominant}` : 'diversified'),
+    ],
+    interpretation: interpretation(summary, [
+      threshold(`Below ${fmtPct(PORTFOLIO_CONFIG.crowdedShare, 0)}`, 'No dominant driver', 'healthy'),
+      threshold(`${fmtPct(PORTFOLIO_CONFIG.crowdedShare, 0)}+, one holding tied to it`, 'Dominated by one holding', 'caution'),
+      threshold(`${fmtPct(PORTFOLIO_CONFIG.crowdedShare, 0)}+, two or more holdings at ${fmtN(PORTFOLIO_CONFIG.crowdCorrelation, 1)}+`, 'One crowded bet', 'risky'),
+    ], caveat),
+  });
+  let betsTone = 'healthy';
+  if (bets < 1.3) betsTone = 'risky';
+  else if (bets < 2) betsTone = 'caution';
+  const effectiveBets = traced({
+    id: 'effectiveBets', label: 'Effective number of bets', value: bets, unit: 'ratio', tone: betsTone,
+    meta: { holdings: active.length, shares },
+    formula: BETS_FORMULA,
+    rawInputs: active.map((i) => input(`Weight of ${tickers[i]}`, w[i], 'fraction', 'your allocation, scaled to total 100%')),
+    steps: [
+      step('Share of the variance from each common driver', 'pₖ = λₖ (vₖ · w)² ÷ wᵀ S w', shares.map((value) => fmtPct(value, 1)).join(', ')),
+      step('Entropy of those shares', '−Σ pₖ ln pₖ', fmtN(entropy, 4)),
+      step('Effective number of bets', `exp(${fmtN(entropy, 4)})`, fmtN(bets, 2)),
+    ],
+    interpretation: interpretation(
+      `Spread across its common drivers, this portfolio behaves like about ${fmtN(bets, 1)} independent bet${bets >= 1.95 ? 's' : ''}, from ${active.length} holdings.`,
+      [threshold('2 or more', 'Genuinely spread', 'healthy'), threshold('1.3 – 2', 'Few bets', 'caution'), threshold('Below 1.3', 'Effectively one bet', 'risky')],
+      `Meucci's effective number of bets. ${caveat}`,
+    ),
+    dependsOn: ['concentration'],
+  });
+  return { concentration, effectiveBets, loadings };
 }
 
 /* ------------------------------------------------------------------ */
@@ -216,8 +391,10 @@ function unavailableAnalysis(reason, tickers, riskFree, baseCurrency) {
  * @param {{rate:number, series?:{dates:string[], rates:number[]}}} [args.fx]
  * @param {{yield:number|null, status?:string, name?:string, source?:string, asOf?:string}|null} [args.riskFree]
  * @param {number} [args.minObservations]
+ * @param {{ticker:string, currency:string, market:string, assetClass:string, series:{dates:string[], close:number[]}}|null} [args.benchmark]
+ *   the S&P 500's window for the same range, for the portfolio's beta (V3.1)
  */
-export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, riskFree = null, minObservations = PORTFOLIO_CONFIG.minObservations }) {
+export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, riskFree = null, minObservations = PORTFOLIO_CONFIG.minObservations, benchmark = null }) {
   const list = (Array.isArray(assets) ? assets : []).filter(Boolean);
   const tickers = list.map((asset) => asset.ticker);
   const fail = (reason) => unavailableAnalysis(reason, tickers, riskFree, baseCurrency);
@@ -435,6 +612,16 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
     });
   }
 
+  /* ---- V3.1: market beta and concentration ---- */
+  const { metric: portfolioBeta, betas } = portfolioBetaMetric({ list, tickers, w, benchmark, fxArgs, minObservations, baseCurrency });
+  const { concentration, effectiveBets, loadings } = concentrationMetrics({ tickers, w, sampleCov, frequency, observations });
+  for (const [i, row] of contributions.entries()) {
+    row.beta = betas ? betas[i] : null;
+    row.betaContribution = betas ? w[i] * betas[i] : null;
+    const loading = loadings ? loadings.find((entry) => entry.ticker === row.ticker) : null;
+    row.driverCorrelation = loading ? loading.correlation : null;
+  }
+
   return {
     ok: true,
     reason: null,
@@ -450,7 +637,7 @@ export function analyzePortfolio({ assets, weights, baseCurrency, fx = null, ris
     baseCurrency,
     stats: { means: mu, volatilities: vols, covariance: cov, correlation: corr, sampleCovariance: sampleCov },
     contributions,
-    metrics: { portfolioReturn, portfolioVolatility, sharpeRatio, diversificationRatio, riskFreeRate },
+    metrics: { portfolioReturn, portfolioVolatility, sharpeRatio, diversificationRatio, riskFreeRate, portfolioBeta, concentration, effectiveBets },
   };
 }
 

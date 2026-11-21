@@ -77,6 +77,18 @@ const SECTIONS = Object.freeze([
     ],
   },
   {
+    id: 'market',
+    title: 'Market sensitivity',
+    note: 'Against each asset\'s benchmark: ^GSPC for US and London, ^STI for Singapore, BTC-USD for other coins',
+    rows: [
+      { id: 'beta' },
+      { id: 'rSquared' },
+      { id: 'idioVolatility' },
+      { id: 'relativeStrength1m' },
+      { id: 'relativeStrength3m' },
+    ],
+  },
+  {
     id: 'events',
     title: 'Events',
     note: 'Scheduled releases that can gap the price past a stop',
@@ -278,6 +290,15 @@ export function mountComparisonMatrix(root, app) {
         return isNum(meta.returns) ? sub(`From ${meta.returns} daily returns${meta.returns < 40 ? ' · rough' : ''}`) : '';
       case 'maxDrawdown':
         return metric.value < 0 ? sub(`${h.shortDate(meta.peakDate)} to ${h.shortDate(meta.troughDate)}`) : sub('No fall from a high');
+      case 'beta':
+        return sub(`${h.formatNumber(meta.low, 2)} to ${h.formatNumber(meta.high, 2)} · ${meta.observations} ${meta.frequency} returns${meta.rough ? ' · rough' : ''}`);
+      case 'rSquared':
+        return sub(`Correlation ${h.formatNumber(meta.correlation, 2)} with ${meta.benchmark}`);
+      case 'idioVolatility':
+        return sub(`Total ${h.formatPercent(meta.total, 0)} · ${h.formatPercent(meta.systematic, 0)} from ${meta.benchmark}`);
+      case 'relativeStrength1m':
+      case 'relativeStrength3m':
+        return sub(`${h.signedPercent(meta.assetReturn, 1)} vs ${h.signedPercent(meta.benchmarkReturn, 1)} for ${meta.benchmark}`);
       case 'ewmaVolatility':
         return sub(`Equal-weighted ${h.formatPercent(meta.flat, 0)} · half-life ${h.formatNumber(meta.halfLifeDays, 0)} days`);
       case 'var95':

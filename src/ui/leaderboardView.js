@@ -41,6 +41,8 @@ export const BOARD_COLUMNS = Object.freeze([
   { id: 'periodReturn', label: 'Return', metric: 'periodReturn', tier: 'a', first: 'descending', ranged: true },
   { id: 'periodVolatility', label: 'Volatility', metric: 'periodVolatility', tier: 'b', first: 'ascending', ranged: true },
   { id: 'maxDrawdown', label: 'Drawdown', metric: 'maxDrawdown', tier: 'c', first: 'descending', ranged: true },
+  { id: 'beta', label: 'Beta', metric: 'beta', tier: 'c', first: 'descending', ranged: true },
+  { id: 'relativeStrength3m', label: 'RS 3M', metric: 'relativeStrength3m', tier: 'c', first: 'descending' },
   { id: 'headlineTone', label: 'News tone', metric: 'headlineTone', tier: 'c', first: 'descending' },
   { id: 'forecast30d', label: '30d projection', metric: 'forecast30d', tier: 'c', first: 'descending' },
 ].map((column) => Object.freeze(column)));

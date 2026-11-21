@@ -39,6 +39,7 @@ import { analyzeTechnicals, analyzeWindow } from './engines/technicalEngine.js';
 import { analyzeRisk, positionTailRisk } from './engines/riskEngine.js';
 import { analyzeEvents, gapRisk } from './engines/eventEngine.js';
 import { analyzeRegime, describeRegime } from './engines/regimeEngine.js';
+import { analyzeFactors, benchmarkFor } from './engines/factorEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
 import { advise } from './engines/advisorEngine.js';
@@ -95,7 +96,7 @@ const TONES = ['healthy', 'neutral', 'caution', 'risky'];
 const TONE_WORDS = { healthy: 'healthy', neutral: 'neutral', caution: 'caution', risky: 'risky' };
 const MULTIPLE_IDS = new Set(['evEbitda', 'trailingPE', 'forwardPE', 'priceToBook', 'debtToEquity']);
 // Changes read better with an explicit sign: "+4.2%" cannot be mistaken for a level.
-const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown']);
+const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown', 'relativeStrength1m', 'relativeStrength3m']);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 /**
@@ -112,6 +113,8 @@ const RANGE_INFO = Object.freeze({
 
 /** Ranges long enough for the full-year correlation rule (at least 60 overlapping returns). */
 const FULL_CORRELATION_RANGES = new Set(['1y', '5y']);
+// The market a portfolio's beta is measured against (V3.1).
+const PORTFOLIO_BENCHMARK = '^GSPC';
 
 /** Escape text for safe insertion into HTML. Every dynamic string goes through this. */
 function esc(value) {
@@ -290,6 +293,18 @@ function windowFor(ticker, range = store.getState().range) {
     const source = info.id === '5y' ? analysis.asset.longSeries : analysis.asset.series;
     const series = sliceSeries(source, info.id);
     const result = analyzeWindow(analysis.asset, series, info.label);
+    // Beta, R², idiosyncratic volatility and relative strength against the asset's benchmark,
+    // over the same window (the benchmark is never benchmarked itself, so this recurses once).
+    const benchmarkTicker = benchmarkFor(analysis.asset);
+    const benchmarkView = benchmarkTicker && analyses.has(benchmarkTicker) ? windowFor(benchmarkTicker, info.id) : null;
+    const factors = analyzeFactors({
+      asset: analysis.asset,
+      series,
+      benchmark: benchmarkView ? analyses.get(benchmarkTicker).asset : null,
+      benchmarkSeries: benchmarkView ? benchmarkView.series : null,
+      windowLabel: info.label,
+      minOverlap: FULL_CORRELATION_RANGES.has(info.id) ? CORR_CONFIG.minOverlap : CORR_CONFIG.minWindowOverlap,
+    });
     cached = Object.freeze({
       range: info.id,
       info,
@@ -298,6 +313,7 @@ function windowFor(ticker, range = store.getState().range) {
       metrics: result.metrics,
       // EWMA volatility and historical VaR/CVaR over the same window.
       risk: analyzeRisk(analysis.asset, series, info.label),
+      factors,
       from: result.from,
       to: result.to,
       observations: result.observations,
@@ -508,11 +524,21 @@ function portfolioRequest(state) {
     };
   });
   const mix = weights.map((entry) => `${entry.ticker}:${entry.weight}`).join(',');
+  // The S&P 500 over the same window, for the portfolio's beta.
+  const market = windowFor(PORTFOLIO_BENCHMARK, info.id);
+  const benchmark = market ? {
+    ticker: market.asset.ticker,
+    currency: market.asset.currency,
+    assetClass: market.asset.assetClass,
+    market: market.asset.market,
+    series: { dates: market.series.dates, close: market.series.close },
+  } : null;
   return {
     key: jobKey('portfolio', state.snapshot.generatedAt, info.id, state.currency, mix, fx ? fx.rate : null, riskFree ? riskFree.yield : null),
     payload: {
       assets,
       weights,
+      benchmark,
       baseCurrency: state.currency,
       fx: fx ? { rate: fx.rate, series: state.snapshot.fx.series } : null,
       riskFree,
@@ -619,6 +645,7 @@ function traceIndex(ticker) {
     analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics] : null,
     view ? view.metrics : null,
     view ? view.risk.metrics : null,
+    view ? view.factors.metrics : null,
     record ? record.metrics : null,
     sizing ? sizing.metrics : null,
     tail,
