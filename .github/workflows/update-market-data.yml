@@ -16,7 +16,8 @@ name: Update market data and deploy
 #
 # One-time setup: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
 # Optional: repository secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID turn on the
-# daily briefing. Without them the briefing step does nothing.
+# daily briefing. TELEGRAM_CHAT_ID may list several chats separated by commas; logs
+# name them only as "recipient k of n". Without the secrets the step does nothing.
 
 on:
   schedule:

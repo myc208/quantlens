@@ -844,6 +844,55 @@ class TelegramBriefing(unittest.TestCase):
         self.assertEqual(result, "failed")
         self.assertIn("Every check passed", calls[0]["body"]["text"].replace("\\", ""))
 
+    def test_chat_ids_are_split_on_commas_trimmed_and_deduplicated(self):
+        ids, invalid = ff.parse_chat_ids(" 123456789, -1001234567890 ,, @quant_lens_feed, 123456789, abc, 12x, ")
+        self.assertEqual(ids, ["123456789", "-1001234567890", "@quant_lens_feed"])
+        self.assertEqual(invalid, 2)
+        self.assertEqual(ff.parse_chat_ids("-1001234"), (["-1001234"], 0))
+        self.assertEqual(ff.parse_chat_ids(None), ([], 0))
+        self.assertEqual(ff.parse_chat_ids(" , ,"), ([], 0))
+
+    def test_every_recipient_gets_the_same_message_and_a_failure_does_not_stop_the_others(self):
+        ids = ["111111", "-1002222222222", "333333"]
+        fake, calls = self.opener({"ok": True}, self.http_error(403, "Forbidden: bot was blocked by the user"), {"ok": True})
+        env = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": ", ".join(ids), **self.PASSED}
+        with self.assertLogs(ff.LOG, level="WARNING") as logs:
+            self.assertEqual(self.deliver(env, fake), "partial")
+        self.assertEqual([call["body"]["chat_id"] for call in calls], ids)
+        self.assertEqual(len({call["body"]["text"] for call in calls}), 1)
+        joined = "\n".join(logs.output)
+        self.assertIn("recipient 2 of 3", joined)
+        self.assertIn("reached 2 of 3 recipients", joined)
+        for secret in [self.TOKEN, *ids]:
+            self.assertNotIn(secret, joined)  # chat ids are not masked by GitHub once the secret is split
+
+    def test_all_recipients_reached_is_a_plain_success(self):
+        fake, calls = self.opener({"ok": True}, {"ok": True})
+        env = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": "111111,222222", **self.PASSED}
+        with self.assertNoLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(self.deliver(env, fake), "sent")
+        self.assertEqual(len(calls), 2)
+
+    def test_the_markdown_fallback_is_decided_per_recipient(self):
+        fake, calls = self.opener(self.http_error(400, "Bad Request: can't parse entities"), {"ok": True}, {"ok": True})
+        env = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": "111111,222222", **self.PASSED}
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(self.deliver(env, fake), "sent-plain")
+        self.assertEqual([("parse_mode" in call["body"]) for call in calls], [True, False, True])
+
+    def test_invalid_entries_are_skipped_with_a_count_never_their_values(self):
+        fake, calls = self.opener({"ok": True})
+        env = {"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": "not-an-id, 111111", **self.PASSED}
+        with self.assertLogs(ff.LOG, level="WARNING") as logs:
+            self.assertEqual(self.deliver(env, fake), "sent")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("1 TELEGRAM_CHAT_ID entry was skipped", "\n".join(logs.output))
+        self.assertNotIn("not-an-id", "\n".join(logs.output))
+        fake, calls = self.opener()
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            self.assertEqual(self.deliver({"TELEGRAM_BOT_TOKEN": self.TOKEN, "TELEGRAM_CHAT_ID": "nope"}, fake), "failed")
+        self.assertEqual(calls, [])
+
     def test_pipeline_outcome_names_the_first_step_that_did_not_succeed(self):
         self.assertEqual(ff.pipeline_outcome(self.PASSED), ("passed", None))
         self.assertEqual(ff.pipeline_outcome({}), ("unknown", None))

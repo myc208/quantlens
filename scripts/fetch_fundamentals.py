@@ -20,9 +20,10 @@ plus two macro inputs: the US and Singapore 10-year government yields, used as
 risk-free rates, and one year of daily USD/SGD closes.
 
 With ``--notify`` it instead sends a short daily briefing about the snapshot to
-Telegram (top BUY and SELL signals, notable shifts in headline tone, and the
-pipeline's status). It never fails: missing credentials skip it silently, and
-an unreachable API is a warning.
+Telegram (top BUY and SELL signals, earnings in the next 30 days, notable shifts
+in headline tone, and the pipeline's status) to one chat or several:
+TELEGRAM_CHAT_ID may hold comma-separated ids. It never fails: missing
+credentials skip it silently, and an unreachable API is a warning.
 
 Design rules
 ------------
@@ -220,6 +221,8 @@ BRIEFING_EARNINGS_DAYS = 30      # list earnings releases this many calendar day
 BRIEFING_MAX_EARNINGS = 5
 SENTIMENT_SHIFT_MIN = 0.25       # a move in headline tone at least this large is notable
 SIGNALS_SCRIPT = REPO_ROOT / "scripts" / "signals.mjs"
+# A Telegram chat id: a user or group number (groups and channels are negative), or a public @channel.
+CHAT_ID_RE = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$")
 SIGNALS_TIMEOUT = 60.0
 # The refresh job's steps, in order, with the environment variable carrying each outcome.
 PIPELINE_STEPS = (
@@ -2326,19 +2329,80 @@ def send_telegram(text: str, token: str, chat_id: str, parse_mode: str | None,
         return False, None, f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"
 
 
+def parse_chat_ids(raw: str | None) -> tuple[list[str], int]:
+    """Recipients from TELEGRAM_CHAT_ID: one id, or several separated by commas.
+
+    Spaces around each entry are stripped, empty entries ignored and repeats
+    dropped (the first one wins). Returns the valid ids and how many entries were
+    skipped because they are not chat ids. The values themselves are never logged:
+    GitHub masks the secret as a whole, not the pieces of it after a split.
+    """
+    ids: list[str] = []
+    invalid = 0
+    for entry in (raw or "").split(","):
+        value = entry.strip()
+        if not value:
+            continue
+        if not CHAT_ID_RE.match(value):
+            invalid += 1
+        elif value not in ids:
+            ids.append(value)
+    return ids, invalid
+
+
+def send_to_recipient(texts: dict[bool, str], token: str, chat_id: str, label: str,
+                      opener: Callable[..., Any] | None, pause: Callable[[float], None],
+                      redact: Callable[[str | None], str]) -> str:
+    """Send one briefing to one chat: Markdown first, plain text if Telegram rejects the formatting,
+    one retry on a network or server error. Returns 'sent', 'sent-plain' or 'failed'. Logs only `label`."""
+    for markdown in (True, False):
+        status = None
+        description = None
+        for attempt in range(2):
+            delivered, status, description = send_telegram(texts[markdown], token, chat_id, "MarkdownV2" if markdown else None, opener)
+            if delivered:
+                return "sent" if markdown else "sent-plain"
+            transient = status is None or status == 429 or status >= 500
+            if not transient or attempt == 1:
+                break
+            pause(3.0)
+        if status == 400 and markdown:
+            # Usually a formatting problem: send the same content without Markdown.
+            warn(f"Telegram rejected the Markdown briefing for {label} ({redact(description)}); retrying as plain text")
+            continue
+        warn(f"the daily briefing was not delivered to {label}: HTTP {status or '-'} {redact(description)}")
+        return "failed"
+    return "failed"
+
+
 def deliver_briefing(snapshot_path: Path, previous_path: Path | None, env: dict[str, str],
                      opener: Callable[..., Any] | None = None, now: datetime | None = None,
                      signals_source: Callable[[Path], list[dict[str, Any]] | None] = compute_signals,
                      pause: Callable[[float], None] = time.sleep) -> str:
-    """Build and send the briefing. Returns 'skipped', 'sent', 'sent-plain' or 'failed'. Never raises."""
+    """Build the briefing once and send it to every recipient in TELEGRAM_CHAT_ID.
+
+    Returns 'skipped' (not configured), 'sent' (every recipient, as Markdown),
+    'sent-plain' (every recipient, at least one as plain text), 'partial' (some
+    recipients) or 'failed' (none). Never raises.
+    """
     token = (env.get("TELEGRAM_BOT_TOKEN") or "").strip()
-    chat_id = (env.get("TELEGRAM_CHAT_ID") or "").strip()
-    if not token or not chat_id:
+    chat_ids, invalid = parse_chat_ids(env.get("TELEGRAM_CHAT_ID"))
+    if not token or (not chat_ids and not invalid):
         LOG.debug("Telegram is not configured; the daily briefing was not sent")
         return "skipped"
 
     def redact(message: str | None) -> str:
-        return (message or "no detail").replace(token, "***")[:300]
+        text = message or "no detail"
+        for secret in [token, *chat_ids]:
+            text = text.replace(secret, "***")
+        return text[:300]
+
+    if invalid:
+        warn(f"{invalid} TELEGRAM_CHAT_ID entr{'y was' if invalid == 1 else 'ies were'} skipped: not a chat id "
+             "(use numbers such as 123456789 or -1001234567890, or @channelname, separated by commas)")
+    if not chat_ids:
+        warn("the daily briefing was not sent: TELEGRAM_CHAT_ID holds no valid chat id")
+        return "failed"
 
     try:
         outcome, failed_step = pipeline_outcome(env)
@@ -2351,24 +2415,27 @@ def deliver_briefing(snapshot_path: Path, previous_path: Path | None, env: dict[
             shifts = sentiment_shifts(previous, snapshot) if previous else None
         moment = now or datetime.now(timezone.utc)
         links = briefing_links(env)
+        # Build both versions once: every recipient gets the same message.
+        texts = {markdown: build_briefing(snapshot, signals, shifts, outcome, failed_step, moment, links, BriefingFormat(markdown))
+                 for markdown in (True, False)}
 
-        for markdown in (True, False):
-            text = build_briefing(snapshot, signals, shifts, outcome, failed_step, moment, links, BriefingFormat(markdown))
-            for attempt in range(2):
-                delivered, status, description = send_telegram(text, token, chat_id, "MarkdownV2" if markdown else None, opener)
-                if delivered:
-                    LOG.info("daily briefing sent to Telegram%s", "" if markdown else " as plain text")
-                    return "sent" if markdown else "sent-plain"
-                transient = status is None or status == 429 or status >= 500
-                if not transient or attempt == 1:
-                    break
-                pause(3.0)
-            if status == 400 and markdown:
-                # Usually a formatting problem: send the same content without Markdown.
-                warn(f"Telegram rejected the Markdown briefing ({redact(description)}); retrying as plain text")
-                continue
-            warn(f"the daily briefing was not delivered: HTTP {status or '-'} {redact(description)}")
-            return "failed"
+        results = []
+        for position, chat_id in enumerate(chat_ids, start=1):
+            label = f"recipient {position} of {len(chat_ids)}"
+            try:
+                results.append(send_to_recipient(texts, token, chat_id, label, opener, pause, redact))
+            except Exception as exc:  # noqa: BLE001 - one recipient must never stop the others
+                warn(f"the daily briefing was not delivered to {label}: {type(exc).__name__}: {redact(str(exc))}")
+                results.append("failed")
+        delivered = sum(1 for result in results if result != "failed")
+        plain = any(result == "sent-plain" for result in results)
+        if delivered == len(results):
+            LOG.info("daily briefing sent to Telegram (%d recipient%s%s)", delivered, "" if delivered == 1 else "s",
+                     ", some as plain text" if plain else "")
+            return "sent-plain" if plain else "sent"
+        if delivered:
+            warn(f"the daily briefing reached {delivered} of {len(results)} recipients")
+            return "partial"
         return "failed"
     except Exception as exc:  # noqa: BLE001 - the briefing must never fail the pipeline
         warn(f"the daily briefing was not sent: {type(exc).__name__}: {redact(str(exc))}")
@@ -2380,8 +2447,10 @@ def run_notify(settings: argparse.Namespace) -> int:
     try:
         deliver_briefing(settings.output, settings.previous, dict(os.environ))
     except Exception as exc:  # noqa: BLE001 - belt and braces: deliver_briefing already never raises
-        token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-        detail = str(exc).replace(token, "***") if token else str(exc)
+        detail = str(exc)
+        secrets = [(os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip(), *parse_chat_ids(os.environ.get("TELEGRAM_CHAT_ID"))[0]]
+        for secret in filter(None, secrets):
+            detail = detail.replace(secret, "***")
         warn(f"the daily briefing was not sent: {type(exc).__name__}: {detail[:300]}")
     return 0
 
