@@ -108,6 +108,7 @@ const SECTIONS = Object.freeze([
       { id: 'nextEarnings' },
       { id: 'earningsMove' },
       { id: 'nextExDividend' },
+      { id: 'nextMacroEvent' },
     ],
   },
   {
@@ -304,6 +305,8 @@ export function mountComparisonMatrix(root, app) {
         return isNum(meta.returns) ? sub(`From ${meta.returns} daily returns${meta.returns < 40 ? ' · rough' : ''}`) : '';
       case 'maxDrawdown':
         return metric.value < 0 ? sub(`${h.shortDate(meta.peakDate)} to ${h.shortDate(meta.troughDate)}`) : sub('No fall from a high');
+      case 'nextMacroEvent':
+        return `<span class="cell__sub${meta.within48h ? ' cell__sub--reason' : ''}">${meta.within48h ? '⚠ ' : ''}${esc(meta.title)} · ${esc(h.shortDate(meta.date))}${meta.insideSizing && !meta.within48h ? ' · inside the sizing horizon' : ''}</span>`;
       case 'averageVolume':
         return sub(`${meta.unitName} a day${meta.thin ? ` · ${meta.zeroDays} days without trades` : ''}`);
       case 'dollarVolume':

@@ -7,6 +7,12 @@
  * technical, fundamental and advisor engines over the same snapshot, with no
  * second implementation in Python to drift out of step.
  *
+ * V3.2 adds what the risk-first briefing needs and only the engines can compute:
+ * each asset's bucket, the latest session's move in σ (the bootstrap's own filtered
+ * residual), 3-month relative strength, the next ex-dividend date and the timing of
+ * the next earnings release. Macro events and the regime come straight from the
+ * snapshot, which Python already reads.
+ *
  *   node scripts/signals.mjs [data/market_snapshot.json]
  *
  * Prints one JSON document to stdout and exits 0, or prints a reason to stderr
@@ -21,33 +27,63 @@ import { analyzeFundamentals } from '../src/engines/fundamentalEngine.js';
 import { advise } from '../src/engines/advisorEngine.js';
 import { valueOf } from '../src/core/derivationTracer.js';
 import { analyzeEvents } from '../src/engines/eventEngine.js';
+import { holidaysFor } from '../src/engines/macroCalendarEngine.js';
+import { latestShock } from '../src/engines/riskEngine.js';
+import { analyzeFactors, benchmarkFor } from '../src/engines/factorEngine.js';
+
+/** US / Global (US and London listings), SGX, or Crypto (24/7). */
+function bucketOf(asset) {
+  if (asset.market === 'CRYPTO') return 'crypto';
+  if (asset.market === 'SG') return 'sgx';
+  return 'global';
+}
 
 async function main() {
   const path = process.argv[2] ?? 'data/market_snapshot.json';
   const raw = JSON.parse(await readFile(path, 'utf8'));
   const snapshot = normaliseSnapshot(raw, new Date(raw.generatedAt));
+  const calendar = snapshot.macro ? snapshot.macro.calendar : null;
+  const holidays = { US: holidaysFor(calendar, 'US'), SG: holidaysFor(calendar, 'SG') };
   const assets = snapshot.assets.map((asset) => {
     // Exactly what main.js does for each asset when the page loads.
     const technical = analyzeTechnicals(asset);
     const fundamental = analyzeFundamentals(asset, { fxRate: snapshot.fx.rate });
     const advice = advise({ asset, technical, fundamental });
     const confidence = advice.metrics.confidence;
-    // Days are counted from the snapshot's own date, so the message matches the data it describes.
-    const events = analyzeEvents(asset, { now: new Date(raw.generatedAt) }).metrics;
+    // Days are counted from the snapshot's own date, so the message matches the data it describes;
+    // trading days skip the market's holidays from the macro calendar.
+    const events = analyzeEvents(asset, { now: new Date(raw.generatedAt), holidays: holidays[asset.market] ?? null }).metrics;
     const next = events.nextEarnings;
     const move = events.earningsMove;
+    const exDividend = events.nextExDividend;
+    const shock = latestShock(asset.longSeries.close, asset.longSeries.dates);
+    const benchmark = snapshot.byTicker[benchmarkFor(asset)] ?? null;
+    const strength = analyzeFactors({ asset, series: asset.series, benchmark, benchmarkSeries: benchmark ? benchmark.series : null }).metrics.relativeStrength3m;
     return {
       ticker: asset.ticker,
       name: asset.name,
       assetClass: asset.assetClass,
+      market: asset.market,
+      bucket: bucketOf(asset),
+      tradable: asset.assetClass !== 'index',
+      quoteAsOf: asset.quote.asOf,
       verdict: advice.verdict ?? null,
       composite: valueOf(advice.metrics.compositeScore),
       technical: valueOf(technical.metrics.technicalScore),
       fundamental: valueOf(fundamental.metrics.fundamentalScore),
       confidence: confidence.status === 'ok' ? confidence.value : null,
-      nextEarnings: next.status === 'ok' ? { date: next.meta.date, days: next.value, tradingDays: next.meta.tradingDays } : null,
+      nextEarnings: next.status === 'ok'
+        ? { date: next.meta.date, dateTo: next.meta.dateTo ?? null, timing: next.meta.timing ?? null, days: next.value, tradingDays: next.meta.tradingDays }
+        : null,
       typicalMove: move.status === 'ok' ? move.value : null,
       worstMove: move.status === 'ok' ? move.meta.worst : null,
+      nextExDividend: exDividend.status === 'ok'
+        ? { date: exDividend.meta.date, estimated: Boolean(exDividend.meta.estimated), days: exDividend.value }
+        : null,
+      dailyReturn: shock ? shock.dailyReturn : null,
+      zScore: shock ? shock.z : null,
+      relativeStrength3m: strength.status === 'ok' ? strength.value : null,
+      benchmark: strength.status === 'ok' ? strength.meta.benchmark : null,
     };
   });
   process.stdout.write(`${JSON.stringify({ generatedAt: raw.generatedAt, warnings: snapshot.warnings, assets })}\n`);

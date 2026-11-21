@@ -41,6 +41,7 @@ import { analyzeEvents, gapRisk } from './engines/eventEngine.js';
 import { analyzeRegime, describeRegime } from './engines/regimeEngine.js';
 import { analyzeFactors, benchmarkFor } from './engines/factorEngine.js';
 import { analyzeLiquidity } from './engines/liquidityEngine.js';
+import { analyzeMacro, describeMacro, holidaysFor } from './engines/macroCalendarEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
 import { advise } from './engines/advisorEngine.js';
@@ -256,8 +257,10 @@ const h = Object.freeze({
 const analyses = new Map();
 // The market regime: one reading per snapshot, shared by every view.
 let regimeAnalysis = analyzeRegime(null);
+// The macro calendar: next FOMC decision or CPI release, shared by every view (V3.2).
+let macroAnalysis = analyzeMacro(null);
 
-function analyseAsset(asset, fxRate, now) {
+function analyseAsset(asset, fxRate, now, holidays = null) {
   const technical = analyzeTechnicals(asset);
   const fundamental = analyzeFundamentals(asset, { fxRate });
   const advisor = advise({ asset, technical, fundamental });
@@ -265,7 +268,7 @@ function analyseAsset(asset, fxRate, now) {
   const sentiment = analyzeSentiment(asset, { now });
   const forecast = analyzeForecast(asset);
   // Scheduled events: earnings and ex-dividend dates, and the typical earnings-day move.
-  const events = analyzeEvents(asset, { now });
+  const events = analyzeEvents(asset, { now, holidays });
   // Liquidity from the last 20 sessions: volume, traded value, Amihud and the tick-floor spread.
   const liquidity = analyzeLiquidity(asset, { fxRate });
   return { asset, technical, fundamental, advisor, sentiment, forecast, events, liquidity };
@@ -647,7 +650,7 @@ function traceIndex(ticker) {
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
   const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
-  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis];
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
@@ -665,6 +668,7 @@ function traceIndex(ticker) {
     current.heat,
     held ? held.metrics : null,
     regimeAnalysis.metrics,
+    macroAnalysis.metrics,
   );
   indexCache.set(cacheKey, { parts, index });
   return index;
@@ -695,6 +699,8 @@ const app = {
   backtest,
   regime: () => regimeAnalysis,
   describeRegime: () => describeRegime(regimeAnalysis),
+  macro: () => macroAnalysis,
+  describeMacro: () => describeMacro(macroAnalysis),
   traceIndex,
   trace,
   explain: (id, profile) => getExplainer(id, profile),
@@ -850,8 +856,12 @@ async function boot() {
     correlationMemo = { key: null, value: null };
     comparisonMemo = { key: null, value: EMPTY_COMPARISON };
     const now = new Date();
-    for (const asset of snapshot.assets) analyses.set(asset.ticker, analyseAsset(asset, snapshot.fx.rate, now));
+    const calendar = snapshot.macro ? snapshot.macro.calendar : null;
+    // Market holidays from the macro calendar make the event layer's trading-day counts exact.
+    const holidays = { US: holidaysFor(calendar, 'US'), SG: holidaysFor(calendar, 'SG') };
+    for (const asset of snapshot.assets) analyses.set(asset.ticker, analyseAsset(asset, snapshot.fx.rate, now, holidays[asset.market] ?? null));
     regimeAnalysis = analyzeRegime(snapshot.macro ? snapshot.macro.regime : null);
+    macroAnalysis = analyzeMacro(calendar, { now });
 
     store.dispatch(actions.snapshotLoaded(snapshot, snapshot.warnings));
     // Canonicalise the address bar: drop unknown tickers and malformed values from a hand-edited link.

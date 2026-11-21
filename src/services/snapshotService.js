@@ -47,6 +47,10 @@ export const MAX_REGIME_ROWS = 1400;
 const REGIME_STATES = ['normal', 'elevated', 'stressed'];
 const REGIME_RULE_KEYS = ['elevatedLevel', 'elevatedRatio', 'invertedRatio'];
 const REGIME_LEVEL_BOUNDS = Object.freeze({ min: 1, max: 200 });
+// V3.2: macro.calendar, the hand-kept FOMC / CPI / market-holiday calendar.
+export const CALENDAR_TYPES = Object.freeze(['fomc-decision', 'fomc-meeting', 'fomc-minutes', 'cpi', 'market-holiday', 'market-early-close']);
+const TIMED_CALENDAR_TYPES = ['fomc-decision', 'fomc-minutes', 'cpi', 'market-early-close'];
+const OFFSET_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
 
 const ASSET_CLASSES = ['equity', 'etf', 'index', 'crypto'];
 const MARKETS = ['US', 'SG', 'UK', 'CRYPTO'];
@@ -443,10 +447,52 @@ export function normaliseRegime(raw) {
   };
 }
 
+function unavailableCalendar(note) {
+  return Object.freeze({ status: 'unavailable', updated: null, coverage: null, events: Object.freeze([]), note });
+}
+
+/**
+ * The macro calendar block (V3.2). Never throws: a missing block (a snapshot written before
+ * V3.2) or a malformed one becomes "unavailable" with a reason.
+ * @returns {{ calendar: object, problem: string|null }}
+ */
+export function normaliseCalendar(raw) {
+  if (raw === undefined || raw === null) {
+    return { calendar: unavailableCalendar('This snapshot was written before the macro calendar was added.'), problem: null };
+  }
+  if (!isPlainObject(raw) || !['fresh', 'unavailable'].includes(raw.status)) {
+    return { calendar: unavailableCalendar('The macro calendar block is malformed.'), problem: 'the macro calendar block is malformed' };
+  }
+  if (raw.status === 'unavailable') return { calendar: unavailableCalendar(textOrNull(raw.note) ?? 'The macro calendar could not be read.'), problem: null };
+  const fail = (why) => ({ calendar: unavailableCalendar(`The macro calendar is unusable: ${why}.`), problem: `the macro calendar is unusable: ${why}` });
+  const coverage = raw.coverage;
+  if (!isPlainObject(coverage) || !isIsoDate(coverage.from) || !isIsoDate(coverage.to) || !isIsoDate(raw.updated)) return fail('its dates are missing');
+  if (!Array.isArray(raw.events)) return fail('it has no event list');
+  const events = [];
+  let previous = '';
+  for (const event of raw.events) {
+    if (!isPlainObject(event) || !CALENDAR_TYPES.includes(event.type) || !isIsoDate(event.date) || event.date < previous) {
+      return fail('an event is malformed or out of order');
+    }
+    if (TIMED_CALENDAR_TYPES.includes(event.type) && !(typeof event.at === 'string' && OFFSET_TIME_PATTERN.test(event.at) && event.at.slice(0, 10) === event.date)) {
+      return fail(`the ${event.type} on ${event.date} has no valid time`);
+    }
+    previous = event.date;
+    events.push(Object.freeze({ ...event }));
+  }
+  return {
+    problem: null,
+    calendar: Object.freeze({
+      status: 'fresh', updated: raw.updated, coverage: Object.freeze({ from: coverage.from, to: coverage.to }),
+      events: Object.freeze(events), note: textOrNull(raw.note),
+    }),
+  };
+}
+
 /**
  * Validate and normalise the macro block. Never throws: a missing or malformed
  * rate becomes "unavailable", and anything that needs it (the Sharpe ratio)
- * reports N/A with that reason. The same holds for the market regime.
+ * reports N/A with that reason. The same holds for the market regime and the calendar.
  * @returns {{ macro: object, problems: string[] }}
  */
 export function normaliseMacro(raw) {
@@ -460,7 +506,9 @@ export function normaliseMacro(raw) {
   }
   const { regime, problem } = normaliseRegime(isPlainObject(raw) ? raw.regime : undefined);
   if (problem) problems.push(problem);
-  return { macro: Object.freeze({ riskFree: Object.freeze(riskFree), regime }), problems };
+  const { calendar, problem: calendarProblem } = normaliseCalendar(isPlainObject(raw) ? raw.calendar : undefined);
+  if (calendarProblem) problems.push(calendarProblem);
+  return { macro: Object.freeze({ riskFree: Object.freeze(riskFree), regime, calendar }), problems };
 }
 
 function normaliseFxSeries(raw) {
@@ -763,7 +811,7 @@ export function describeAge(generatedAt, now = new Date()) {
  * The result always has the v2 shape:
  *   { schemaVersion, generatedAt, ageHours, ageDays, freshness,
  *     fx: { base, quote, rate, asOf, series: { dates, rates } },
- *     macro: { riskFree: { USD, SGD }, regime },
+ *     macro: { riskFree: { USD, SGD }, regime, calendar },
  *     assets: [{ ...core, news, forecast }], byTicker, sectors, staleTickers, warnings }
  */
 export function normaliseSnapshot(raw, now = new Date()) {

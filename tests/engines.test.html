@@ -193,6 +193,7 @@
     import * as regimes from '../src/engines/regimeEngine.js';
     import * as factors from '../src/engines/factorEngine.js';
     import * as liquidityEngine from '../src/engines/liquidityEngine.js';
+    import * as macroEngine from '../src/engines/macroCalendarEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -1882,6 +1883,7 @@
         regimes.REGIME_METRIC_IDS.forEach((id) => ids.add(id));
         factors.FACTOR_METRIC_IDS.forEach((id) => ids.add(id));
         liquidityEngine.LIQUIDITY_METRIC_IDS.forEach((id) => ids.add(id));
+        macroEngine.MACRO_METRIC_IDS.forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -4254,6 +4256,127 @@
             expect(units).toBeAtMost(0.05 * averageVolume + 1e-9);
             expect(units % 100).toBe(0);
           }
+        }
+      });
+    });
+
+    /* ================================================================== */
+    /* 31. V3.2 macro calendar: FOMC, CPI and market holidays               */
+    /* ================================================================== */
+
+    // A small calendar in the snapshot block's format.
+    const CALENDAR_BLOCK = {
+      status: 'fresh', updated: '2026-11-22', coverage: { from: '2026-11-01', to: '2027-12-31' }, note: null,
+      events: [
+        { type: 'market-holiday', date: '2026-11-26', market: 'US', name: 'Thanksgiving Day' },
+        { type: 'market-early-close', date: '2026-11-27', at: '2026-11-27T13:00:00-05:00', market: 'US', name: 'Day after Thanksgiving' },
+        { type: 'fomc-decision', date: '2026-12-09', at: '2026-12-09T14:00:00-05:00', meeting: '2026-12-08/09', projections: true },
+        { type: 'cpi', date: '2026-12-10', at: '2026-12-10T08:30:00-05:00', period: '2026-11' },
+        { type: 'market-holiday', date: '2026-12-25', market: 'SG', name: 'Christmas Day' },
+        { type: 'market-holiday', date: '2026-12-25', market: 'US', name: 'Christmas Day' },
+        { type: 'fomc-minutes', date: '2026-12-30', at: '2026-12-30T14:00:00-05:00', meeting: '2026-12-08/09' },
+        { type: 'cpi', date: '2027-03-10', at: '2027-03-10T08:30:00-05:00', period: '2027-02' },
+        { type: 'cpi', date: '2027-04-13', at: '2027-04-13T08:30:00-04:00', period: '2027-03' },
+        { type: 'fomc-meeting', date: '2027-10-27', meeting: '2027-10-26/27', decision: false },
+      ],
+    };
+    const calendarAt = () => snapshotService.normaliseCalendar(CALENDAR_BLOCK).calendar;
+
+    suite('macro calendar: reading, timing and holidays', () => {
+      test('a valid block is kept; a missing one is simply unavailable; a malformed one says so', () => {
+        const { calendar, problem } = snapshotService.normaliseCalendar(CALENDAR_BLOCK);
+        expect(problem).toBeNull();
+        expect(calendar.events.length).toBe(10);
+        expect(Object.isFrozen(calendar.events)).toBeTrue();
+        const old = snapshotService.normaliseCalendar(undefined);
+        expect(old.problem).toBeNull();
+        expect(old.calendar.note).toMatch(/before the macro calendar/);
+        const shuffled = snapshotService.normaliseCalendar({ ...CALENDAR_BLOCK, events: [...CALENDAR_BLOCK.events].reverse() });
+        expect(shuffled.calendar.status).toBe('unavailable');
+        expect(shuffled.problem).toMatch(/out of order/);
+        const untimed = snapshotService.normaliseCalendar({ ...CALENDAR_BLOCK, events: [{ type: 'cpi', date: '2026-12-10', period: '2026-11' }] });
+        expect(untimed.problem).toMatch(/no valid time/);
+      });
+      test('times carry their own offset: 8:30 New York is 13:30 UTC in winter and 12:30 UTC in summer', () => {
+        const [winter, summer] = calendarAt().events.filter((event) => event.type === 'cpi' && event.date >= '2027-01-01');
+        expect(new Date(macroEngine.eventTime(winter)).toISOString()).toBe('2027-03-10T13:30:00.000Z');
+        expect(new Date(macroEngine.eventTime(summer)).toISOString()).toBe('2027-04-13T12:30:00.000Z');
+        expect(macroEngine.eventClock(calendarAt().events[2])).toBe('2:00 p.m. New York (3:00 a.m. Thu Singapore)');
+      });
+      test('titles in plain words', () => {
+        const [holiday, early, decision, cpi, , , minutes] = calendarAt().events;
+        expect(macroEngine.eventTitle(decision)).toBe('FOMC rate decision and projections');
+        expect(macroEngine.eventTitle(cpi)).toBe('US CPI for November');
+        expect(macroEngine.eventTitle(minutes)).toBe('FOMC minutes (8–9 Dec meeting)');
+        expect(macroEngine.eventTitle(holiday)).toBe('US markets closed: Thanksgiving Day');
+        expect(macroEngine.eventTitle(early)).toMatch(/close at 1:00 p.m./);
+        expect(macroEngine.eventTitle(calendarAt().events[9])).toMatch(/no policy decision/);
+      });
+      test('holidays come off the trading-day count: Thanksgiving week has four US sessions', () => {
+        const us = macroEngine.holidaysFor(calendarAt(), 'US');
+        expect(us.has('2026-11-26')).toBeTrue();
+        expect(eventsEngine.tradingDaysBetween('2026-11-23', '2026-11-30', 'equity')).toBe(5);
+        expect(eventsEngine.tradingDaysBetween('2026-11-23', '2026-11-30', 'equity', us)).toBe(4);
+        expect(eventsEngine.tradingDaysBetween('2026-11-23', '2026-11-30', 'crypto', us)).toBe(7);   // crypto never closes
+        expect(macroEngine.holidaysFor(calendarAt(), 'SG').has('2026-11-26')).toBeFalse();
+        expect(macroEngine.holidaysFor(null, 'US').size).toBe(0);
+      });
+      test('the next market-moving event, and the 48-hour window inclusive at exactly 48 hours', () => {
+        const at = (iso) => macroEngine.analyzeMacro(calendarAt(), { now: new Date(iso) });
+        const sunday = at('2026-11-22T22:30:00Z');
+        expect(sunday.next.type).toBe('fomc-decision');
+        const metric = sunday.metrics.nextMacroEvent;
+        expect(metric.value).toBe(17);
+        expect(metric.meta.within48h).toBeFalse();
+        expect(metric.meta.tradingDays).toBe(12);                             // 23 Nov to 9 Dec, less Thanksgiving
+        expect(metric.meta.insideSizing).toBeTrue();
+        expect(sunday.next7.map((event) => event.type)).toEqual(['market-holiday', 'market-early-close']);
+        expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(at('2026-12-07T19:00:00Z').metrics.nextMacroEvent.meta.within48h).toBeTrue();   // exactly 48 h before 19:00 UTC
+        expect(at('2026-12-07T18:59:00Z').metrics.nextMacroEvent.meta.within48h).toBeFalse();
+        const between = at('2026-12-09T19:01:00Z');                          // the decision has passed
+        expect(between.next.type).toBe('cpi');
+        expect(between.within48h.length).toBe(1);
+        expect(macroEngine.describeMacro(between)).toEqual({ label: 'CPI Thu 10 Dec', soon: true, pill: 'tomorrow', title: 'US CPI for November' });
+      });
+      test('without a calendar, or past its end, the metric says why', () => {
+        const none = macroEngine.analyzeMacro(null);
+        expect(none.metrics.nextMacroEvent.status).toBe('na');
+        expect(none.metrics.nextMacroEvent.naReason).toMatch(/no macro calendar/);
+        const after = macroEngine.analyzeMacro(calendarAt(), { now: new Date('2027-06-01T00:00:00Z') });
+        expect(after.metrics.nextMacroEvent.naReason).toMatch(/lists no FOMC decision or CPI release after today/);
+        expect(macroEngine.describeMacro(none).label).toBe('N/A');
+      });
+      test('real snapshot: the calendar reads cleanly and every asset\'s event metrics stay valid with holidays', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const calendar = snapshot.macro.calendar;
+        expect(snapshot.warnings.some((warning) => /calendar/.test(warning))).toBeFalse();
+        const result = macroEngine.analyzeMacro(calendar, { now: new Date(raw.generatedAt) });
+        expect(tracer.validateTrace(result.metrics.nextMacroEvent)).toEqual([]);
+        const holidays = { US: macroEngine.holidaysFor(calendar, 'US'), SG: macroEngine.holidaysFor(calendar, 'SG') };
+        for (const asset of snapshot.assets) {
+          const events = eventsEngine.analyzeEvents(asset, { now: new Date(raw.generatedAt), holidays: holidays[asset.market] ?? null });
+          for (const metric of Object.values(events.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        }
+      });
+    });
+
+    suite('briefing: the latest move in σ is the bootstrap\'s own residual', () => {
+      test('latestShock equals the last filtered residual, on a synthetic series and on every real asset', async () => {
+        const closes = randomWalk(120, { seed: 77, sigma: 0.02 });
+        const shock = risk.latestShock(closes);
+        const filtered = risk.filteredResiduals(closes);
+        expect(shock.z).toBeCloseTo(filtered.residuals[filtered.residuals.length - 1], 1e-12);
+        expect(shock.dailyReturn).toBeCloseTo(closes[119] / closes[118] - 1, 1e-15);
+        expect(risk.latestShock(closes.slice(0, 15))).toBeNull();           // too short to seed the EWMA
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const real = risk.latestShock(asset.longSeries.close, asset.longSeries.dates);
+          const residuals = risk.filteredResiduals(asset.longSeries.close).residuals;
+          expect(real.z).toBeCloseTo(residuals[residuals.length - 1], 1e-12);
+          expect(real.date).toBe(asset.longSeries.dates[asset.longSeries.dates.length - 1]);
         }
       });
     });

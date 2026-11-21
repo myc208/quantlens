@@ -615,6 +615,13 @@ const ENTRIES = {
     healthy: '2 or more.',
     risky: 'Below 1.3: effectively one bet.',
   },
+  nextMacroEvent: {
+    term: 'Next FOMC / CPI',
+    what: 'Days to the next Federal Reserve rate decision or US inflation (CPI) release, from a calendar kept by hand from the Fed and BLS schedules, with what else is due in the next 7 and 30 days.',
+    why: 'Scheduled announcements move every asset at once, often with a gap at the open that no stop can catch. Knowing they are coming is the cheapest risk control there is.',
+    healthy: 'More than 48 hours away, outside the plan for any trade you are about to open.',
+    risky: 'Within 48 hours. Context only: it changes no score, verdict or position size.',
+  },
   marketRegime: {
     term: 'Market regime',
     what: 'A three-way reading of the US options market from the VIX curve: normal, elevated, or stressed when the curve is inverted (VIX at or above VIX3M).',

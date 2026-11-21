@@ -901,65 +901,6 @@ class TelegramBriefing(unittest.TestCase):
         fetch = {key: "skipped" for key in self.PASSED} | {"QUANTLENS_FETCH": "failure"}
         self.assertEqual(ff.pipeline_outcome(fetch), ("failed", "data refresh"))
 
-    def build(self, outcome="passed", failed_step=None, signals=SIGNALS, shifts=None, markdown=True, links=()):
-        return ff.build_briefing(self.snapshot, signals, shifts, outcome, failed_step, NOW, list(links),
-                                 ff.BriefingFormat(markdown))
-
-    def test_signals_are_ranked_best_buy_first_and_worst_sell_first(self):
-        text = self.build(markdown=False)
-        self.assertLess(text.index("Top BUY signals"), text.index("1. MU"))
-        self.assertLess(text.index("1. MU"), text.index("2. D05.SI"))
-        self.assertLess(text.index("Top SELL signals"), text.index("1. ETH-USD"))
-        self.assertLess(text.index("1. ETH-USD"), text.index("2. BRK-B"))
-        self.assertIn("81/100 · High confidence", text)
-        self.assertIn("All verdicts: 2 BUY · 1 HOLD · 2 SELL", text)
-        self.assertNotIn("^GSPC", text)  # a HOLD is neither a top BUY nor a top SELL
-
-    def test_markdown_escapes_every_special_character_outside_code(self):
-        self.assertEqual(ff.escape_markdown_v2("D05.SI (+1.5%) [x]_*!"), r"D05\.SI \(\+1\.5%\) \[x\]\_\*\!")
-        text = self.build(links=[("Open QuantLens", "https://user.github.io/quantlens/")])
-        self.assertIn("`BRK-B`", text)        # tickers sit in code spans, unescaped
-        self.assertIn("`^GSPC`" if "^GSPC" in text else "`MU`", text)
-        self.assertIn(r"81/100 · High confidence", text)
-        self.assertIn("[Open QuantLens](https://user.github.io/quantlens/)", text)
-        self.assertIn(r"_Rule\-based signals for learning, not financial advice\._", text)
-
-    def test_a_failed_gate_holds_the_signals_back(self):
-        text = self.build(outcome="failed", failed_step="Gate 2 (browser tests)", signals=None, markdown=False)
-        self.assertIn("Gate 2 (browser tests) failed, so today's data was NOT published", text)
-        self.assertNotIn("Top BUY signals", text)
-        self.assertNotIn("Signals are unavailable", text)
-
-    def test_a_failed_refresh_reports_the_signals_of_the_last_good_snapshot(self):
-        text = self.build(outcome="failed", failed_step="data refresh", markdown=False)
-        self.assertIn("The data refresh failed, so nothing was committed", text)
-        self.assertIn("the signals below are from it", text)
-        self.assertIn("Top BUY signals", text)
-
-    def test_earnings_within_30_days_are_listed_nearest_first(self):
-        rows = [dict(row) for row in self.SIGNALS]
-        rows[0].update(nextEarnings={"date": "2026-12-17", "days": 26}, typicalMove=0.058, worstMove=-0.162)
-        rows[1].update(nextEarnings={"date": "2026-12-01", "days": 10}, typicalMove=None, worstMove=None)
-        rows[3].update(nextEarnings={"date": "2027-02-01", "days": 72}, typicalMove=0.02, worstMove=-0.03)
-        text = self.build(signals=rows, markdown=False)
-        self.assertIn("Earnings in the next 30 days", text)
-        first, second = text.index("D05.SI ~1 Dec (in 10 days)"), text.index("MU ~17 Dec (in 26 days)")
-        self.assertLess(first, second)
-        self.assertIn("typical move \u00b15.8%, worst \u221216.2%", text)
-        self.assertIn("too few past releases to size the move", text)
-        self.assertNotIn("in 72 days", text)
-        self.assertNotIn("Earnings in the next", self.build(markdown=False))  # nothing upcoming: no section
-        markdown = self.build(signals=rows)
-        self.assertIn("`MU`", markdown)
-        self.assertIn("\\(in 26 days\\)", markdown)
-
-    def test_the_message_stays_inside_telegrams_limit(self):
-        many = [{"ticker": f"T{i}", "name": "N" * 200, "verdict": "BUY", "composite": 90 - i % 40, "confidence": "High"} for i in range(400)]
-        shifts = [{"ticker": f"S{i}", "from": "positive", "to": "negative", "before": 0.5, "after": -0.5, "delta": -1.0,
-                   "headline": "H" * 400} for i in range(50)]
-        text = self.build(signals=many, shifts=shifts)
-        self.assertLessEqual(len(text), ff.TELEGRAM_MAX_CHARS)
-
     def test_sentiment_shifts_need_a_flip_or_a_large_move_in_fresh_news(self):
         def asset(ticker, label, compound, status="fresh"):
             return {"ticker": ticker, "news": {"status": status, "sentiment": {"label": label, "compound": compound},
@@ -985,24 +926,6 @@ class TelegramBriefing(unittest.TestCase):
         ])
         self.assertEqual(ff.briefing_links({}), [])
         self.assertEqual(ff.briefing_links({"GITHUB_REPOSITORY": "../evil"}), [])
-
-    @unittest.skipIf(shutil.which("node") is None, "Node.js is not installed")
-    def test_the_signals_bridge_runs_the_sites_engines_over_the_committed_snapshot(self):
-        signals = ff.compute_signals(SNAPSHOT_PATH)
-        self.assertIsNotNone(signals)
-        self.assertEqual([row["ticker"] for row in signals], [asset["ticker"] for asset in self.snapshot["assets"]])
-        for row in signals:
-            self.assertIn(row["verdict"], {"BUY", "HOLD", "SELL"}, row["ticker"])
-            self.assertTrue(0 <= row["composite"] <= 100, row["ticker"])
-        by_class = {asset["ticker"]: asset["assetClass"] for asset in self.snapshot["assets"]}
-        for row in signals:
-            if by_class[row["ticker"]] in {"etf", "index", "crypto"}:
-                self.assertEqual(row["confidence"], "Low", row["ticker"])  # technical only, by construction
-        upcoming = [row for row in signals if row["nextEarnings"]]
-        self.assertTrue(upcoming)  # the event layer reaches the briefing
-        for row in upcoming:
-            self.assertEqual(by_class[row["ticker"]], "equity")
-            self.assertGreaterEqual(row["nextEarnings"]["days"], 0)
 
 
 class SchemaV3History(unittest.TestCase):
@@ -1389,9 +1312,9 @@ class MarketRegime(unittest.TestCase):
         snapshot = {"generatedAt": "2026-11-21T11:18:28Z", "assets": [], "macro": {"regime": self.block()}}
         signals = [{"ticker": "MU", "name": "Micron", "verdict": "BUY", "composite": 70.0, "confidence": "High"}]
         plain = ff.build_briefing(snapshot, signals, None, "passed", None, NOW, [], ff.BriefingFormat(False)).split("\n")
-        self.assertTrue(plain[2].startswith("🔴 Market regime: stressed"))   # title, date, then the regime
+        self.assertTrue(plain[1].startswith("🔴 Market regime: stressed"))   # title and date, then the regime
         markdown = ff.build_briefing(snapshot, signals, None, "passed", None, NOW, [], ff.BriefingFormat(True)).split("\n")
-        self.assertIn(r"\(VIX 35\.9 above VIX3M 30\.9\)", markdown[2])
+        self.assertIn(r"\(VIX 35\.9 above VIX3M 30\.9\)", markdown[1])
         held = ff.build_briefing(snapshot, None, None, "failed", "the browser test gate (Gate 2)", NOW, [], ff.BriefingFormat(False))
         self.assertNotIn("Market regime", held)                              # unpublished data is not reported
         refresh_failed = ff.build_briefing(snapshot, signals, None, "failed", "data refresh", NOW, [], ff.BriefingFormat(False))
@@ -1406,6 +1329,390 @@ class MarketRegime(unittest.TestCase):
         self.assertEqual(ff.validate_regime(regime), [])
         if regime["status"] != "unavailable":
             self.assertGreater(len(regime["history"]), 1000)                 # five years, not one
+
+
+class MacroCalendar(unittest.TestCase):
+    """scripts/macro_calendar.json and the macro.calendar block (V3.2)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.calendar = ff.load_json(ff.DEFAULT_CALENDAR)
+
+    def mutated(self, change):
+        calendar = copy.deepcopy(self.calendar)
+        change(calendar)
+        return ff.validate_macro_calendar(calendar)
+
+    def event(self, kind):
+        return next(event for event in self.calendar["events"] if event["type"] == kind)
+
+    def test_the_committed_calendar_is_valid_and_spans_both_offsets(self):
+        self.assertEqual(ff.validate_macro_calendar(self.calendar), [])
+        offsets = {event["at"][-6:] for event in self.calendar["events"] if "at" in event}
+        self.assertEqual(offsets, {"-05:00", "-04:00"})                       # winter and summer time both present
+        kinds = {event["type"] for event in self.calendar["events"]}
+        self.assertTrue({"fomc-decision", "fomc-minutes", "cpi", "market-holiday", "fomc-meeting"} <= kinds)
+
+    def test_every_time_carries_new_yorks_offset_for_that_day(self):
+        self.assertEqual(ff.new_york_offset("2027-03-13", "08:30"), "-05:00")   # the Saturday before the clocks change
+        self.assertEqual(ff.new_york_offset("2027-03-15", "08:30"), "-04:00")
+        self.assertEqual(ff.new_york_offset("2027-11-08", "14:00"), "-05:00")
+        bad = dict(self.event("cpi"), date="2027-04-13", at="2027-04-13T08:30:00-05:00", period="2027-03")
+        self.assertTrue(any("08:30:00-04:00" in error for error in ff.validate_calendar_event(bad, "e")))
+        late = dict(self.event("cpi"), at=self.event("cpi")["at"].replace("08:30", "09:00"))
+        self.assertTrue(ff.validate_calendar_event(late, "e"))               # CPI is always 08:30
+
+    def test_fomc_rules(self):
+        decision = self.event("fomc-decision")
+        self.assertEqual(ff.meeting_days("2026-12-08/09"), (date(2026, 12, 8), date(2026, 12, 9)))
+        self.assertEqual(ff.meeting_days("2027-04-30/01"), (date(2027, 4, 30), date(2027, 5, 1)))  # across a month end
+        self.assertIsNone(ff.meeting_days("2026-12-08/10"))
+        wrong_day = dict(decision, date="2026-12-08", at="2026-12-08T14:00:00-05:00")
+        self.assertTrue(any("second day" in error for error in ff.validate_calendar_event(wrong_day, "e")))
+        self.assertTrue(ff.validate_calendar_event(dict(decision, projections=False), "e"))
+        no_decision = {"type": "fomc-meeting", "date": "2027-10-27", "meeting": "2027-10-26/27", "decision": True}
+        self.assertTrue(ff.validate_calendar_event(no_decision, "e"))
+        strategy = [event for event in self.calendar["events"] if event["type"] == "fomc-meeting"]
+        self.assertEqual([event["date"] for event in strategy], ["2027-10-27"])   # no decision at the strategy meeting
+        self.assertNotIn("at", strategy[0])
+
+    def test_derived_minutes_are_three_weeks_after_the_decision(self):
+        def shift(calendar):
+            minutes = next(event for event in calendar["events"] if event["type"] == "fomc-minutes" and event.get("derived"))
+            minutes["date"] = "2027-02-18"
+            minutes["at"] = "2027-02-18T14:00:00-05:00"
+        self.assertTrue(any("21 days" in error for error in self.mutated(shift)))
+
+    def test_structure_order_and_duplicates(self):
+        self.assertTrue(self.mutated(lambda c: c["events"].reverse()))
+        self.assertTrue(self.mutated(lambda c: c["events"].append(copy.deepcopy(c["events"][-1]))))
+        self.assertTrue(self.mutated(lambda c: c["events"][0].update(type="nfp")))
+        self.assertTrue(self.mutated(lambda c: c["events"][0].update(extra=1)))
+        self.assertTrue(self.mutated(lambda c: c.update(extra=1)))
+        self.assertTrue(self.mutated(lambda c: c["sources"].update(fomc="http://insecure.example")))
+        weekend = {"type": "market-holiday", "date": "2027-05-01", "market": "SG", "name": "Labour Day"}
+        self.assertTrue(any("weekend" in error for error in ff.validate_calendar_event(weekend, "e")))
+        old_period = dict(self.event("cpi"), period=self.event("cpi")["date"][:7])
+        self.assertTrue(ff.validate_calendar_event(old_period, "e"))          # CPI reports an earlier month
+
+    def test_coverage_is_judged_against_the_files_own_date_not_today(self):
+        self.assertTrue(any("60 days" in error for error in self.mutated(lambda c: c.update(updated="2027-11-15"))))
+        self.assertEqual(self.mutated(lambda c: c.update(updated="2026-01-15")), [])
+        outside = self.mutated(lambda c: c["coverage"].update(to="2027-06-30"))
+        self.assertTrue(any("outside the coverage" in error for error in outside))
+
+    def test_the_snapshot_block_keeps_the_last_30_days_and_warns_when_the_calendar_runs_out(self):
+        now = datetime(2026, 12, 15, 22, 30, tzinfo=timezone.utc)
+        block = ff.build_calendar(ff.DEFAULT_CALENDAR, now)
+        self.assertEqual(ff.validate_calendar_block(block), [])
+        self.assertEqual(block["status"], "fresh")
+        self.assertEqual(block["events"][0]["date"], "2026-11-18")           # 27 days back; 10 Nov is older than 30
+        self.assertIsNone(block["note"])
+        late = datetime(2027, 11, 15, 22, 30, tzinfo=timezone.utc)
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            ending = ff.build_calendar(ff.DEFAULT_CALENDAR, late)
+        self.assertIn("runs out on 2027-12-31", ending["note"])
+        self.assertIn("NEEDS UPDATING", ff.calendar_summary(ending, late))
+        self.assertEqual(ff.calendar_summary(block, now), "next FOMC 2027-01-27 · CPI 2027-01-13 (covers to 2027-12-31)")
+
+    def test_a_broken_file_never_fails_the_run(self):
+        now = datetime(2026, 11, 22, 22, 30, tzinfo=timezone.utc)
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            missing = ff.build_calendar(Path("no/such/macro_calendar.json"), now)
+        self.assertEqual(missing["status"], "unavailable")
+        self.assertEqual(ff.validate_calendar_block(missing), [])
+        broken = copy.deepcopy(self.calendar)
+        broken["events"][0]["date"] = "not a date"
+        target = Path(self.id().replace(".", "_") + ".json")
+        try:
+            target.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertLogs(ff.LOG, level="WARNING"):
+                self.assertEqual(ff.build_calendar(target, now)["status"], "unavailable")
+        finally:
+            target.unlink(missing_ok=True)
+
+    def test_macro_validation_accepts_a_snapshot_without_a_calendar_and_rejects_a_bad_one(self):
+        rates = {"USD": ff.risk_free_entry("US 10-year Treasury yield", "^TNX", 0.05, "2026-11-16", "yahoo", "fresh"),
+                 "SGD": ff.risk_free_entry("Singapore 10-year SGS benchmark yield", None, 0.023, "2026-11-16", "mas", "fresh")}
+        self.assertEqual(ff.validate_macro({"riskFree": rates}), [])
+        good = ff.build_calendar(ff.DEFAULT_CALENDAR, datetime(2026, 11, 22, tzinfo=timezone.utc))
+        self.assertEqual(ff.validate_macro({"riskFree": rates, "calendar": good}), [])
+        bad = copy.deepcopy(good)
+        bad["events"][0]["date"] = "2030-01-01"
+        self.assertTrue(ff.validate_macro({"riskFree": rates, "calendar": bad}))
+
+    def test_events_render_one_per_line(self):
+        snapshot = copy.deepcopy(ff.load_json(SNAPSHOT_PATH))
+        snapshot["macro"]["calendar"] = ff.build_calendar(ff.DEFAULT_CALENDAR, datetime(2026, 11, 22, tzinfo=timezone.utc))
+        text = ff.render_snapshot(snapshot)
+        self.assertEqual(json.loads(text), snapshot)
+        self.assertIn('\n        {"type":"fomc-decision","date":"2026-12-09","at":"2026-12-09T14:00:00-05:00","meeting":"2026-12-08/09","projections":true},\n', text)
+
+
+class RiskFirstBriefing(unittest.TestCase):
+    """The V3.2 briefing: regime, ⚡ triggers, tradable buckets, the next 30 days, a compact footer,
+    and the week-ahead edition at weekends."""
+
+    WEEKDAY = datetime(2026, 11, 20, 22, 30, tzinfo=timezone.utc)   # Friday, after the US close
+    SATURDAY = datetime(2026, 11, 21, 22, 30, tzinfo=timezone.utc)
+    SUNDAY = datetime(2026, 11, 22, 22, 30, tzinfo=timezone.utc)
+
+    @staticmethod
+    def row(ticker, bucket="global", verdict="HOLD", composite=50.0, **extra):
+        base = {"ticker": ticker, "name": ticker, "verdict": verdict, "composite": composite, "confidence": "Low",
+                "assetClass": "crypto" if bucket == "crypto" else "equity", "market": {"global": "US", "sgx": "SG", "crypto": "CRYPTO"}[bucket],
+                "bucket": bucket, "tradable": True, "quoteAsOf": "2026-11-20", "nextEarnings": None, "nextExDividend": None,
+                "typicalMove": None, "worstMove": None, "dailyReturn": 0.001, "zScore": 0.1, "relativeStrength3m": None, "benchmark": None}
+        base.update(extra)
+        return base
+
+    def signals(self):
+        return [
+            self.row("XOM", verdict="BUY", composite=66.0, relativeStrength3m=0.05),
+            self.row("MU", composite=57.0, dailyReturn=-0.139, zScore=-2.63, relativeStrength3m=-0.31,
+                     nextEarnings={"date": "2026-12-17", "dateTo": "2026-12-18", "timing": "after-close", "days": 27, "tradingDays": 18},
+                     typicalMove=0.058, worstMove=-0.162),
+            self.row("TSLA", verdict="SELL", composite=23.0, dailyReturn=-0.076, zScore=-2.45),
+            self.row("WMT", composite=60.0, relativeStrength3m=0.37, nextExDividend={"date": "2026-12-11", "days": 21, "estimated": False}),
+            self.row("VOO", verdict="SELL", composite=14.0, dailyReturn=-0.034, zScore=-2.60, assetClass="etf"),
+            self.row("^GSPC", verdict="SELL", composite=13.0, assetClass="index", tradable=False, dailyReturn=-0.037, zScore=-2.85),
+            self.row("C6L.SI", "sgx", verdict="BUY", composite=70.0, relativeStrength3m=0.15,
+                     nextExDividend={"date": "2026-11-25", "days": 5, "estimated": False}),
+            self.row("A17U.SI", "sgx", verdict="SELL", composite=44.0, dailyReturn=-0.023, zScore=-2.0,
+                     nextExDividend={"date": "2027-01-18", "days": 59, "estimated": True}),
+            self.row("BTC-USD", "crypto", verdict="SELL", composite=8.0, dailyReturn=-0.05, zScore=-2.0),
+            self.row("ETH-USD", "crypto", verdict="SELL", composite=13.0, dailyReturn=-0.077, zScore=-2.46, relativeStrength3m=-0.14, benchmark="BTC-USD"),
+        ]
+
+    @staticmethod
+    def regime(rows, status="fresh"):
+        block = ff.regime_block(MarketRegime.series(rows))
+        block["status"] = status
+        return block
+
+    def snapshot(self, regime_rows=None, calendar_now=None):
+        assets = [{"ticker": row["ticker"], "assetClass": row["assetClass"], "status": "fresh", "quote": {"asOf": "2026-11-20"}}
+                  for row in self.signals()]
+        macro = {"regime": self.regime(regime_rows or MarketRegime.ROWS),
+                 "calendar": ff.build_calendar(ff.DEFAULT_CALENDAR, calendar_now or datetime(2026, 11, 20, tzinfo=timezone.utc))}
+        return {"generatedAt": "2026-11-20T22:00:00Z", "assets": assets, "macro": macro}
+
+    def previous(self, as_of="2026-11-19", regime_as_of="2026-11-19"):
+        assets = [{"ticker": row["ticker"], "assetClass": row["assetClass"], "status": "fresh", "quote": {"asOf": as_of}} for row in self.signals()]
+        return {"assets": assets, "macro": {"regime": {"asOf": regime_as_of}}}
+
+    def text(self, now=None, signals="default", shifts=None, previous="default", snapshot=None, markdown=False,
+             outcome="passed", failed_step=None, links=()):
+        rows = self.signals() if signals == "default" else signals
+        return ff.build_briefing(snapshot or self.snapshot(), rows, shifts, outcome, failed_step, now or self.WEEKDAY,
+                                 list(links), ff.BriefingFormat(markdown), previous=self.previous() if previous == "default" else previous)
+
+    # --- layout -----------------------------------------------------------------
+
+    def test_a_weekday_reads_regime_triggers_buckets_outlook_footer_in_that_order(self):
+        text = self.text()
+        lines = text.split("\n")
+        self.assertEqual(lines[0], "QuantLens daily briefing · Fri 20 Nov 2026")
+        self.assertTrue(lines[1].startswith("🔴 Market regime: stressed"))
+        order = ["⚡ Triggers today", "US / Global · 1 BUY · 2 HOLD · 2 SELL", "SGX · 1 BUY · 0 HOLD · 1 SELL",
+                 "Crypto (24/7) · 0 BUY · 0 HOLD · 2 SELL", "Next 30 days", "Tradable: 2 BUY · 2 HOLD · 5 SELL", "✅ 10/10 fresh"]
+        positions = [text.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertTrue(text.endswith("Rule-based signals for learning, not financial advice."))
+
+    def test_indices_never_appear_in_the_lists_or_the_tally(self):
+        text = self.text()
+        self.assertNotIn("^GSPC", text)                                      # its −2.85σ move and its SELL are both left out
+        self.assertIn("SELL: VOO 14 · TSLA 23", text)
+
+    def test_a_quiet_day_has_no_trigger_block_and_never_says_nothing_happened(self):
+        calm = [dict(row, zScore=0.2, dailyReturn=0.001) for row in self.signals()]
+        text = self.text(signals=calm, snapshot=self.snapshot(regime_rows=[["2026-11-20", 13.1, 14.2, 17.1]]))
+        self.assertNotIn("Triggers", text)
+        for banned in ("No notable", "No BUY", "No SELL", "No shifts", "Movers:"):
+            self.assertNotIn(banned, text)
+
+    def test_empty_lines_are_left_out_within_a_bucket(self):
+        text = self.text()
+        crypto = text[text.index("Crypto (24/7)"):text.index("Next 30 days")]
+        self.assertNotIn("BUY:", crypto)                                     # no BUY in the bucket: no line at all
+        self.assertIn("SELL: BTC-USD 8 · ETH-USD 13", crypto)
+
+    # --- T1 moves ---------------------------------------------------------------
+
+    def test_moves_fire_beyond_two_and_a_half_sigma_only(self):
+        rows = [self.row("EDGE", dailyReturn=-0.03, zScore=-2.50), self.row("OVER", dailyReturn=-0.03, zScore=-2.51)]
+        text = self.text(signals=rows)
+        self.assertIn("Moves beyond 2.5σ: OVER −3.0% (−2.5σ)", text)
+        self.assertNotIn("EDGE −3.0%", text.split("US / Global")[0])
+
+    def test_a_move_is_reported_once_per_session(self):
+        repeat = self.text(previous=self.previous(as_of="2026-11-20"))      # the previous run already had this session
+        self.assertNotIn("Moves beyond", repeat)
+        self.assertNotIn("Movers:", repeat)
+        first = self.text(previous=None)                                     # nothing to compare with: report it
+        self.assertIn("Moves beyond 2.5σ: MU −13.9% (−2.6σ) · VOO −3.4% (−2.6σ)", first)
+
+    def test_triggered_moves_are_not_repeated_as_bucket_movers(self):
+        text = self.text()
+        movers = [line for line in text.split("\n") if line.startswith("Movers:")]
+        self.assertEqual(movers[0], "Movers: TSLA −7.6% (−2.5σ)")           # MU and VOO are already triggers
+        self.assertEqual(movers[1], "Movers: A17U.SI −2.3% (−2.0σ)")
+
+    # --- T2 regime --------------------------------------------------------------
+
+    def test_day_one_of_an_inversion_fires_once_and_not_again_at_the_weekend(self):
+        rows = [["2026-11-19", 23.0, 22.9, 23.0], ["2026-11-20", 26.7, 25.5, 25.0]]   # inverted on the 20th only
+        snapshot = self.snapshot(regime_rows=rows)
+        self.assertEqual(ff.regime_transition(snapshot["macro"]["regime"]), {"dayOne": True, "uninverted": False, "priorStreak": 0})
+        self.assertIn("VIX curve inverted today, day 1: VIX 25.5 above VIX3M 25.0", self.text(snapshot=snapshot))
+        saturday = self.text(snapshot=snapshot, now=self.SATURDAY, previous=self.previous(as_of="2026-11-20", regime_as_of="2026-11-20"))
+        self.assertNotIn("day 1", saturday)
+
+    def test_the_first_session_out_of_an_inversion_fires(self):
+        rows = MarketRegime.ROWS[:-1] + [["2026-11-20", 21.0, 24.0, 25.0]]  # three inverted sessions, then 0.96
+        text = self.text(snapshot=self.snapshot(regime_rows=rows))
+        self.assertIn("VIX curve no longer inverted: elevated after 3 inverted sessions", text)
+
+    # --- T3 earnings ------------------------------------------------------------
+
+    def test_earnings_fire_within_five_trading_days_not_six(self):
+        five = self.row("ORCL", nextEarnings={"date": "2026-11-27", "dateTo": None, "timing": "after-close", "days": 7, "tradingDays": 5},
+                        typicalMove=0.098, worstMove=-0.135)
+        six = self.row("CAT", nextEarnings={"date": "2026-11-30", "dateTo": None, "timing": "before-open", "days": 10, "tradingDays": 6})
+        text = self.text(signals=[five, six])
+        self.assertIn("Earnings: ORCL ~Fri 27 Nov, after the close (5 trading days) · ±9.8% (worst −13.5%)", text)
+        triggers = text.split("Next 30 days")[0]
+        self.assertNotIn("CAT", triggers)
+        self.assertIn("CAT ~30 Nov too few past releases to size the move", text)   # listed ahead instead
+        self.assertNotIn("ORCL ~27 Nov", text.split("Next 30 days")[1])             # and never twice
+
+    # --- T4 macro ---------------------------------------------------------------
+
+    def test_fomc_and_cpi_fire_within_48_hours_with_singapore_time(self):
+        snapshot = self.snapshot(calendar_now=datetime(2026, 12, 7, tzinfo=timezone.utc))
+        at_48 = datetime(2026, 12, 7, 19, 0, tzinfo=timezone.utc)            # the decision is at 19:00 UTC on the 9th
+        text = self.text(snapshot=snapshot, now=at_48, previous=None, signals=[])
+        self.assertIn("• FOMC rate decision (+ projections): Wed 9 Dec 2:00 PM ET · Thu 3:00 AM SGT · in 48 h", text)
+        early = self.text(snapshot=snapshot, now=datetime(2026, 12, 7, 18, 59, tzinfo=timezone.utc), previous=None, signals=[])
+        self.assertNotIn("Thu 3:00 AM SGT · in", early)
+        cpi = self.text(snapshot=snapshot, now=datetime(2026, 12, 9, 20, 0, tzinfo=timezone.utc), previous=None, signals=[])
+        self.assertIn("• US CPI (November): Thu 10 Dec 8:30 AM ET · Thu 9:30 PM SGT · in 18 h", cpi)
+        self.assertNotIn("FOMC rate decision (+ projections): Wed 9 Dec", cpi)  # it has passed
+        self.assertNotIn("US CPI (November) Thu 10 Dec", cpi.split("Next 30 days")[-1])  # not listed twice
+
+    def test_event_clocks_follow_daylight_saving(self):
+        self.assertEqual(ff.event_clocks("2027-04-13T08:30:00-04:00"), ("8:30 AM ET", "Tue 8:30 PM SGT"))
+        self.assertEqual(ff.event_clocks("2026-12-10T08:30:00-05:00"), ("8:30 AM ET", "Thu 9:30 PM SGT"))
+        self.assertEqual(ff.event_clocks("2026-12-09T14:00:00-05:00"), ("2:00 PM ET", "Thu 3:00 AM SGT"))
+
+    # --- T5 tone ----------------------------------------------------------------
+
+    def test_tone_shifts_are_folded_into_triggers_tradables_only(self):
+        shifts = [{"ticker": "^GSPC", "from": "negative", "to": "positive", "before": -0.4, "after": 0.4, "delta": 0.8, "headline": "Index"},
+                  {"ticker": "WMT", "from": "positive", "to": "negative", "before": 0.24, "after": -0.09, "delta": -0.33, "headline": "W" * 90}]
+        text = self.text(shifts=shifts, previous=self.previous(as_of="2026-11-20"))
+        self.assertIn("⚡ Triggers today\n• Tone: WMT positive → negative (+0.24 → −0.09)\n   " + "W" * 67 + "...", text)
+        self.assertNotIn("Index", text)
+        self.assertNotIn("Headline tone shifts", text)
+
+    # --- next 30 days -------------------------------------------------------------
+
+    def test_the_next_30_days_lists_closures_macro_earnings_and_ex_dividends(self):
+        text = self.text()
+        outlook = text.split("Next 30 days\n")[1]
+        self.assertIn("Closures: US closed Thu 26 Nov (Thanksgiving Day) · US closes 1:00 PM ET Fri 27 Nov", outlook)
+        self.assertIn("Macro: FOMC rate decision (+ projections) Wed 9 Dec · US CPI (November) Thu 10 Dec", outlook)
+        self.assertIn("Earnings: MU ~17 Dec ±5.8% (worst −16.2%)", outlook)
+        self.assertIn("Ex-dividend: C6L.SI 25 Nov · WMT 11 Dec", outlook)
+        self.assertNotIn("A17U.SI", outlook)                                 # 59 days away
+
+    # --- weekend ------------------------------------------------------------------
+
+    def test_saturday_and_sunday_runs_get_the_week_ahead_edition(self):
+        self.assertTrue(ff.is_weekend_run(self.SATURDAY))
+        self.assertTrue(ff.is_weekend_run(self.SUNDAY))
+        self.assertFalse(ff.is_weekend_run(self.WEEKDAY))                    # Friday 22:30 UTC carries Friday's close
+        text = self.text(now=self.SUNDAY, previous=self.previous(as_of="2026-11-20", regime_as_of="2026-11-20"))
+        self.assertTrue(text.startswith("QuantLens · week ahead · Sun 22 Nov 2026\n🔴 Market regime (Friday close): stressed"))
+        for absent in ("US / Global", "SGX ·", "BUY:", "Movers:", "Tradable:"):
+            self.assertNotIn(absent, text)
+        week = text.split("Next 7 days\n")[1].split("\n\n")[0].split("\n")
+        self.assertEqual(week, ["• Wed 25 Nov: ex-dividend C6L.SI", "• Thu 26 Nov: US closed (Thanksgiving Day)",
+                                "• Fri 27 Nov: US closes 1:00 PM ET",
+                                "• No FOMC, CPI or watchlist earnings. Next: FOMC rate decision (+ projections) Wed 9 Dec"])
+        self.assertIn("Next 30 days watch\nMacro: FOMC rate decision (+ projections) Wed 9 Dec · US CPI (November) Thu 10 Dec", text)
+        self.assertIn("Weekend crypto check (UTC day to 20 Nov)\nBTC-USD −5.0% (−2.0σ) · SELL 8\nETH-USD −7.7% (−2.5σ) · SELL 13 · 3M vs BTC −14.0%", text)
+        self.assertIn("Crypto: 0 BUY · 0 HOLD · 2 SELL", text)
+
+    def test_weekend_triggers_are_crypto_moves_only_among_moves(self):
+        rows = self.signals()
+        rows[-1] = dict(rows[-1], quoteAsOf="2026-11-21", zScore=-3.1, dailyReturn=-0.09)   # a new UTC day for ETH
+        text = self.text(signals=rows, now=self.SUNDAY, previous=self.previous(as_of="2026-11-20", regime_as_of="2026-11-20"))
+        self.assertIn("• Moves beyond 2.5σ: ETH-USD −9.0% (−3.1σ)", text)
+        self.assertNotIn("MU −13.9%", text)
+
+    # --- failures, markdown, size ---------------------------------------------------
+
+    def test_a_failed_check_moves_the_status_to_the_top_and_holds_the_data_back(self):
+        text = self.text(outcome="failed", failed_step="Gate 2 (browser tests)", signals=None)
+        lines = text.split("\n")
+        self.assertTrue(lines[2].startswith("❌ Gate 2 (browser tests) failed, so today's data was NOT published"))
+        for absent in ("Market regime", "Triggers", "US / Global", "Next 30 days"):
+            self.assertNotIn(absent, text)
+        self.assertIn("❌ Gate 2 (browser tests) failed · held back", text)
+        refresh = self.text(outcome="failed", failed_step="data refresh")
+        self.assertIn("The data refresh failed, so nothing was committed", refresh.split("⚡")[0])
+        self.assertIn("US / Global", refresh)                                # the last good snapshot's content
+
+    def test_markdown_escapes_the_new_symbols(self):
+        text = self.text(markdown=True, links=[("Open QuantLens", "https://user.github.io/quantlens/")])
+        self.assertIn(r"\(−2\.6σ\)", text)
+        self.assertIn(r"±5\.8% \(worst −16\.2%\)", text)
+        self.assertIn("*US / Global*", text)
+        self.assertIn("[Open QuantLens](https://user.github.io/quantlens/)", text)
+        estimated = self.text(markdown=True, signals=[self.row("A17U.SI", "sgx", nextExDividend={"date": "2026-12-01", "days": 11, "estimated": True})])
+        self.assertIn(r"A17U\.SI \~1 Dec", estimated)
+
+    def test_the_message_stays_inside_telegrams_limit_and_keeps_its_footer(self):
+        many = [self.row(f"T{i}", ("global", "sgx", "crypto")[i % 3], verdict=("BUY", "SELL")[i % 2], composite=float(i % 90),
+                         dailyReturn=-0.1, zScore=-4.0, relativeStrength3m=0.1,
+                         nextEarnings={"date": "2026-11-23", "dateTo": None, "timing": None, "days": 3, "tradingDays": 1},
+                         nextExDividend={"date": "2026-11-24", "days": 4, "estimated": False}) for i in range(300)]
+        shifts = [{"ticker": f"T{i}", "from": "positive", "to": "negative", "before": 0.5, "after": -0.5, "delta": -1.0, "headline": "H" * 400}
+                  for i in range(50)]
+        snapshot = self.snapshot()
+        snapshot["assets"] = [{"ticker": row["ticker"], "assetClass": "equity", "status": "fresh", "quote": {"asOf": "2026-11-20"}} for row in many]
+        for markdown in (False, True):
+            text = self.text(signals=many, shifts=shifts, snapshot=snapshot, markdown=markdown, previous=None)
+            self.assertLessEqual(len(text), ff.TELEGRAM_MAX_CHARS)
+            self.assertIn("300/300 fresh", text)
+            self.assertTrue(text.rstrip("_").endswith("advice\\.") or text.endswith("advice."))
+
+    @unittest.skipIf(shutil.which("node") is None, "Node.js is not installed")
+    def test_the_signals_bridge_runs_the_sites_engines_over_the_committed_snapshot(self):
+        snapshot = ff.load_json(SNAPSHOT_PATH)
+        signals = ff.compute_signals(SNAPSHOT_PATH)
+        self.assertIsNotNone(signals)
+        self.assertEqual([row["ticker"] for row in signals], [asset["ticker"] for asset in snapshot["assets"]])
+        by_class = {asset["ticker"]: asset["assetClass"] for asset in snapshot["assets"]}
+        for row in signals:
+            self.assertIn(row["verdict"], {"BUY", "HOLD", "SELL"}, row["ticker"])
+            self.assertTrue(0 <= row["composite"] <= 100, row["ticker"])
+            self.assertEqual(row["tradable"], by_class[row["ticker"]] != "index", row["ticker"])
+            self.assertIn(row["bucket"], {"global", "sgx", "crypto"}, row["ticker"])
+            self.assertEqual(row["bucket"] == "crypto", by_class[row["ticker"]] == "crypto", row["ticker"])
+            self.assertTrue(is_iso := ff.is_iso_date(row["quoteAsOf"]), row["ticker"])
+            self.assertIsNotNone(row["zScore"], row["ticker"])
+            if by_class[row["ticker"]] in {"etf", "index", "crypto"}:
+                self.assertEqual(row["confidence"], "Low", row["ticker"])   # technical only, by construction
+        upcoming = [row for row in signals if row["nextEarnings"]]
+        self.assertTrue(upcoming)                                            # the event layer reaches the briefing
+        for row in upcoming:
+            self.assertEqual(by_class[row["ticker"]], "equity")
+            self.assertIsNotNone(row["nextEarnings"]["tradingDays"])
+        self.assertTrue(any(row["nextExDividend"] for row in signals))
+        self.assertTrue(any(row["relativeStrength3m"] is not None for row in signals))
 
 
 if __name__ == "__main__":

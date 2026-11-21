@@ -109,6 +109,28 @@ export function filteredResiduals(closes, lambda = RISK_CONFIG.lambda, seedCount
   return { residuals, sigmaNow: Math.sqrt(ewma.next), sigmaSample, meanLogReturn, returns: returns.length };
 }
 
+/**
+ * The latest session's move against the volatility known the day before it (V3.2):
+ * z = ln(Cₜ ÷ Cₜ₋₁) ÷ σₜ₋₁, with σ the EWMA volatility. It is exactly the last filtered
+ * residual the bootstrap resamples, so the briefing's "2.5σ" and the simulator agree.
+ * @returns {{ dailyReturn:number, z:number, sigma:number, date:string|null } | null}
+ */
+export function latestShock(closes, dates = null, lambda = RISK_CONFIG.lambda, seedCount = RISK_CONFIG.ewmaSeed) {
+  const returns = logReturns(closes);
+  if (!returns || returns.length <= seedCount) return null;
+  const ewma = ewmaVariance(returns, lambda, seedCount);
+  if (!ewma) return null;
+  const last = returns.length - 1;
+  const sigma = Math.sqrt(ewma.forecasts[last]);
+  if (!(sigma > 0)) return null;
+  return {
+    dailyReturn: closes[closes.length - 1] / closes[closes.length - 2] - 1,
+    z: returns[last] / sigma,
+    sigma,
+    date: Array.isArray(dates) ? dates[dates.length - 1] : null,
+  };
+}
+
 /** The Friday that ends the week of an ISO date (weekend days belong to the following week). */
 export function weekKey(isoDate) {
   const time = Date.parse(`${isoDate}T00:00:00Z`);

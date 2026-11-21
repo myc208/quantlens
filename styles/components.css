@@ -295,6 +295,10 @@ code,
   background: var(--surface-1);
 }
 
+.tick[data-macro="soon"] {
+  border-color: var(--status-warning);
+}
+
 .tick[data-regime="elevated"] {
   border-color: var(--status-warning);
 }

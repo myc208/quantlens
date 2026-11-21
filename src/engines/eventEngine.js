@@ -54,10 +54,12 @@ function calendarDaysBetween(fromIso, toIso) {
 }
 
 /**
- * Sessions after `fromIso` up to and including `toIso`: weekdays for exchange-traded
- * assets (holidays are not known here, so this can run a day or two long), every day for crypto.
+ * Sessions after `fromIso` up to and including `toIso`: weekdays for exchange-traded assets,
+ * less the market's holidays when they are known (V3.2: from the macro calendar), and every
+ * day for crypto. Without holidays the count can run a day or two long.
+ * @param {Set<string>|null} [holidays] ISO dates on which the market is closed
  */
-export function tradingDaysBetween(fromIso, toIso, assetClass = 'equity') {
+export function tradingDaysBetween(fromIso, toIso, assetClass = 'equity', holidays = null) {
   const total = calendarDaysBetween(fromIso, toIso);
   if (!(total > 0)) return 0;
   if (assetClass === 'crypto') return total;
@@ -65,10 +67,16 @@ export function tradingDaysBetween(fromIso, toIso, assetClass = 'equity') {
   let time = Date.parse(`${fromIso}T00:00:00Z`);
   for (let i = 0; i < total; i += 1) {
     time += DAY_MS;
-    const day = new Date(time).getUTCDay();
-    if (day !== 0 && day !== 6) count += 1;
+    const date = new Date(time);
+    const day = date.getUTCDay();
+    if (day !== 0 && day !== 6 && !(holidays && holidays.has(date.toISOString().slice(0, 10)))) count += 1;
   }
   return count;
+}
+
+function sessionsWording(asset, holidays) {
+  if (asset.assetClass === 'crypto') return 'Sessions until the release (crypto trades every day)';
+  return holidays && holidays.size ? 'Trading days until the release (weekdays, less market holidays from the macro calendar)' : 'Trading days until the release (weekdays; holidays not known)';
 }
 
 /** Index of the first date on or after `iso` (dates ascending), or -1. */
@@ -145,7 +153,7 @@ function horizonSentence(flags) {
   return inside.length ? `inside ${inside.join(', ')}` : 'beyond every horizon used here';
 }
 
-function buildNextEarnings(asset, events, today) {
+function buildNextEarnings(asset, events, today, holidays = null) {
   const id = 'nextEarnings';
   const label = 'Next earnings';
   const formula = 'Days to release = release date − today; trading days count weekdays (crypto: every day)';
@@ -158,7 +166,7 @@ function buildNextEarnings(asset, events, today) {
     return notAvailable({ id, label, unit: 'days', formula, reason: `The stored date (${next.date}) has passed. The calendar refreshes on the next daily run.` });
   }
   const calendarDays = calendarDaysBetween(today, next.date);
-  const tradingDays = tradingDaysBetween(today, next.date, asset.assetClass);
+  const tradingDays = tradingDaysBetween(today, next.date, asset.assetClass, holidays);
   const flags = horizonFlags(tradingDays, calendarDays);
   const window = next.dateTo ? `${next.date} or ${next.dateTo}` : next.date;
   return traced({
@@ -172,7 +180,7 @@ function buildNextEarnings(asset, events, today) {
     ],
     steps: [
       step('Calendar days until the release', `${next.date} − ${today}`, calendarDays),
-      step(asset.assetClass === 'crypto' ? 'Sessions until the release (crypto trades every day)' : 'Trading days until the release (weekdays; holidays not known)', `count of sessions after ${today}`, tradingDays),
+      step(sessionsWording(asset, holidays), `count of sessions after ${today}`, tradingDays),
       step(`Inside the ${EVENT_CONFIG.sizingHorizon}-day sizing horizon?`, `${tradingDays} ≤ ${EVENT_CONFIG.sizingHorizon}`, flags.insideSizing ? 'yes' : 'no'),
       step(`Inside the ${EVENT_CONFIG.forecastDays}-day projection?`, `${calendarDays} ≤ ${EVENT_CONFIG.forecastDays}`, flags.insideForecast ? 'yes' : 'no'),
     ],
@@ -230,7 +238,7 @@ function buildEarningsMove(asset, events) {
   });
 }
 
-function buildNextExDividend(asset, events, dividends, today) {
+function buildNextExDividend(asset, events, dividends, today, holidays = null) {
   const id = 'nextExDividend';
   const label = 'Next ex-dividend date';
   const formula = 'Expected price drop ≈ last dividend ÷ last close; estimated date = last ex-date + median gap between payments';
@@ -244,7 +252,7 @@ function buildNextExDividend(asset, events, dividends, today) {
   const amount = dividends && dividends.amounts.length ? dividends.amounts[dividends.amounts.length - 1] : null;
   const dropFraction = isNum(amount) ? safeDiv(amount, asset.quote.lastClose) : null;
   const calendarDays = calendarDaysBetween(today, next.date);
-  const tradingDays = tradingDaysBetween(today, next.date, asset.assetClass);
+  const tradingDays = tradingDaysBetween(today, next.date, asset.assetClass, holidays);
   const flags = horizonFlags(tradingDays, calendarDays);
   return traced({
     id, label, value: calendarDays, unit: 'days', tone: 'neutral',
@@ -274,7 +282,7 @@ function buildNextExDividend(asset, events, dividends, today) {
  * @param {object} asset normalised asset (events, dividends, longSeries, quote)
  * @param {{ now?: Date|string }} [options]
  */
-export function analyzeEvents(asset, { now = new Date() } = {}) {
+export function analyzeEvents(asset, { now = new Date(), holidays = null } = {}) {
   const today = isoDay(now) ?? asset.quote.asOf;
   const events = asset.events ?? null;
   const dividends = asset.dividends ?? { dates: [], amounts: [] };
@@ -282,9 +290,9 @@ export function analyzeEvents(asset, { now = new Date() } = {}) {
     ticker: asset.ticker,
     today,
     metrics: {
-      nextEarnings: buildNextEarnings(asset, events, today),
+      nextEarnings: buildNextEarnings(asset, events, today, holidays),
       earningsMove: buildEarningsMove(asset, events),
-      nextExDividend: buildNextExDividend(asset, events, dividends, today),
+      nextExDividend: buildNextExDividend(asset, events, dividends, today, holidays),
     },
   };
 }

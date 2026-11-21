@@ -1,7 +1,7 @@
 /**
  * telemetryBar.js: the sticky bar at the top of the page.
  *
- *   [brand] [BTC live] [ETH live] [feed status] [regime] [USD/SGD] [US 10Y] [SG 10Y] [data age]   [USD|SGD] [Guided|Pro]
+ *   [brand] [BTC live] [ETH live] [feed status] [regime] [next macro] [USD/SGD] [US 10Y] [SG 10Y] [data age]   [USD|SGD] [Guided|Pro]
  *
  * It tells the user, at all times, where every number is coming from: which
  * feed is live, which has fallen back, how old the daily snapshot is and which
@@ -184,6 +184,22 @@ export function mountTelemetryBar(root, app) {
       </button>`;
   }
 
+  /** The next FOMC decision or CPI release, amber within 48 hours. A button: it opens the derivation. */
+  function macroTick() {
+    const macro = app.describeMacro();
+    if (!macro.title) return '';
+    const metric = app.macro().metrics.nextMacroEvent;
+    const title = `${macro.title}: ${h.shortDate(metric.meta.date)}, ${metric.meta.clock}. Context only. Select to see the next 7 and 30 days.`;
+    return `
+      <button type="button" class="tick tick--button" data-trace="nextMacroEvent" data-key="telemetry:nextMacroEvent" data-macro="${macro.soon ? 'soon' : 'later'}"
+        aria-label="${h.esc(title)}" title="${h.esc(title)}">
+        ${h.toneMark(macro.soon ? 'caution' : 'neutral')}
+        <span class="tick__label">Next macro</span>
+        <span class="tick__price">${h.esc(macro.label)}</span>
+        <span class="tick__meta">${h.esc(macro.pill)}</span>
+      </button>`;
+  }
+
   function dataTick(state) {
     const { snapshot } = state;
     const generated = Date.parse(snapshot.generatedAt);
@@ -222,6 +238,7 @@ export function mountTelemetryBar(root, app) {
       ...crypto.map((asset) => cryptoTick(state, asset)),
       crypto.length ? feedMarkup(state) : '',
       regimeTick(),
+      macroTick(),
       fxTick(state),
       yieldTicks(state),
       dataTick(state),
