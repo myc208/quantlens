@@ -41,6 +41,12 @@ export const FUNDAMENTAL_KEYS = Object.freeze([
 ]);
 export const MAX_NEWS_CLUSTERS = 3;
 export const RISK_FREE_CURRENCIES = Object.freeze(['USD', 'SGD']);
+// V3.1: macro.regime, the VIX term structure, with five years of daily closes.
+export const REGIME_HISTORY_FIELDS = Object.freeze(['date', 'vix9d', 'vix', 'vix3m']);
+export const MAX_REGIME_ROWS = 1400;
+const REGIME_STATES = ['normal', 'elevated', 'stressed'];
+const REGIME_RULE_KEYS = ['elevatedLevel', 'elevatedRatio', 'invertedRatio'];
+const REGIME_LEVEL_BOUNDS = Object.freeze({ min: 1, max: 200 });
 
 const ASSET_CLASSES = ['equity', 'etf', 'index', 'crypto'];
 const MARKETS = ['US', 'SG', 'UK', 'CRYPTO'];
@@ -359,10 +365,88 @@ function normaliseRate(raw, currency) {
   };
 }
 
+function unavailableRegime(note) {
+  return Object.freeze({
+    status: 'unavailable', asOf: null, source: null,
+    levels: Object.freeze({ vix9d: null, vix: null, vix3m: null }),
+    slope: null, ratio: null, frontRatio: null, state: null, inverted: null, invertedStreak: null, rules: null,
+    history: Object.freeze({ dates: Object.freeze([]), vix9d: Object.freeze([]), vix: Object.freeze([]), vix3m: Object.freeze([]) }),
+    note,
+  });
+}
+
+/**
+ * The market regime block (V3.1). Never throws: a missing block (a snapshot written
+ * before V3.1) or a malformed one becomes "unavailable" with a reason, and the
+ * regime metrics report N/A. History arrives as [date, vix9d|null, vix, vix3m] rows
+ * and is returned column-wise.
+ * @returns {{ regime: object, problem: string|null }}
+ */
+export function normaliseRegime(raw) {
+  if (raw === undefined || raw === null) {
+    return { regime: unavailableRegime('This snapshot was written before the market regime was added.'), problem: null };
+  }
+  if (!isPlainObject(raw) || !SECTION_STATUSES.includes(raw.status)) {
+    return { regime: unavailableRegime('The market regime block is malformed.'), problem: 'the market regime block is malformed' };
+  }
+  if (raw.status === 'unavailable') {
+    return { regime: unavailableRegime(textOrNull(raw.note) ?? 'The VIX curve could not be read.'), problem: null };
+  }
+  const fail = (why) => ({ regime: unavailableRegime(`The market regime block is unusable: ${why}.`), problem: `the market regime block is unusable: ${why}` });
+  const level = (value) => isNum(value) && value >= REGIME_LEVEL_BOUNDS.min && value <= REGIME_LEVEL_BOUNDS.max;
+  const { levels, rules } = raw;
+  if (!isPlainObject(levels) || !level(levels.vix) || !level(levels.vix3m) || !(levels.vix9d === null || level(levels.vix9d))) {
+    return fail('the VIX levels are missing or implausible');
+  }
+  if (!isIsoDate(raw.asOf)) return fail('it has no reading date');
+  if (!isPlainObject(rules) || !REGIME_RULE_KEYS.every((key) => isNum(rules[key]) && rules[key] > 0)) return fail('its thresholds are missing');
+  if (!REGIME_STATES.includes(raw.state)) return fail('its state is not normal, elevated or stressed');
+  if (!Array.isArray(raw.historyFields) || raw.historyFields.join(',') !== REGIME_HISTORY_FIELDS.join(',')) return fail('its historyFields are not the documented ones');
+  if (!Array.isArray(raw.history) || raw.history.length === 0 || raw.history.length > MAX_REGIME_ROWS) return fail('its history is missing or too long');
+  const history = { dates: [], vix9d: [], vix: [], vix3m: [] };
+  let previous = '';
+  for (const row of raw.history) {
+    if (!Array.isArray(row) || row.length !== 4 || !isIsoDate(row[0]) || row[0] <= previous
+      || !level(row[2]) || !level(row[3]) || !(row[1] === null || level(row[1]))) {
+      return fail('a history row is malformed or out of order');
+    }
+    previous = row[0];
+    history.dates.push(row[0]);
+    history.vix9d.push(row[1]);
+    history.vix.push(row[2]);
+    history.vix3m.push(row[3]);
+  }
+  const last = history.dates.length - 1;
+  if (history.dates[last] !== raw.asOf || history.vix[last] !== levels.vix || history.vix3m[last] !== levels.vix3m || history.vix9d[last] !== levels.vix9d) {
+    return fail('its history does not end with the reported levels');
+  }
+  return {
+    problem: null,
+    regime: Object.freeze({
+      status: raw.status,
+      asOf: raw.asOf,
+      source: textOrNull(raw.source),
+      levels: Object.freeze({ vix9d: levels.vix9d, vix: levels.vix, vix3m: levels.vix3m }),
+      slope: isNum(raw.slope) ? raw.slope : null,
+      ratio: isNum(raw.ratio) ? raw.ratio : null,
+      frontRatio: isNum(raw.frontRatio) ? raw.frontRatio : null,
+      state: raw.state,
+      inverted: raw.inverted === true,
+      invertedStreak: Number.isInteger(raw.invertedStreak) && raw.invertedStreak >= 0 ? raw.invertedStreak : null,
+      rules: Object.freeze({ elevatedLevel: rules.elevatedLevel, elevatedRatio: rules.elevatedRatio, invertedRatio: rules.invertedRatio }),
+      history: Object.freeze({
+        dates: Object.freeze(history.dates), vix9d: Object.freeze(history.vix9d),
+        vix: Object.freeze(history.vix), vix3m: Object.freeze(history.vix3m),
+      }),
+      note: textOrNull(raw.note),
+    }),
+  };
+}
+
 /**
  * Validate and normalise the macro block. Never throws: a missing or malformed
  * rate becomes "unavailable", and anything that needs it (the Sharpe ratio)
- * reports N/A with that reason.
+ * reports N/A with that reason. The same holds for the market regime.
  * @returns {{ macro: object, problems: string[] }}
  */
 export function normaliseMacro(raw) {
@@ -374,7 +458,9 @@ export function normaliseMacro(raw) {
     riskFree[currency] = rate;
     if (problem) problems.push(problem);
   }
-  return { macro: Object.freeze({ riskFree: Object.freeze(riskFree) }), problems };
+  const { regime, problem } = normaliseRegime(isPlainObject(raw) ? raw.regime : undefined);
+  if (problem) problems.push(problem);
+  return { macro: Object.freeze({ riskFree: Object.freeze(riskFree), regime }), problems };
 }
 
 function normaliseFxSeries(raw) {
@@ -677,7 +763,7 @@ export function describeAge(generatedAt, now = new Date()) {
  * The result always has the v2 shape:
  *   { schemaVersion, generatedAt, ageHours, ageDays, freshness,
  *     fx: { base, quote, rate, asOf, series: { dates, rates } },
- *     macro: { riskFree: { USD, SGD } },
+ *     macro: { riskFree: { USD, SGD }, regime },
  *     assets: [{ ...core, news, forecast }], byTicker, sectors, staleTickers, warnings }
  */
 export function normaliseSnapshot(raw, now = new Date()) {

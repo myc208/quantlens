@@ -38,6 +38,7 @@ import { createWorkerService, createJobRunner, jobKey } from './services/workerS
 import { analyzeTechnicals, analyzeWindow } from './engines/technicalEngine.js';
 import { analyzeRisk, positionTailRisk } from './engines/riskEngine.js';
 import { analyzeEvents, gapRisk } from './engines/eventEngine.js';
+import { analyzeRegime, describeRegime } from './engines/regimeEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
 import { advise } from './engines/advisorEngine.js';
@@ -55,6 +56,7 @@ import { mountPortfolioSandbox } from './ui/portfolioSandbox.js';
 import { mountDerivationDrawer } from './ui/derivationDrawer.js';
 import { mountRiskSandboxModal } from './ui/riskSandboxModal.js';
 import { mountCommandPalette } from './ui/commandPalette.js';
+import { mountRegimeBanner } from './ui/regimeBanner.js';
 
 /* ------------------------------------------------------------------ */
 /* Store and URL state                                                 */
@@ -242,6 +244,8 @@ const h = Object.freeze({
 
 // ticker -> { asset, technical, fundamental, advisor, sentiment, forecast }
 const analyses = new Map();
+// The market regime: one reading per snapshot, shared by every view.
+let regimeAnalysis = analyzeRegime(null);
 
 function analyseAsset(asset, fxRate, now) {
   const technical = analyzeTechnicals(asset);
@@ -607,7 +611,7 @@ function traceIndex(ticker) {
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
   const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
-  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record];
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
@@ -623,6 +627,7 @@ function traceIndex(ticker) {
     current.correlation.pairs,
     current.heat,
     held ? held.metrics : null,
+    regimeAnalysis.metrics,
   );
   indexCache.set(cacheKey, { parts, index });
   return index;
@@ -651,6 +656,8 @@ const app = {
   simulation,
   portfolio,
   backtest,
+  regime: () => regimeAnalysis,
+  describeRegime: () => describeRegime(regimeAnalysis),
   traceIndex,
   trace,
   explain: (id, profile) => getExplainer(id, profile),
@@ -678,6 +685,7 @@ const elements = {
   screener: document.getElementById('screener'),
   workspace: document.getElementById('workspace'),
   status: document.getElementById('app-status'),
+  regimeBanner: document.getElementById('regime-banner'),
   matrix: document.getElementById('comparison-matrix'),
   leaderboard: document.getElementById('leaderboard'),
   portfolio: document.getElementById('portfolio'),
@@ -771,6 +779,7 @@ store.subscribe((next, previous) => {
 /* ------------------------------------------------------------------ */
 
 mountTelemetryBar(elements.telemetry, app);
+mountRegimeBanner(elements.regimeBanner, app);
 mountAppTabs(elements.tabs, app);
 mountScreenerPanel(elements.screener, app);
 mountComparisonMatrix(elements.matrix, app);
@@ -805,6 +814,7 @@ async function boot() {
     comparisonMemo = { key: null, value: EMPTY_COMPARISON };
     const now = new Date();
     for (const asset of snapshot.assets) analyses.set(asset.ticker, analyseAsset(asset, snapshot.fx.rate, now));
+    regimeAnalysis = analyzeRegime(snapshot.macro ? snapshot.macro.regime : null);
 
     store.dispatch(actions.snapshotLoaded(snapshot, snapshot.warnings));
     // Canonicalise the address bar: drop unknown tickers and malformed values from a hand-edited link.

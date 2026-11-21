@@ -190,6 +190,7 @@
     import * as risk from '../src/engines/riskEngine.js';
     import * as eventsEngine from '../src/engines/eventEngine.js';
     import * as backtest from '../src/engines/backtestEngine.js';
+    import * as regimes from '../src/engines/regimeEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -1875,6 +1876,8 @@
         Object.keys(eventsEngine.analyzeEvents(anyAsset).metrics).forEach((id) => ids.add(id));
         ids.add(eventsEngine.gapRisk({ sizing: null, events: null, accountCurrency: 'USD' }).id);
         Object.keys(backtest.backtestAsset(anyAsset).metrics).forEach((id) => ids.add(id));
+        // V3.1: the market regime.
+        regimes.REGIME_METRIC_IDS.forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -3713,6 +3716,160 @@
         expect(storeModule.COMPUTE_JOBS).toContain('backtest');
         expect(storeModule.createInitialState('').compute.backtest.status).toBe('idle');
         expect(mathWorker.JOB_TYPES).toContain('backtest');
+      });
+    });
+
+    /* ================================================================== */
+    /* 27. V3.1 market regime: the VIX term structure                       */
+    /* ================================================================== */
+
+    // A compact block in the pipeline's format: [date, vix9d, vix, vix3m] rows.
+    function regimeBlock(rows, overrides = {}) {
+      const last = rows[rows.length - 1];
+      const ratio = last[2] / last[3];
+      const rules = { elevatedLevel: 20, elevatedRatio: 0.95, invertedRatio: 1 };
+      const state = regimes.classifyRegime(last[2], last[3], rules);
+      let streak = 0;
+      for (let i = rows.length - 1; i >= 0 && rows[i][2] / rows[i][3] >= 1; i -= 1) streak += 1;
+      return {
+        status: 'fresh', asOf: last[0], source: 'yahoo', symbols: { short: '^VIX9D', mid: '^VIX', long: '^VIX3M' },
+        levels: { vix9d: last[1], vix: last[2], vix3m: last[3] },
+        slope: Math.round((last[3] - last[2]) * 100) / 100, ratio, frontRatio: last[1] === null ? null : last[1] / last[2],
+        state, inverted: state === 'stressed', invertedStreak: streak, rules,
+        historyFields: ['date', 'vix9d', 'vix', 'vix3m'], history: rows, note: null,
+        ...overrides,
+      };
+    }
+    const NOVEMBER = [
+      ['2026-11-13', 17.82, 19.30, 20.62],
+      ['2026-11-16', 23.15, 22.91, 23.02],
+      ['2026-11-17', 26.70, 25.46, 24.98],
+      ['2026-11-18', 23.95, 24.56, 24.29],
+      ['2026-11-19', 29.26, 28.44, 27.03],
+      ['2026-11-20', 40.72, 35.89, 30.94],
+    ];
+
+    suite('market regime: reading macro.regime from the snapshot', () => {
+      test('a valid block is kept, column-wise and frozen', () => {
+        const { regime, problem } = snapshotService.normaliseRegime(regimeBlock(NOVEMBER));
+        expect(problem).toBeNull();
+        expect(regime.status).toBe('fresh');
+        expect(regime.levels).toEqual({ vix9d: 40.72, vix: 35.89, vix3m: 30.94 });
+        expect(regime.history.dates.length).toBe(6);
+        expect(regime.history.vix[5]).toBe(35.89);
+        expect(Object.isFrozen(regime.history.vix)).toBeTrue();
+      });
+      test('a snapshot from before V3.1 simply has no regime, with no warning', () => {
+        const { regime, problem } = snapshotService.normaliseRegime(undefined);
+        expect(problem).toBeNull();
+        expect(regime.status).toBe('unavailable');
+        expect(regime.note).toMatch(/before the market regime/);
+        expect(snapshotService.normaliseMacro({ riskFree: {} }).macro.regime.status).toBe('unavailable');
+      });
+      test('a malformed block becomes unavailable with a reason, never a wrong reading', () => {
+        const cases = [
+          regimeBlock(NOVEMBER, { levels: { vix9d: 40.72, vix: 3589, vix3m: 30.94 } }),        // basis points, not a level
+          regimeBlock(NOVEMBER, { asOf: '20/11/2026' }),
+          regimeBlock(NOVEMBER, { state: 'panic' }),
+          regimeBlock(NOVEMBER, { history: NOVEMBER.slice(0, 5) }),                            // does not end with the levels
+          regimeBlock(NOVEMBER, { history: [NOVEMBER[1], NOVEMBER[0], ...NOVEMBER.slice(2)] }), // out of order
+          regimeBlock(NOVEMBER, { rules: null }),
+          { status: 'sideways' },
+        ];
+        for (const raw of cases) {
+          const { regime, problem } = snapshotService.normaliseRegime(raw);
+          expect(regime.status).toBe('unavailable');
+          expect(problem).toMatch(/market regime/);
+        }
+        const down = snapshotService.normaliseRegime({ status: 'unavailable', note: 'The VIX curve could not be read in this run.' });
+        expect(down.problem).toBeNull();
+        expect(down.regime.note).toMatch(/could not be read/);
+      });
+    });
+
+    suite('regimeEngine: normal, elevated, stressed', () => {
+      test('the state follows the published rules at their boundaries (same cases as the pipeline)', () => {
+        expect(regimes.classifyRegime(25, 25)).toBe('stressed');          // ratio exactly 1: inverted
+        expect(regimes.classifyRegime(24.99, 25)).toBe('elevated');
+        expect(regimes.classifyRegime(19, 20)).toBe('elevated');          // ratio exactly 0.95: flat
+        expect(regimes.classifyRegime(18.99, 20)).toBe('normal');
+        expect(regimes.classifyRegime(20, 25)).toBe('elevated');          // VIX exactly 20
+        expect(regimes.classifyRegime(19.99, 25)).toBe('normal');
+        expect(regimes.classifyRegime(15, 20, { elevatedLevel: 14, elevatedRatio: 0.95, invertedRatio: 1 })).toBe('elevated');
+        expect(regimes.classifyRegime(null, 20)).toBeNull();
+      });
+      test('an inverted curve: ratio, slope, run length and counts, all traced', () => {
+        const { regime } = snapshotService.normaliseRegime(regimeBlock(NOVEMBER));
+        const result = regimes.analyzeRegime(regime);
+        expect(result.state).toBe('stressed');
+        expect(result.streak).toBe(4);                                     // 16 Nov was 0.995
+        const { marketRegime, vixLevel, vixTermRatio, vixFrontRatio } = result.metrics;
+        expect(marketRegime.value).toBe('Stressed');
+        expect(marketRegime.tone).toBe('risky');
+        expect(marketRegime.meta.agreesWithPipeline).toBeTrue();
+        expect(vixTermRatio.value).toBeCloseTo(35.89 / 30.94, 1e-12);
+        expect(vixTermRatio.meta.slope).toBeCloseTo(-4.95, 1e-9);
+        expect(vixTermRatio.meta.invertedYear).toBe(4);
+        expect(vixLevel.meta.dailyMove).toBeCloseTo(35.89 / Math.sqrt(252), 1e-12);
+        expect(vixLevel.meta.yearRank).toBe(1);                           // the highest of the six
+        expect(vixFrontRatio.value).toBeCloseTo(40.72 / 35.89, 1e-12);
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(marketRegime.trace.interpretation.caveat).toMatch(/Context only/);
+      });
+      test('normal and elevated days, and a percentile computed by hand', () => {
+        const calm = regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock([['2026-11-12', 13.1, 14.2, 17.1]])).regime);
+        expect(calm.state).toBe('normal');
+        expect(calm.metrics.marketRegime.tone).toBe('healthy');
+        expect(calm.streak).toBe(0);
+        const flat = regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock([['2026-11-16', 23.15, 22.91, 23.02]])).regime);
+        expect(flat.state).toBe('elevated');
+        expect(regimes.percentileRank([10, 20, 30, 40], 30)).toBe(0.75);
+        expect(regimes.percentileRank([], 30)).toBeNull();
+      });
+      test('without VIX9D only the front of the curve is N/A; without a block everything is', () => {
+        const rows = NOVEMBER.map((row, i) => (i === NOVEMBER.length - 1 ? [row[0], null, row[2], row[3]] : row));
+        const partial = regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock(rows, { note: 'VIX9D has no close for the latest session, so the front of the curve is not shown.' })).regime);
+        expect(partial.state).toBe('stressed');
+        expect(partial.metrics.vixFrontRatio.status).toBe('na');
+        expect(partial.metrics.vixFrontRatio.naReason).toMatch(/VIX9D/);
+        const none = regimes.analyzeRegime(snapshotService.normaliseRegime(undefined).regime);
+        expect(none.state).toBeNull();
+        for (const id of regimes.REGIME_METRIC_IDS) {
+          expect(none.metrics[id].status).toBe('na');
+          expect(tracer.validateTrace(none.metrics[id])).toEqual([]);
+        }
+      });
+      test('a stale reading says whose day it is', () => {
+        const { regime } = snapshotService.normaliseRegime(regimeBlock(NOVEMBER, { status: 'stale' }));
+        const result = regimes.analyzeRegime(regime);
+        expect(result.metrics.marketRegime.trace.interpretation.caveat).toMatch(/reading of 2026-11-20/);
+        expect(regimes.describeRegime(result).pill).toMatch(/2026-11-20/);
+      });
+      test('the telemetry pill and the banner text', () => {
+        const stressed = regimes.describeRegime(regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock(NOVEMBER)).regime));
+        expect(stressed.label).toBe('Stressed');
+        expect(stressed.pill).toBe('VIX 35.9 · inverted');
+        expect(stressed.headline).toBe('VIX curve inverted (VIX 35.9 above VIX3M 30.9), 4th session in a row');
+        expect(stressed.banner).toBeTrue();
+        const calm = regimes.describeRegime(regimes.analyzeRegime(snapshotService.normaliseRegime(regimeBlock([['2026-11-12', 13.1, 14.2, 17.1]])).regime));
+        expect(calm.headline).toBe('VIX 14.2, curve in contango (VIX3M 17.1)');
+        expect(calm.banner).toBeFalse();
+        expect(regimes.describeRegime(regimes.analyzeRegime(null)).label).toBe('N/A');
+      });
+      test('real snapshot: the browser reads the same regime as the pipeline wrote', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const result = regimes.analyzeRegime(snapshot.macro.regime);
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+        if (!raw.macro || !raw.macro.regime || raw.macro.regime.status === 'unavailable') {
+          expect(result.state).toBeNull();
+          return;
+        }
+        expect(result.state).toBe(raw.macro.regime.state);
+        expect(result.streak).toBe(raw.macro.regime.invertedStreak);
+        expect(result.metrics.vixTermRatio.value).toBeCloseTo(raw.macro.regime.ratio, 1e-6);
+        expect(snapshot.macro.regime.history.vix.length).toBeGreaterThan(1000);   // five years
+        expect(snapshot.warnings.some((warning) => /regime/.test(warning))).toBeFalse();
       });
     });
 
