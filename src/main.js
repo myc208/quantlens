@@ -3,12 +3,12 @@
  *
  * Responsibilities
  *   1. Create the store from the URL
- *      (?t=&ccy=&mode=&class=&mkt=&sector=&verdict=&view=&range=&p=) and keep the
+ *      (?t=&ccy=&mode=&class=&mkt=&sector=&trend=&view=&range=&p=) and keep the
  *      URL and the store in sync in both directions.
  *   2. Load the daily snapshot, run every engine once per asset, and cache the result.
  *   3. Slice each asset to the selected time range (1M / 3M / 6M / 1Y) and derive
- *      the windowed statistics. The verdict and its indicators always use the
- *      full year: the time range never changes them.
+ *      the windowed statistics. The trend regime, the scores and their indicators
+ *      always use the full year: the time range never changes them.
  *   4. Derive the comparison (correlation, position sizes, total risk) for the
  *      selected assets, memoised on exactly the inputs it depends on.
  *   5. Send the heavy maths (Monte Carlo, portfolio statistics and the frontier
@@ -44,7 +44,6 @@ import { analyzeLiquidity } from './engines/liquidityEngine.js';
 import { analyzeMacro, describeMacro, holidaysFor } from './engines/macroCalendarEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
-import { advise } from './engines/advisorEngine.js';
 import { sizePosition, portfolioHeat } from './engines/positionSizerEngine.js';
 import { analyzeSentiment } from './engines/sentimentEngine.js';
 import { analyzeForecast } from './engines/forecastEngine.js';
@@ -99,7 +98,7 @@ const TONE_WORDS = { healthy: 'healthy', neutral: 'neutral', caution: 'caution',
 const MULTIPLE_IDS = new Set(['evEbitda', 'trailingPE', 'forwardPE', 'priceToBook', 'debtToEquity']);
 const FINE_PERCENT_IDS = new Set(['spreadEstimate', 'rangeSpread', 'volumeShare']);
 // Changes read better with an explicit sign: "+4.2%" cannot be mistaken for a level.
-const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown', 'relativeStrength1m', 'relativeStrength3m']);
+const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown', 'relativeStrength1m', 'relativeStrength3m', 'regimeRecord']);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 /**
@@ -253,7 +252,7 @@ const h = Object.freeze({
 /* Analysis cache: every engine, once per asset, per snapshot           */
 /* ------------------------------------------------------------------ */
 
-// ticker -> { asset, technical, fundamental, advisor, sentiment, forecast }
+// ticker -> { asset, technical, fundamental, sentiment, forecast, events, liquidity }
 const analyses = new Map();
 // The market regime: one reading per snapshot, shared by every view.
 let regimeAnalysis = analyzeRegime(null);
@@ -263,20 +262,23 @@ let macroAnalysis = analyzeMacro(null);
 function analyseAsset(asset, fxRate, now, holidays = null) {
   const technical = analyzeTechnicals(asset);
   const fundamental = analyzeFundamentals(asset, { fxRate });
-  const advisor = advise({ asset, technical, fundamental });
-  // Context only: neither of these ever reaches the verdict.
+  // Context only: neither of these ever reaches the trend regime or a score.
   const sentiment = analyzeSentiment(asset, { now });
   const forecast = analyzeForecast(asset);
   // Scheduled events: earnings and ex-dividend dates, and the typical earnings-day move.
   const events = analyzeEvents(asset, { now, holidays });
   // Liquidity from the last 20 sessions: volume, traded value, Amihud and the tick-floor spread.
   const liquidity = analyzeLiquidity(asset, { fxRate });
-  return { asset, technical, fundamental, advisor, sentiment, forecast, events, liquidity };
+  return { asset, technical, fundamental, sentiment, forecast, events, liquidity };
 }
 
-function verdicts() {
+/** ticker -> trend regime label (Uptrend, Extended, Pullback, Recovering, Downtrend) or null. */
+function trends() {
   const result = {};
-  for (const [ticker, analysis] of analyses) result[ticker] = analysis.advisor.verdict;
+  for (const [ticker, analysis] of analyses) {
+    const regime = analysis.technical.metrics.trendRegime;
+    result[ticker] = regime && regime.status === 'ok' ? regime.value : null;
+  }
   return result;
 }
 
@@ -290,7 +292,7 @@ const windows = new Map(); // `${ticker}|${range}` -> window
  * One asset cut down to a time range, with the statistics of that window.
  * Used by the charts, the Period rows, correlation, the simulation's
  * volatility and the portfolio maths. RSI, MACD, the moving averages and the
- * verdict are never computed from a window: they need their full warm-up.
+ * trend regime are never computed from a window: they need their full warm-up.
  *
  * @returns {{ range:string, info:object, series:object, asset:object, metrics:object, from:string, to:string, observations:number }|null}
  */
@@ -436,7 +438,6 @@ function comparison() {
       entryPrice: quote.price,
       entrySource: quote.live ? 'live Binance price' : `last daily close (${asset.quote.asOf})`,
       atr: valueOf(analysis.technical.metrics.atr14),
-      verdict: analysis.advisor.verdict,
       account: state.account,
       accountCurrency: state.currency,
       fxRate,
@@ -590,7 +591,7 @@ function schedulePortfolio(delay = 140) {
   }, delay);
 }
 
-// The verdict backtest replays about 1,000 days for every asset: it runs once per snapshot,
+// The backtest replays about 1,000 days for every asset: it runs once per snapshot,
 // in the worker, so the page is usable while it computes.
 function submitBacktest(snapshot) {
   const assets = snapshot.assets.map((asset) => ({
@@ -636,7 +637,7 @@ const indexCache = new Map(); // ticker|'' -> { parts, index }
 
 /**
  * Every traced metric that is in scope for an asset: its indicators,
- * fundamentals, verdict, headline tone, projection and time-range statistics,
+ * fundamentals, trend regime, headline tone, projection and time-range statistics,
  * its position sizing, the latest simulation, plus the selection-wide
  * correlation pairs and total risk. Pass null for the metrics that belong to
  * no single asset: correlation, total risk and the portfolio statistics.
@@ -658,7 +659,7 @@ function traceIndex(ticker) {
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
   const index = buildTraceIndex(
-    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics, analysis.liquidity.metrics] : null,
+    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics, analysis.liquidity.metrics] : null,
     view ? view.metrics : null,
     view ? view.risk.metrics : null,
     view ? view.factors.metrics : null,
@@ -693,7 +694,7 @@ const app = {
   h,
   analysis: (ticker) => analyses.get(ticker) ?? null,
   window: (ticker, range) => windowFor(ticker, range),
-  verdicts,
+  trends,
   comparison,
   priceMetric,
   requestSimulation,

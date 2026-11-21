@@ -14,8 +14,7 @@ import { valueOf } from '../core/derivationTracer.js';
 
 const CLASS_LABELS = Object.freeze({ all: 'All classes', equity: 'Stocks and REITs', etf: 'ETFs', index: 'Indices', crypto: 'Crypto' });
 const MARKET_LABELS = Object.freeze({ all: 'All markets', US: 'United States', SG: 'Singapore', UK: 'United Kingdom', CRYPTO: 'Crypto' });
-const VERDICT_LABELS = Object.freeze({ all: 'Any verdict', buy: 'Buy', hold: 'Hold', sell: 'Sell' });
-const VERDICT_TONES = Object.freeze({ BUY: 'healthy', HOLD: 'neutral', SELL: 'risky' });
+const TREND_LABELS = Object.freeze({ all: 'Any trend', uptrend: 'Uptrend', extended: 'Extended', pullback: 'Pullback', recovering: 'Recovering', downtrend: 'Downtrend' });
 
 export function mountScreenerPanel(root, app) {
   const { store, actions, h } = app;
@@ -74,9 +73,9 @@ export function mountScreenerPanel(root, app) {
         </select>
       </label>
       <label class="field">
-        <span class="field__label">Verdict</span>
-        <select class="select" name="verdict">
-          ${FILTER_OPTIONS.verdict.map((value) => option(value, VERDICT_LABELS[value], filters.verdict)).join('')}
+        <span class="field__label">Trend regime</span>
+        <select class="select" name="trend">
+          ${FILTER_OPTIONS.trend.map((value) => option(value, TREND_LABELS[value], filters.trend)).join('')}
         </select>
       </label>`;
     syncFilters();
@@ -93,22 +92,22 @@ export function mountScreenerPanel(root, app) {
     resetButton.hidden = !hasActiveFilters(filters);
   }
 
-  function verdictBadge(verdict) {
-    if (!verdict) return '<span class="badge badge--na">N/A</span>';
-    const tone = VERDICT_TONES[verdict] ?? 'neutral';
-    return `<span class="badge badge--verdict badge--${tone}">${h.toneMark(tone)}${h.esc(verdict)}</span>`;
+  function trendBadge(regime) {
+    if (!regime || regime.status !== 'ok') return '<span class="badge badge--na">N/A</span>';
+    return `<span class="badge badge--trend badge--${regime.tone}">${h.toneMark(regime.tone)}${h.esc(regime.value)}</span>`;
   }
 
   function assetRow(asset, state) {
     const analysis = app.analysis(asset.ticker);
-    const verdict = analysis ? analysis.advisor.verdict : null;
-    const score = analysis ? valueOf(analysis.advisor.metrics.compositeScore) : null;
+    const regime = analysis ? analysis.technical.metrics.trendRegime : null;
+    const trend = regime && regime.status === 'ok' ? regime.value : null;
+    const score = analysis ? valueOf(analysis.technical.metrics.technicalScore) : null;
     const selected = state.selected.includes(asset.ticker);
     const full = !selected && state.selected.length >= MAX_SELECTED;
-    const scoreText = score === null ? 'no score' : `score ${h.formatNumber(score, 0)}`;
+    const scoreText = score === null ? 'no score' : `Technical ${h.formatNumber(score, 0)}`;
     const labelParts = [
       asset.ticker, asset.name,
-      verdict ? `verdict ${verdict}` : 'no verdict', scoreText,
+      trend ? `trend ${trend}` : 'no trend regime', score === null ? 'no Technical score' : `Technical score ${h.formatNumber(score, 0)}`,
       selected ? 'selected' : full ? `not selected, ${MAX_SELECTED} already chosen` : 'not selected',
     ];
     return `
@@ -121,7 +120,7 @@ export function mountScreenerPanel(root, app) {
             <span class="asset__name">${h.esc(asset.name)}${asset.sector ? ` · ${h.esc(asset.sector)}` : ''}</span>
           </span>
           <span class="asset__signal">
-            ${verdictBadge(verdict)}
+            ${trendBadge(regime)}
             <span class="asset__score">${h.esc(scoreText)}</span>
           </span>
         </button>
@@ -137,7 +136,7 @@ export function mountScreenerPanel(root, app) {
       return;
     }
     const total = state.snapshot.assets.length;
-    const visible = filterAssets(state.snapshot.assets, state.filters, app.verdicts());
+    const visible = filterAssets(state.snapshot.assets, state.filters, app.trends());
     const hiddenSelected = state.selected.filter((ticker) => !visible.some((asset) => asset.ticker === ticker));
 
     // Keep keyboard focus on the same asset across re-renders.

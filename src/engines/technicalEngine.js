@@ -752,7 +752,7 @@ const MIN_WINDOW_RETURNS = 10;
  * Statistics for one time-range window: 1 month, 3 months, 6 months or 1 year.
  *
  * These describe the chosen window only and change with the time slicer.
- * Moving averages, MACD, RSI, ATR and the verdict are NOT recomputed on a
+ * Moving averages, MACD, RSI, ATR and the trend regime are NOT recomputed on a
  * window: they need a warm-up that a short slice cannot give, so they always
  * use the full history (see analyzeTechnicals).
  *
@@ -922,7 +922,7 @@ export function analyzeWindow(asset, series, rangeLabel = '1 year') {
           threshold('25% – 50%', 'Lower half', 'caution'),
           threshold('0% – 25%', 'Near the lows of the window', 'risky'),
         ],
-        'This uses daily closes inside the selected time range. The 52-week range position in the Technical section always uses the full year, and it is the one that feeds the verdict.',
+        'This uses daily closes inside the selected time range. The 52-week range position in the Technical section always uses the full year, and it is the one that feeds the Technical score.',
       ),
     });
   }

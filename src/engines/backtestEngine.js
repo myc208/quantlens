@@ -1,35 +1,34 @@
 /**
- * backtestEngine.js: the verdict's own track record.
+ * backtestEngine.js: what followed the price-based readouts, replayed over the stored years.
  *
- * For every past day with a full window of history behind it, the Technical score
- * is recomputed from exactly that window, as the live engine would have computed it
- * on that day, then compared with what the price did over the next 21 trading days.
+ * For every past day with a full window of history behind it, the Technical score and
+ * the trend regime are recomputed from exactly that window, as the live engine would
+ * have computed them on that day, then compared with what the price did over the next
+ * 21 trading days.
  *
  *   window    the same length as the live window (the asset's year of candles), so the
- *             last day of the backtest reproduces today's live score exactly
- *   verdict   the score's band (BUY 65+, HOLD 45 to 65, SELL below 45) with the two
- *             price-based safety rules applied (downtrend, overheated RSI)
+ *             last day of the backtest reproduces today's live score and label exactly
+ *   label     the trend regime (Uptrend, Extended, Pullback, Recovering, Downtrend)
+ *   state     the VIX regime of that day (normal, elevated, stressed, macro.regime.history)
  *   outcome   simple return from that day's close to the close 21 sessions later
  *
- * Reported per asset: the average forward return and hit rate of each band against
- * the asset's average day, and the rank IC (Spearman correlation between the score
- * and the forward return).
+ * Reported per asset: the regime track record (the average forward return after each
+ * label, overall and within each VIX regime) and the Technical score's rank IC (Spearman
+ * correlation between the score and the forward return), with the highest and lowest
+ * third of scored days against the asset's average day.
  *
- * Deliberately NOT tested: the Fundamental half of the composite. Free data only has
- * today's fundamentals, and scoring 2022 with 2026 accounts would leak the future into
- * the test (look-ahead bias). For ETFs, indices and crypto the Technical score is the
- * whole verdict; for stocks it is the half that moves day to day.
+ * V3.3: the BUY / HOLD / SELL bands are gone. Over 2022–2026 neither the score nor any
+ * simple trend or momentum signal predicted 21- or 63-day returns on this watchlist, so
+ * QuantLens describes the trend and publishes what followed, rather than a verdict.
  *
- * V3.3 adds the regime track record: every replayed day also gets its trend regime
- * (Uptrend, Extended, Pullback, Recovering, Downtrend) and the VIX regime of that day
- * (normal, elevated, stressed, from macro.regime.history), and the forward returns are
- * reported by label, overall and within each VIX regime.
+ * Deliberately NOT tested: the Fundamental score. Free data only has today's
+ * fundamentals, and scoring 2022 with 2026 accounts would leak the future into the test
+ * (look-ahead bias).
  */
 
 import { isNum, safeDiv, mean, pearson, interpolateAnchors, weightedScore, minOf, maxOf, percentile } from '../core/precisionMath.js';
 import { traced, notAvailable, input, step, threshold, interpretation, fmtN, fmtPct } from '../core/derivationTracer.js';
 import { TECH_CONFIG, smaSeries, emaSeries, macdSeries, rsiSeries } from './technicalEngine.js';
-import { ADVISOR_CONFIG, verdictForScore } from './advisorEngine.js';
 import { classifyTrend, TREND_REGIMES } from './trendRegimeEngine.js';
 import { classifyRegime, REGIME_STATES } from './regimeEngine.js';
 
@@ -151,16 +150,6 @@ export function summariseRegimes(labels, states, scores, forward) {
   return { byLabel, byState, base: describeReturns(forward) };
 }
 
-/** The verdict a Technical score implies, with the two price-based safety rules applied. */
-export function technicalVerdict(point, price) {
-  const raw = verdictForScore(point.score);
-  if (raw !== 'BUY') return raw;
-  const downtrend = point.sma200 !== null && point.macdLine !== null && point.macdSignal !== null
-    && price < point.sma200 && point.macdLine < point.macdSignal;
-  const overheated = point.rsi !== null && point.rsi > ADVISOR_CONFIG.guardrails.rsiOverheated;
-  return downtrend || overheated ? 'HOLD' : 'BUY';
-}
-
 /** Ranks with ties sharing their average rank (1-based). */
 export function averageRanks(values) {
   const order = values.map((value, index) => ({ value, index })).sort((a, b) => a.value - b.value);
@@ -184,10 +173,11 @@ export function spearman(xs, ys) {
 }
 
 /**
- * Band statistics and rank IC from per-day scores, verdicts and forward returns.
- * @returns {{ n:number, base:object, bands:Record<string, object>, ic:number|null, independent:number, tStat:number|null }}
+ * Rank IC of per-day scores against forward returns, with the highest and lowest third
+ * of scored days (by score) against the average day.
+ * @returns {{ n:number, base:object, top:object, bottom:object, ic:number|null, independent:number, tStat:number|null }}
  */
-export function summariseBacktest(scores, verdicts, forward) {
+export function summariseBacktest(scores, forward) {
   const n = forward.length;
   const describe = (returns) => {
     if (!returns.length) return { count: 0, mean: null, median: null, upShare: null };
@@ -195,30 +185,33 @@ export function summariseBacktest(scores, verdicts, forward) {
     return { count: returns.length, mean: mean(returns), median: percentile(sorted, 0.5), upShare: returns.filter((r) => r > 0).length / returns.length };
   };
   const base = describe(forward);
-  const bands = {};
-  for (const verdict of ['BUY', 'HOLD', 'SELL']) {
-    const band = describe(forward.filter((_, i) => verdicts[i] === verdict));
-    band.share = n ? band.count / n : 0;
+  // Days ordered by score (ties keep their date order); a third at each end.
+  const order = scores.map((score, i) => ({ score, i })).sort((a, b) => a.score - b.score || a.i - b.i).map((item) => item.i);
+  const third = Math.floor(n / 3);
+  const slice = (indices) => {
+    const band = describe(indices.map((i) => forward[i]));
     band.excess = isNum(band.mean) && isNum(base.mean) ? band.mean - base.mean : null;
-    // A BUY is right when the price rose; a SELL is right when it fell.
-    band.hitRate = band.count === 0 ? null : verdict === 'SELL' ? 1 - band.upShare : band.upShare;
-    bands[verdict] = band;
-  }
+    band.minScore = indices.length ? Math.min(...indices.map((i) => scores[i])) : null;
+    band.maxScore = indices.length ? Math.max(...indices.map((i) => scores[i])) : null;
+    return band;
+  };
+  const top = slice(third ? order.slice(n - third) : []);
+  const bottom = slice(order.slice(0, third));
   const ic = spearman(scores, forward);
   const independent = Math.floor(n / BACKTEST_CONFIG.horizon);
   const tStat = isNum(ic) && independent > 2 && Math.abs(ic) < 1 ? ic * Math.sqrt((independent - 2) / (1 - ic * ic)) : null;
-  return { n, base, bands, ic, independent, tStat };
+  return { n, base, top, bottom, ic, independent, tStat };
 }
 
 /**
- * The verdict's track record for one asset.
+ * The regime track record and the Technical score's track record for one asset.
  * @param {{ ticker:string, assetClass:string, series:{dates:string[], high:number[], low:number[], close:number[]}, longSeries:{dates:string[], close:number[]} }} asset
  */
 export function backtestAsset(asset, { regimeOf = () => null } = {}) {
-  const id = 'verdictBacktest';
-  const label = 'Verdict track record (backtest)';
+  const id = 'scoreBacktest';
+  const label = 'Technical score track record (backtest)';
   const horizon = BACKTEST_CONFIG.horizon;
-  const formula = `Rank IC = Spearman correlation between each day's Technical score and the return over the next ${horizon} sessions; band hit rate = share of BUY days followed by a rise (SELL: by a fall)`;
+  const formula = `Rank IC = Spearman correlation between each day's Technical score and the return over the next ${horizon} sessions`;
   const long = asset.longSeries ?? { dates: asset.series.dates, close: asset.series.close };
   const window = asset.series.close.length;
   const historyCount = long.close.length - window;
@@ -226,7 +219,6 @@ export function backtestAsset(asset, { regimeOf = () => null } = {}) {
   const lows = long.close.map((close, i) => (i >= historyCount ? asset.series.low[i - historyCount] : close));
 
   const scores = [];
-  const verdicts = [];
   const labels = [];
   const states = [];
   const forward = [];
@@ -235,10 +227,9 @@ export function backtestAsset(asset, { regimeOf = () => null } = {}) {
   for (let t = window - 1; t < long.close.length; t += 1) {
     const from = t - window + 1;
     const point = technicalScoreAt(long.close.slice(from, t + 1), highs.slice(from, t + 1), lows.slice(from, t + 1));
-    if (t === long.close.length - 1) lastPoint = { ...point, verdict: technicalVerdict(point, long.close[t]), label: classifyTrend(point) };
+    if (t === long.close.length - 1) lastPoint = { ...point, label: classifyTrend(point) };
     if (!isNum(point.score) || t + horizon >= long.close.length) continue;
     scores.push(point.score);
-    verdicts.push(technicalVerdict(point, long.close[t]));
     labels.push(classifyTrend(point));
     states.push(regimeOf(long.dates[t]));
     forward.push(long.close[t + horizon] / long.close[t] - 1);
@@ -246,7 +237,7 @@ export function backtestAsset(asset, { regimeOf = () => null } = {}) {
   }
 
   const result = {
-    ticker: asset.ticker, lastScore: lastPoint ? lastPoint.score : null, lastVerdict: lastPoint ? lastPoint.verdict : null,
+    ticker: asset.ticker, lastScore: lastPoint ? lastPoint.score : null,
     lastLabel: lastPoint ? lastPoint.label : null, days: days.length,
     span: days.length ? { from: days[0], to: days[days.length - 1] } : null,
   };
@@ -266,23 +257,21 @@ export function backtestAsset(asset, { regimeOf = () => null } = {}) {
     };
   }
 
-  const summary = summariseBacktest(scores, verdicts, forward);
+  const summary = summariseBacktest(scores, forward);
   const regimes = summariseRegimes(labels, states, scores, forward);
-  const { ic, tStat, independent, bands, base } = summary;
+  const { ic, tStat, independent, top, bottom, base } = summary;
   const meaningful = isNum(tStat) && Math.abs(tStat) >= 2 && Math.abs(ic) >= BACKTEST_CONFIG.noiseIc;
   let tone = 'neutral';
   if (meaningful) tone = ic > 0 ? 'healthy' : 'risky';
   const pct = (value) => (isNum(value) ? `${value >= 0 ? '+' : ''}${fmtPct(value, 2)}` : 'N/A');
-  const bandLine = (verdict) => {
-    const band = bands[verdict];
-    return band.count === 0 ? `${verdict}: no days` : `${verdict}: ${band.count} days, average ${pct(band.mean)} (${pct(band.excess)} against all days), ${verdict === 'HOLD' ? 'rose' : 'right'} ${fmtPct(verdict === 'HOLD' ? band.upShare : band.hitRate, 0)} of the time`;
-  };
+  const thirdLine = (band) => (band.count === 0 ? 'no days'
+    : `${band.count} days scoring ${fmtN(band.minScore, 0)} to ${fmtN(band.maxScore, 0)}: average ${pct(band.mean)}, rose ${fmtPct(band.upShare, 0)} of the time`);
 
   let summaryText;
   if (!isNum(ic)) summaryText = 'The scores did not vary enough to measure a relationship with what followed.';
-  else if (!meaningful) summaryText = `Over ${days.length} days the score showed no reliable link with the next ${horizon} days (rank IC ${fmtN(ic, 2)}, about ${independent} independent periods). Treat the verdict as a description of the trend, not a forecast.`;
+  else if (!meaningful) summaryText = `Over ${days.length} days the score showed no reliable link with the next ${horizon} days (rank IC ${fmtN(ic, 2)}, about ${independent} independent periods). It describes the trend; it does not forecast it.`;
   else if (ic > 0) summaryText = `Over ${days.length} days, higher scores were followed by better ${horizon}-day returns (rank IC ${fmtN(ic, 2)}). That is a modest, past-only edge for this asset, not a promise.`;
-  else summaryText = `Over ${days.length} days, higher scores were followed by WORSE ${horizon}-day returns (rank IC ${fmtN(ic, 2)}). For this asset the verdict has pointed the wrong way.`;
+  else summaryText = `Over ${days.length} days, higher scores were followed by WORSE ${horizon}-day returns (rank IC ${fmtN(ic, 2)}). For this asset a high score has pointed the wrong way.`;
 
   return {
     ...result,
@@ -296,16 +285,14 @@ export function backtestAsset(asset, { regimeOf = () => null } = {}) {
         formula,
         rawInputs: [
           input('Days scored', days.length, 'days', `${days[0]} to ${days[days.length - 1]}, each with a full ${window}-session window and a ${horizon}-session outcome`),
-          input('Window per score', window, 'sessions', 'the same length as the live verdict uses'),
+          input('Window per score', window, 'sessions', 'the same length as the live score uses'),
           input('Average return over all those days', base.mean, 'fraction', `${horizon}-session forward returns`),
-          input('Share of all days followed by a rise', base.upShare, 'fraction', 'the base rate any verdict must beat'),
+          input('Share of all days followed by a rise', base.upShare, 'fraction', 'the base rate any signal must beat'),
         ],
         steps: [
           step('Recompute the Technical score for every past day from the window ending that day', `${days.length} windows of ${window} sessions`, `${days.length} scores`),
-          step('Map each score to its band, with the downtrend and overheated-RSI rules applied', 'BUY ≥ 65 · HOLD 45 to 65 · SELL < 45', `${bands.BUY.count} BUY · ${bands.HOLD.count} HOLD · ${bands.SELL.count} SELL`),
-          step('BUY days against all days', bandLine('BUY'), pct(bands.BUY.excess)),
-          step('HOLD days', bandLine('HOLD'), pct(bands.HOLD.excess)),
-          step('SELL days against all days', bandLine('SELL'), pct(bands.SELL.excess)),
+          step('Highest third of days by score, against all days', thirdLine(top), pct(top.excess)),
+          step('Lowest third of days by score, against all days', thirdLine(bottom), pct(bottom.excess)),
           step('Rank IC: correlation between the score\'s rank and the forward return\'s rank', `Spearman over ${days.length} days`, isNum(ic) ? fmtN(ic, 3) : 'N/A'),
           step(`Rough significance with about ${independent} non-overlapping ${horizon}-day periods`, 't ≈ IC × √((periods − 2) ÷ (1 − IC²))', isNum(tStat) ? fmtN(tStat, 2) : 'N/A'),
         ],
@@ -316,7 +303,7 @@ export function backtestAsset(asset, { regimeOf = () => null } = {}) {
             threshold(`IC ${BACKTEST_CONFIG.noiseIc} or more with t ≥ 2`, 'A modest historical edge', 'healthy'),
             threshold(`IC −${BACKTEST_CONFIG.noiseIc} or less with t ≥ 2`, 'The signal pointed the wrong way', 'risky'),
           ],
-          `Tests the price-based (Technical) half of the verdict only: free data has no point-in-time fundamentals, and scoring past days with today's accounts would leak the future into the test. Before the last year the 52-week range uses closes, as highs and lows are not stored. Overlapping ${horizon}-day windows share days, so the effective sample is about ${independent} periods. The watchlist was chosen today, with hindsight, and prices are dividend-adjusted.`,
+          `Tests the price-based score only: free data has no point-in-time fundamentals, and scoring past days with today's accounts would leak the future into the test. Before the last year the 52-week range uses closes, as highs and lows are not stored. Overlapping ${horizon}-day windows share days, so the effective sample is about ${independent} periods. The watchlist was chosen today, with hindsight, and prices are dividend-adjusted.`,
         ),
       }),
     },
@@ -387,7 +374,7 @@ export function regimeEpisodes(regime, from, to) {
 export function backtestWatchlist({ assets, regime = null }) {
   const byTicker = {};
   const ics = [];
-  const pooled = { BUY: [], HOLD: [], SELL: [], all: [] };
+  const pooled = [];
   const regimeOf = regimeLookup(regime);
   for (const asset of Array.isArray(assets) ? assets : []) {
     const result = backtestAsset(asset, { regimeOf });
@@ -395,12 +382,7 @@ export function backtestWatchlist({ assets, regime = null }) {
     if (result.summary && isNum(result.summary.ic)) ics.push(result.summary.ic);
   }
   for (const result of Object.values(byTicker)) {
-    if (!result.summary) continue;
-    for (const verdict of ['BUY', 'HOLD', 'SELL']) {
-      const band = result.summary.bands[verdict];
-      if (band.count) pooled[verdict].push({ count: band.count, mean: band.mean });
-    }
-    pooled.all.push({ count: result.summary.n, mean: result.summary.base.mean });
+    if (result.summary) pooled.push({ count: result.summary.n, mean: result.summary.base.mean });
   }
   const weighted = (list) => {
     const count = list.reduce((total, item) => total + item.count, 0);
@@ -439,10 +421,7 @@ export function backtestWatchlist({ assets, regime = null }) {
       assets: ics.length,
       meanIc: ics.length ? mean(ics) : null,
       positiveIc: ics.filter((ic) => ic > 0).length,
-      buy: weighted(pooled.BUY),
-      hold: weighted(pooled.HOLD),
-      sell: weighted(pooled.SELL),
-      all: weighted(pooled.all),
+      all: weighted(pooled),
       horizon: BACKTEST_CONFIG.horizon,
     },
   };

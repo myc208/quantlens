@@ -14,7 +14,7 @@
  *                     simply assuming the price would not move
  *
  * A trend model cannot foresee news. The projection is an extrapolation with a
- * measured track record, shown for context. It is not part of the verdict.
+ * measured track record, shown for context. It is not part of any score.
  */
 
 import { isNum, safeDiv } from '../core/precisionMath.js';
@@ -100,7 +100,7 @@ export function analyzeForecast(asset) {
   const signed = (value, digits = 1) => `${value >= 0 ? '+' : ''}${fmtPct(value, digits)}`;
 
   /* ---- the projection ---- */
-  let projectionCaveat = 'This is a trend extrapolation, not a prediction. The model sees only past prices: it knows nothing about earnings, news or interest rates, and it is not part of the verdict.';
+  let projectionCaveat = 'This is a trend extrapolation, not a prediction. The model sees only past prices: it knows nothing about earnings, news or interest rates, and it is not part of any score.';
   if (hasBacktest) {
     projectionCaveat = beatsNaive
       ? `${projectionCaveat} In its last test it was slightly closer than assuming no change at all (${fmtPct(backtest.mape)} against ${fmtPct(backtest.naiveMape)}).`

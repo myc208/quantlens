@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * signals.mjs: every asset's verdict, computed by the site's own engines.
+ * signals.mjs: every asset's trend regime and scores, computed by the site's own engines.
  *
  * The daily Telegram briefing (fetch_fundamentals.py --notify) runs this so that
  * the signals in the message are exactly the ones the site shows: the same
- * technical, fundamental and advisor engines over the same snapshot, with no
+ * technical and fundamental engines over the same snapshot, with no
  * second implementation in Python to drift out of step.
  *
  * V3.2 adds what the risk-first briefing needs and only the engines can compute:
@@ -12,6 +12,10 @@
  * residual), 3-month relative strength, the next ex-dividend date and the timing of
  * the next earnings release. Macro events and the regime come straight from the
  * snapshot, which Python already reads.
+ *
+ * V3.3: the trend regime (Uptrend, Extended, Pullback, Recovering, Downtrend) replaces
+ * the BUY / HOLD / SELL verdict, and the Composite and Confidence are gone; the Technical
+ * and Fundamental scores are reported separately.
  *
  *   node scripts/signals.mjs [data/market_snapshot.json]
  *
@@ -24,7 +28,6 @@ import { readFile } from 'node:fs/promises';
 import { normaliseSnapshot } from '../src/services/snapshotService.js';
 import { analyzeTechnicals } from '../src/engines/technicalEngine.js';
 import { analyzeFundamentals } from '../src/engines/fundamentalEngine.js';
-import { advise } from '../src/engines/advisorEngine.js';
 import { valueOf } from '../src/core/derivationTracer.js';
 import { analyzeEvents } from '../src/engines/eventEngine.js';
 import { holidaysFor } from '../src/engines/macroCalendarEngine.js';
@@ -48,8 +51,7 @@ async function main() {
     // Exactly what main.js does for each asset when the page loads.
     const technical = analyzeTechnicals(asset);
     const fundamental = analyzeFundamentals(asset, { fxRate: snapshot.fx.rate });
-    const advice = advise({ asset, technical, fundamental });
-    const confidence = advice.metrics.confidence;
+    const regime = technical.metrics.trendRegime;
     // Days are counted from the snapshot's own date, so the message matches the data it describes;
     // trading days skip the market's holidays from the macro calendar.
     const events = analyzeEvents(asset, { now: new Date(raw.generatedAt), holidays: holidays[asset.market] ?? null }).metrics;
@@ -67,11 +69,9 @@ async function main() {
       bucket: bucketOf(asset),
       tradable: asset.assetClass !== 'index',
       quoteAsOf: asset.quote.asOf,
-      verdict: advice.verdict ?? null,
-      composite: valueOf(advice.metrics.compositeScore),
+      trend: regime && regime.status === 'ok' ? regime.value : null,
       technical: valueOf(technical.metrics.technicalScore),
       fundamental: valueOf(fundamental.metrics.fundamentalScore),
-      confidence: confidence.status === 'ok' ? confidence.value : null,
       nextEarnings: next.status === 'ok'
         ? { date: next.meta.date, dateTo: next.meta.dateTo ?? null, timing: next.meta.timing ?? null, days: next.value, tradingDays: next.meta.tradingDays }
         : null,

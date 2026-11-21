@@ -1,5 +1,5 @@
 /**
- * positionSizerEngine.js: turn a verdict into a risk-controlled stake size.
+ * positionSizerEngine.js: a risk-controlled stake size, from the stop and the risk budget.
  *
  * Inputs: account equity A, risk per trade r, entry price E, ATR multiple m.
  *
@@ -9,13 +9,16 @@
  *   4. Raw units       = B ÷ R
  *   5. Correlation haircut = 1 ÷ √(1 + (n − 1) × max(0, ρ̄))
  *        n = number of compared assets, ρ̄ = this asset's mean correlation with the others
- *   6. Verdict multiplier: BUY 1.0 · HOLD 0.5 · SELL 0
- *   7. Units = raw × haircut × multiplier, rounded DOWN to the lot size
- *   8. Cap: position value ≤ max position % of the account
- *   9. Liquidity cap (V3.1, when volume is known): units ≤ 5% of the 20-day average volume;
+ *   6. Units = raw × haircut, rounded DOWN to the lot size
+ *   7. Cap: position value ≤ max position % of the account
+ *   8. Liquidity cap (V3.1, when volume is known): units ≤ 5% of the 20-day average volume;
  *      above 1% the position is flagged as large enough to move the price
- *  10. Outputs: units, position value, amount at risk, 2R target, share of daily volume,
+ *   9. Outputs: units, position value, amount at risk, 2R target, share of daily volume,
  *      and the round-trip cost of the spread (at least one tick each way)
+ *
+ * V3.3: the size no longer depends on a verdict (there is none). It is risk control only:
+ * how much can be bought so that hitting the stop costs the budget, within the caps. It
+ * says nothing about whether to buy; the trend regime and its track record are separate.
  *
  * Why the haircut has that shape: n equally sized positions with average
  * pairwise correlation ρ̄ have combined risk proportional to √(n + n(n−1)ρ̄).
@@ -32,7 +35,6 @@ import {
 import { LIQUIDITY_CONFIG } from './liquidityEngine.js';
 
 export const SIZER_CONFIG = Object.freeze({
-  verdictMultiplier: Object.freeze({ BUY: 1, HOLD: 0.5, SELL: 0 }),
   targetMultiple: 2,
   heat: Object.freeze({ healthy: 0.03, caution: 0.06 }),
 });
@@ -53,7 +55,7 @@ const METRIC_SPECS = Object.freeze({
   stopLoss: { label: 'Stop-loss level', unit: 'currency', formula: 'Stop = Entry − ATR multiple × ATR(14)' },
   riskPerUnit: { label: 'Risk per unit', unit: 'currency', formula: 'Risk per unit = Entry − Stop' },
   correlationHaircut: { label: 'Correlation haircut', unit: 'pct', formula: 'Haircut = 1 ÷ √(1 + (n − 1) × max(0, ρ̄))' },
-  positionSize: { label: 'Suggested position size', unit: 'shares', formula: 'Units = (Risk budget ÷ Risk per unit) × Correlation haircut × Verdict multiplier, rounded down to the lot size and capped by the maximum position size' },
+  positionSize: { label: 'Suggested position size', unit: 'shares', formula: 'Units = (Risk budget ÷ Risk per unit) × Correlation haircut, rounded down to the lot size and capped by the maximum position size and 5% of the 20-day volume' },
   positionValue: { label: 'Position value', unit: 'currency', formula: 'Position value = Units × Entry' },
   amountAtRisk: { label: 'Amount at risk', unit: 'currency', formula: 'Amount at risk = Units × Risk per unit' },
   target2R: { label: '2R target', unit: 'currency', formula: 'Target = Entry + 2 × Risk per unit' },
@@ -77,7 +79,6 @@ function unavailable(asset, reason) {
  * @param {number} args.entryPrice price in the asset's currency (live tick or last close)
  * @param {string} [args.entrySource] where the entry price came from, for the trace
  * @param {number|null} args.atr ATR(14) in the asset's currency
- * @param {string|null} args.verdict BUY | HOLD | SELL | null
  * @param {{equity:number, riskPct:number, atrMultiple:number, maxPositionPct:number}} args.account
  * @param {string} args.accountCurrency USD | SGD (the display currency)
  * @param {number|null} args.fxRate USD->SGD
@@ -88,7 +89,7 @@ function unavailable(asset, reason) {
  *   liquidityEngine's summary: enables the volume cap and the spread cost (V3.1)
  */
 export function sizePosition({
-  asset, entryPrice, entrySource = 'last daily close', atr, verdict, account, accountCurrency, fxRate,
+  asset, entryPrice, entrySource = 'last daily close', atr, account, accountCurrency, fxRate,
   comparedCount = 1, meanCorrelation = null, correlationIds = [], liquidity = null,
 }) {
   const assetCurrency = asset.currency;
@@ -138,27 +139,23 @@ export function sizePosition({
   // Step 5: correlation haircut.
   const haircut = correlationHaircut(comparedCount, meanCorrelation);
 
-  // Step 6: verdict multiplier.
-  const hasVerdict = typeof verdict === 'string' && verdict in SIZER_CONFIG.verdictMultiplier;
-  const multiplier = hasVerdict ? SIZER_CONFIG.verdictMultiplier[verdict] : 0;
-
-  // Step 7: adjust and round down to a tradable lot.
-  const adjustedUnits = rawUnits * haircut.factor * multiplier;
+  // Step 6: apply the haircut and round down to a tradable lot.
+  const adjustedUnits = rawUnits * haircut.factor;
   const roundedUnits = floorToStep(adjustedUnits, lot);
 
-  // Step 8: concentration cap.
+  // Step 7: concentration cap.
   const capValue = equityInAsset * capFraction;
   const capUnits = floorToStep(capValue / entryPrice, lot);
   const capBinding = roundedUnits > capUnits;
   const cappedUnits = capBinding ? capUnits : roundedUnits;
 
-  // Step 9 (when volume is known): never more than 5% of an average day's volume.
+  // Step 8 (when volume is known): never more than 5% of an average day's volume.
   const adv = liquidity && isNum(liquidity.averageVolume) && liquidity.averageVolume > 0 ? liquidity.averageVolume : null;
   const liquidityCap = adv !== null ? floorToStep(LIQUIDITY_CONFIG.capShare * adv, lot) : null;
   const liquidityBinding = liquidityCap !== null && cappedUnits > liquidityCap;
   const units = liquidityBinding ? liquidityCap : cappedUnits;
 
-  // Step 9: outputs.
+  // Outputs.
   const positionValueAsset = units * entryPrice;
   const positionValue = toAccount(positionValueAsset);
   const pctOfAccount = safeDiv(positionValue, equity);
@@ -169,9 +166,7 @@ export function sizePosition({
 
   let zeroReason = null;
   if (units === 0) {
-    if (!hasVerdict) zeroReason = 'There is no verdict for this asset, so no new position is suggested.';
-    else if (multiplier === 0) zeroReason = 'The verdict is SELL, so no new position is suggested.';
-    else if (capUnits === 0) zeroReason = `One lot of ${fmtN(lot, 6)} ${unitName} costs ${fmtN(lot * entryPrice, 2)} ${assetCurrency}, which is more than your ${fmtN(account.maxPositionPct, 0)}% position limit (${fmtN(capValue, 2)} ${assetCurrency}).`;
+    if (capUnits === 0) zeroReason = `One lot of ${fmtN(lot, 6)} ${unitName} costs ${fmtN(lot * entryPrice, 2)} ${assetCurrency}, which is more than your ${fmtN(account.maxPositionPct, 0)}% position limit (${fmtN(capValue, 2)} ${assetCurrency}).`;
     else if (liquidityCap === 0) zeroReason = `5% of an average day's volume (${fmtN(adv, 0)} ${unitName}) is less than one lot of ${fmtN(lot, 6)}: too thinly traded to size.`;
     else zeroReason = `Your risk budget covers ${fmtN(adjustedUnits, 2)} ${unitName}, which is less than one tradable lot of ${fmtN(lot, 6)}.`;
   }
@@ -254,15 +249,14 @@ export function sizePosition({
 
   const positionSize = traced({
     id: 'positionSize', ...METRIC_SPECS.positionSize, value: units,
-    tone: units === 0 ? 'caution' : verdict === 'BUY' ? 'healthy' : 'neutral',
-    meta: { unitName, lotSize: lot, capBinding, liquidityBinding, liquidityCap, rawUnits, adjustedUnits, verdict: hasVerdict ? verdict : null, zeroReason },
+    tone: units === 0 ? 'caution' : 'neutral',
+    meta: { unitName, lotSize: lot, capBinding, liquidityBinding, liquidityCap, rawUnits, adjustedUnits, zeroReason },
     rawInputs: [
       input('Account equity', equity, accountCurrency, 'your input (kept in memory only)'),
       input('Risk per trade', riskFraction, 'fraction', 'your input'),
       input('Entry price', entryPrice, assetCurrency, entrySource, asOf),
       input('ATR (14)', atr, assetCurrency, 'technicalEngine: atr14', asOf),
       input('ATR multiple', multiple, '×', 'your input'),
-      input('Verdict', hasVerdict ? verdict : null, '', 'advisorEngine: verdict'),
       input('Lot size', lot, unitName, 'watchlist'),
       input('Maximum position size', capFraction, 'fraction of account', 'your input'),
       ...fxInput,
@@ -273,13 +267,12 @@ export function sizePosition({
       step(`3. Risk budget in ${assetCurrency}: account × risk %`, `${fmtN(equity, 2)} × ${fmtPct(riskFraction)}${fxNote}`, budgetAsset),
       step('4. Raw units: risk budget ÷ risk per unit', `${fmtN(budgetAsset, 2)} ÷ ${fmtN(riskPerUnit)}`, rawUnits),
       step('5. Correlation haircut', `1 ÷ √(1 + (${haircut.n} − 1) × ${fmtN(haircut.rho)})`, fmtPct(haircut.factor)),
-      step('6. Verdict multiplier (BUY 1, HOLD 0.5, SELL 0)', hasVerdict ? verdict : 'no verdict', multiplier),
-      step(`7. Adjust, then round down to a lot of ${fmtN(lot, 6)}`, `${fmtN(rawUnits)} × ${fmtN(haircut.factor)} × ${multiplier} = ${fmtN(adjustedUnits)}`, roundedUnits),
-      step(`8. Cap: position value at most ${fmtPct(capFraction, 0)} of the account`, `${fmtN(capValue, 2)} ÷ ${fmtN(entryPrice)} = at most ${fmtN(capUnits, 6)} ${unitName}`, capBinding ? `Cap applies: ${fmtN(capUnits, 6)}` : 'Within the cap'),
+      step(`6. Apply the haircut, then round down to a lot of ${fmtN(lot, 6)}`, `${fmtN(rawUnits)} × ${fmtN(haircut.factor)} = ${fmtN(adjustedUnits)}`, roundedUnits),
+      step(`7. Cap: position value at most ${fmtPct(capFraction, 0)} of the account`, `${fmtN(capValue, 2)} ÷ ${fmtN(entryPrice)} = at most ${fmtN(capUnits, 6)} ${unitName}`, capBinding ? `Cap applies: ${fmtN(capUnits, 6)}` : 'Within the cap'),
       ...(liquidityCap !== null
-        ? [step(`9. Liquidity cap: at most ${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} of the 20-day average volume`, `${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} × ${fmtN(adv, 0)} = at most ${fmtN(liquidityCap, 6)} ${unitName}`, liquidityBinding ? `Cap applies: ${fmtN(liquidityCap, 6)}` : 'Within the cap')]
+        ? [step(`8. Liquidity cap: at most ${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} of the 20-day average volume`, `${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} × ${fmtN(adv, 0)} = at most ${fmtN(liquidityCap, 6)} ${unitName}`, liquidityBinding ? `Cap applies: ${fmtN(liquidityCap, 6)}` : 'Within the cap')]
         : []),
-      step(`${liquidityCap !== null ? '10' : '9'}. Suggested size in ${unitName}`,
+      step(`${liquidityCap !== null ? '9' : '8'}. Suggested size in ${unitName}`,
         capBinding || liquidityBinding ? `min(${[roundedUnits, capUnits, liquidityCap].filter((value) => value !== null).map((value) => fmtN(value, 6)).join(', ')})` : fmtN(roundedUnits, 6), units),
     ],
     interpretation: interpretation(
@@ -287,15 +280,14 @@ export function sizePosition({
         ? zeroReason
         : `${fmtN(units, 6)} ${unitName} costs about ${fmtN(positionValue, 2)} ${accountCurrency} (${fmtPct(pctOfAccount)} of the account) and would lose about ${fmtN(amountAtRisk, 2)} ${accountCurrency} (${fmtPct(riskPctActual)}) if the stop at ${fmtN(stop)} ${assetCurrency} is hit.${liquidityBinding ? ` The size is limited to ${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} of an average day's volume, so that it could be traded without dominating the market.` : capBinding ? ' The size is limited by your maximum position cap, not by the stop distance.' : ''}`,
       [
-        threshold('BUY', 'Full size', 'healthy'),
-        threshold('HOLD', 'Half size', 'neutral'),
-        threshold('SELL', 'No new position', 'risky'),
+        threshold('Set by the stop', 'Risk budget ÷ risk per unit, after the haircut', 'neutral'),
+        threshold('Capped', 'By your position limit or 5% of the 20-day volume', 'caution'),
       ],
-      asset.market === 'SG'
+      `${asset.market === 'SG'
         ? 'SGX shares trade in board lots of 100. Some brokers also offer odd lots, usually with wider spreads. Fees and slippage are not included.'
-        : 'Fees, slippage and taxes are not included. This is a sizing aid, not a recommendation to trade.',
+        : 'Fees, slippage and taxes are not included.'} This is risk control, not a view on direction: the size does not depend on the trend regime, and it is not a recommendation to trade.`,
     ),
-    dependsOn: ['riskBudget', 'stopLoss', 'riskPerUnit', 'correlationHaircut', 'verdict', 'atr14'],
+    dependsOn: ['riskBudget', 'stopLoss', 'riskPerUnit', 'correlationHaircut', 'atr14'],
   });
 
   const positionValueMetric = traced({
@@ -329,7 +321,7 @@ export function sizePosition({
     interpretation: interpretation(
       `If the stop is hit, the loss is about ${fmtN(amountAtRisk, 2)} ${accountCurrency}, or ${fmtPct(riskPctActual)} of the account (budget ${fmtPct(riskFraction)}).`,
       [threshold('At or below the budget', 'As planned', 'healthy')],
-      'It is usually below the budget because of the haircut, the verdict multiplier and rounding down to whole lots.',
+      'It is usually below the budget because of the haircut, the caps and rounding down to whole lots.',
     ),
     dependsOn: ['positionSize', 'riskPerUnit'],
   });
@@ -416,7 +408,7 @@ export function sizePosition({
     summary: {
       units, unitName, entryPrice, stop, target, riskPerUnit, assetCurrency, accountCurrency,
       positionValue, positionValueAsset, pctOfAccount, amountAtRisk, amountAtRiskAsset, riskPctActual,
-      haircut: haircut.factor, multiplier, capBinding, liquidityBinding, volumeShare: share, zeroReason,
+      haircut: haircut.factor, capBinding, liquidityBinding, volumeShare: share, zeroReason,
     },
   };
 }

@@ -4,8 +4,8 @@
  * It renders one TracedMetric at a time: result, plain-language reading,
  * formula, raw inputs, numbered arithmetic steps, thresholds, and the metrics
  * it is built from. Each `dependsOn` entry is a link that drills into the
- * child metric; the breadcrumb records the path (Verdict > Composite score >
- * Technical score > RSI) and jumps back to any level.
+ * child metric; the breadcrumb records the path (Trend regime > RSI) and jumps
+ * back to any level.
  *
  * Desktop: a 420px panel on the right (it pushes the matrix on wide screens).
  * Phone: a bottom sheet covering 85% of the screen, dismissed by the close

@@ -10,7 +10,7 @@
  * Time range: one radio group. It dispatches setRange, and everything that
  * depends on the window (charts, period statistics, correlation, the
  * simulation's volatility, the portfolio maths) recomputes from the sliced
- * series. It never changes RSI, MACD, the moving averages or the verdict,
+ * series. It never changes RSI, MACD, the moving averages or the trend regime,
  * which need a full year to warm up. The range is part of the URL (?range=).
  *
  * The bar publishes its height as --tabs-h so sticky table headers and the
@@ -43,7 +43,7 @@ export function mountAppTabs(root, app) {
     <div class="app-tabs__range">
       <span class="app-tabs__range-label" aria-hidden="true">Range</span>
       <fieldset class="segmented" data-control="range">
-        <legend class="sr-only">Time range for charts, period statistics, correlation and portfolio maths. The verdict always uses the full year.</legend>
+        <legend class="sr-only">Time range for charts, period statistics, correlation and portfolio maths. The trend regime and the scores always use the full year.</legend>
         ${RANGES.map((range) => {
     const info = h.rangeInfo(range);
     return `

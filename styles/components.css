@@ -188,8 +188,8 @@ code,
   background: var(--status-critical-wash);
 }
 
-.badge--verdict {
-  letter-spacing: 0.05em;
+.badge--trend {
+  letter-spacing: 0.01em;
 }
 
 .badge--na {
@@ -3289,7 +3289,7 @@ th[aria-sort="ascending"] .board__sort::after {
 /* ---------------- Leaderboard column tiers ----------------
  * The table shows as many columns as its own width allows, not the viewport's:
  * with the screener beside it, a 1280px window leaves it about 940px.
- *   tier A  always          asset, verdict, composite, return
+ *   tier A  always          asset, trend regime, RS 3M, return
  *   tier B  >= 920px wide   rank, technical, fundamental, price, volatility, compare
  *   tier C  >= 1200px wide  drawdown, news tone, projection
  * Columns that do not fit are listed in the row's details, opened with "+".
@@ -3385,7 +3385,7 @@ th[aria-sort="ascending"] .board__sort::after {
     display: none;
   }
 
-  .board .badge--verdict {
+  .board .badge--trend {
     padding-inline: 6px;
   }
 

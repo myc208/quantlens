@@ -2,11 +2,11 @@
  * comparisonMatrix.js: the side-by-side comparison of up to three assets.
  *
  * Layout: one table with a sticky metric-label column and one column per
- * asset, in sections (Verdict, Price, Period, Technical, Fundamental, News and
+ * asset, in sections (Trend, Price, Period, Technical, Fundamental, News and
  * forecast), then the correlation card, then the position-sizing table.
  *
  * Time range: the price chart, the Period rows and the correlation card use
- * the series sliced to the selected range (1M / 3M / 6M / 1Y). The verdict,
+ * the series sliced to the selected range (1M / 3M / 6M / 1Y). The trend regime,
  * the Technical rows and the Fundamental rows never change with it.
  *
  * News and forecast are context only. Up to three recent, de-duplicated
@@ -32,14 +32,13 @@ import { pairId } from '../engines/correlationEngine.js';
 
 const SECTIONS = Object.freeze([
   {
-    id: 'verdict',
-    title: 'Verdict',
-    note: 'Rule-based signal for learning, not advice',
+    id: 'trend',
+    title: 'Trend',
+    note: 'A description of the trend, with what followed it: not a forecast or advice',
     rows: [
-      { id: 'verdict', lead: true },
-      { id: 'compositeScore', meter: 'score' },
-      { id: 'confidence' },
-      { id: 'verdictBacktest', label: 'Track record (backtest)' },
+      { id: 'trendRegime', lead: true },
+      { id: 'regimeRecord', label: 'What followed (backtest)' },
+      { id: 'scoreBacktest', label: 'Technical score track record', pro: true },
     ],
   },
   {
@@ -163,7 +162,7 @@ const SECTIONS = Object.freeze([
   {
     id: 'context',
     title: 'News and forecast',
-    note: 'Context only: neither is part of the verdict',
+    note: 'Context only: neither moves the trend regime or a score',
     rows: [
       { id: 'headlineTone' },
       { id: 'news', kind: 'news', label: 'Recent headlines' },
@@ -193,7 +192,6 @@ const SIZING_SECTION = Object.freeze({
   ],
 });
 
-const VERDICT_TONES = Object.freeze({ BUY: 'healthy', HOLD: 'neutral', SELL: 'risky' });
 const PROFILE_CHIPS = Object.freeze({ CORPORATE: 'Corporate', FINANCIAL: 'Financial', REIT: 'REIT', ETF: 'ETF', INDEX: 'Index', CRYPTO: 'Crypto' });
 const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'financial companies', REIT: 'REITs', ETF: 'ETFs', INDEX: 'indices', CRYPTO: 'crypto' });
 const STORY_TONES = Object.freeze({ positive: 'healthy', neutral: 'neutral', negative: 'caution' });
@@ -267,15 +265,14 @@ export function mountComparisonMatrix(root, app) {
     const sizing = comparison.sizings[asset.ticker];
     const summary = sizing && sizing.ok ? sizing.summary : null;
     switch (metric.id) {
-      case 'verdict':
-        return meta.capped ? sub('Held back from BUY by a safety rule') : '';
-      case 'compositeScore': {
-        if (meta.technicalOnly) return sub('Technical only');
-        const [technical, fundamental] = metric.trace.rawInputs;
-        return sub(`Technical ${whole(technical.value)} · Fundamental ${whole(fundamental.value)}`);
+      case 'trendRegime': {
+        const side = meta.above200 ? 'above' : 'below';
+        return sub(`${h.formatPercent(Math.abs(meta.distance200), 1)} ${side} the 200-day average${isNum(meta.rsi) ? ` · RSI ${h.formatNumber(meta.rsi, 0)}` : ''}`);
       }
-      case 'confidence':
-        return isNum(meta.gap) ? sub(`Scores are ${whole(meta.gap)} points apart`) : sub('One source of evidence');
+      case 'regimeRecord': {
+        const own = meta.byLabel[meta.label];
+        return sub(`After ${own.count} ${meta.label} days, ${meta.horizon} sessions ahead · ${h.signedPercent(meta.base.mean, 1)} on all ${meta.base.count} days`);
+      }
       case 'price':
         return `<span class="cell__sub">${deltaMarkup(meta.changePct)} ${meta.live ? 'live' : `close ${esc(h.shortDate(asset.quote.asOf))}`}</span>`;
       case 'fundamentalScore':
@@ -360,10 +357,9 @@ export function mountComparisonMatrix(root, app) {
       }
       case 'earningsMove':
         return sub(`Worst ${h.signedPercent(meta.worst, 1)} · ${h.formatNumber(meta.ratio, 1)}× a normal day · ${meta.count} releases`);
-      case 'verdictBacktest': {
-        const buy = meta.bands.BUY;
-        const verdictWord = meta.meaningful ? (metric.value > 0 ? 'a modest edge' : 'pointed the wrong way') : 'no reliable edge';
-        return sub(`BUY days ${h.signedPercent(buy.mean, 1)} vs ${h.signedPercent(meta.base.mean, 1)} on all days (${meta.horizon} sessions) · ${verdictWord} · ${meta.n} days`);
+      case 'scoreBacktest': {
+        const word = meta.meaningful ? (metric.value > 0 ? 'a modest edge' : 'pointed the wrong way') : 'no reliable edge';
+        return sub(`Top third ${h.signedPercent(meta.top.mean, 1)} · bottom third ${h.signedPercent(meta.bottom.mean, 1)} (${meta.horizon} sessions) · ${word} · ${meta.n} days`);
       }
       case 'nextExDividend':
         return sub(`${h.shortDate(meta.date)}${meta.estimated ? ' (estimated)' : ''}${isNum(meta.dropFraction) ? ` · price drop ≈ ${h.formatPercent(meta.dropFraction, 2)}` : ''}`);
@@ -383,9 +379,8 @@ export function mountComparisonMatrix(root, app) {
 
   function mainValue(metric) {
     if (metric.status !== 'ok') return '<span class="badge badge--na">N/A</span>';
-    if (metric.id === 'verdict') {
-      const tone = VERDICT_TONES[metric.value] ?? 'neutral';
-      return `<span class="badge badge--verdict badge--${tone}">${h.toneMark(tone)}${esc(metric.value)}</span>`;
+    if (metric.id === 'trendRegime') {
+      return `<span class="badge badge--trend badge--${metric.tone}">${h.toneMark(metric.tone)}${esc(metric.value)}</span>`;
     }
     if (metric.id === 'headlineTone') {
       const word = String(metric.meta.label ?? '');
@@ -399,7 +394,7 @@ export function mountComparisonMatrix(root, app) {
   function metricCell(section, row, asset, state, comparison) {
     const metric = app.trace(asset.ticker, row.id);
     if (!metric) {
-      const pending = row.id === 'verdictBacktest' && app.backtest().status !== 'error';
+      const pending = (row.id === 'regimeRecord' || row.id === 'scoreBacktest') && app.backtest().status !== 'error';
       return `<td><div class="cell cell--static cell--na"><span class="cell__value">${pending ? '<span class="cell__sub">Replaying past days in the background…</span>' : '–'}</span></div></td>`;
     }
     const label = rowLabel(row);
@@ -504,7 +499,7 @@ export function mountComparisonMatrix(root, app) {
       + `Low ${amount(model.windowLow, currency)}, high ${amount(model.windowHigh, currency)}.`;
     if (projection) {
       const end = points[points.length - 1];
-      summary += ` A trend model projects ${amount(end.price, currency)} by ${end.date}, with an 80% band from ${amount(end.lower, currency)} to ${amount(end.upper, currency)}. The projection is not part of the verdict.`;
+      summary += ` A trend model projects ${amount(end.price, currency)} by ${end.date}, with an 80% band from ${amount(end.lower, currency)} to ${amount(end.upper, currency)}. The projection is context only and moves no score.`;
     }
     const defaults = sparkDefaults(model);
     return `
@@ -863,7 +858,7 @@ export function mountComparisonMatrix(root, app) {
     return `
       <div class="empty-matrix">
         <p class="empty-matrix__title">Pick up to ${MAX_SELECTED} assets to compare</p>
-        <p>Tick assets in the screener. Each one gets a column with its verdict, indicators, fundamentals and a suggested position size.</p>
+        <p>Tick assets in the screener. Each one gets a column with its trend regime, indicators, fundamentals and a suggested position size.</p>
       </div>`;
   }
 

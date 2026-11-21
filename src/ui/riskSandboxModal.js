@@ -23,11 +23,14 @@ import { ACCOUNT_LIMITS, DEFAULT_ACCOUNT } from '../core/store.js';
 import { isNum, safeDiv } from '../core/precisionMath.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
-const VERDICT_SIZE_NOTES = Object.freeze({
-  BUY: 'BUY verdict: full size',
-  HOLD: 'HOLD verdict: half size',
-  SELL: 'SELL verdict: no new position',
-});
+
+/** What set the suggested size: the stop and the budget, or one of the caps. Never a view on direction. */
+function sizeNote(summary) {
+  if (summary.units === 0) return 'Less than one lot fits these limits';
+  if (summary.liquidityBinding) return 'Capped at 5% of the 20-day volume';
+  if (summary.capBinding) return 'Capped by your maximum position size';
+  return 'Set by the stop and your risk budget';
+}
 
 /** A "nice" axis step (1, 2 or 5 times a power of ten) for about `count` ticks. */
 function niceStep(range, count) {
@@ -179,12 +182,11 @@ export function mountRiskSandboxModal(dialog, app) {
       return `<div class="guide-note"><span class="guide-note__badge">Note</span><span>${esc(reason)}</span></div>`;
     }
     const s = sizing.summary;
-    const verdict = sizing.metrics.positionSize.meta.verdict;
     const pct = (value, digits = 2) => h.formatPercent(value, digits);
     const stopMove = safeDiv(s.stop - s.entryPrice, s.entryPrice);
     const targetMove = safeDiv(s.target - s.entryPrice, s.entryPrice);
     const tiles = [
-      stat('Suggested size', `${h.formatUnits(s.units)} ${s.unitName}`, VERDICT_SIZE_NOTES[verdict] ?? 'No verdict: no new position', true),
+      stat('Suggested size', `${h.formatUnits(s.units)} ${s.unitName}`, sizeNote(s), true),
       stat('Position value', `${s.accountCurrency} ${h.formatAmount(s.positionValue)}`, `${pct(s.pctOfAccount)} of account${s.capBinding ? ' · at your cap' : ''}`),
       stat('Amount at risk', `${s.accountCurrency} ${h.formatAmount(s.amountAtRisk)}`, `${pct(s.riskPctActual)} of account`),
       stat('Entry price', `${s.assetCurrency} ${h.formatAmount(s.entryPrice)}`, sizing.metrics.stopLoss.trace.rawInputs[0].source),

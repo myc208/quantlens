@@ -136,10 +136,10 @@ const ENTRIES = {
   },
   technicalScore: {
     term: 'Technical score',
-    what: 'A 0 to 100 summary of price behaviour: trend (40%), MACD momentum (25%), RSI (20%) and 52-week position (15%).',
-    why: 'It answers "is the market currently agreeing with this idea?" independently of how good the business is.',
-    healthy: '65 or more: trend and momentum are supportive.',
-    risky: 'Below 45: the price action is working against you.',
+    what: 'A 0 to 100 summary of price behaviour: trend (40%), MACD momentum (25%), RSI (20%) and 52-week position (15%). It is a readout of its own, never blended with the Fundamental score.',
+    why: 'It summarises how the price has been behaving, independently of how good the business is. Its track record shows it did not predict the next month on this watchlist over 2022–2026.',
+    healthy: '65 or more: trend and momentum have been supportive.',
+    risky: 'Below 45: the price action has been weak. A description, not a sell signal.',
   },
 
   /* ---------------- Reported fundamentals ---------------- */
@@ -307,32 +307,9 @@ const ENTRIES = {
       FINANCIAL: 'Financial profile (banks, insurers, asset managers): ROE 35%, Price-to-Book 30%, net margin 20%, trailing P/E 15%.',
       REIT: 'REIT profile: Price-to-Book 35%, dividend yield 30%, gearing 25%, operating margin 10%.',
       CRYPTO: 'Crypto assets have no earnings, balance sheet or cash flow, so there is no fundamental score.',
-      ETF: 'An ETF is a basket of companies with no accounts of its own, so there is no fundamental score. Its verdict comes from price behaviour alone.',
-      INDEX: 'An index is a calculated level, not a business, so there is no fundamental score. Its verdict comes from price behaviour alone, and it cannot be bought directly.',
+      ETF: 'An ETF is a basket of companies with no accounts of its own, so there is no fundamental score. Its trend regime and Technical score come from price behaviour alone.',
+      INDEX: 'An index is a calculated level, not a business, so there is no fundamental score. Its trend regime and Technical score come from price behaviour alone, and it cannot be bought directly.',
     },
-  },
-
-  /* ---------------- Advisor ---------------- */
-  compositeScore: {
-    term: 'Composite score',
-    what: 'For stocks, the average of the Technical and Fundamental scores. For crypto, the Technical score alone.',
-    why: 'Good investments usually need both a sound business and a market that agrees. One number makes three assets comparable.',
-    healthy: '65 or more.',
-    risky: 'Below 45.',
-  },
-  verdict: {
-    term: 'Verdict',
-    what: 'A rule-based label from the composite score: BUY at 65 or more, HOLD from 45, SELL below 45. Safety rules can cap a BUY at HOLD.',
-    why: 'It is a consistent starting point for your own research. It is an educational signal, not financial advice.',
-    healthy: 'BUY with High confidence: price action and fundamentals agree.',
-    risky: 'SELL, or any verdict with Low confidence: the evidence is weak or conflicting.',
-  },
-  confidence: {
-    term: 'Confidence',
-    what: 'How much the evidence agrees. High when the Technical and Fundamental scores are within 20 points and data is complete; Low when they disagree or only one is available.',
-    why: 'A BUY built on one strong score and one weak score deserves a smaller position than one where both agree.',
-    healthy: 'High.',
-    risky: 'Low: treat the verdict as a question, not an answer.',
   },
 
   /* ---------------- Correlation ---------------- */
@@ -375,10 +352,10 @@ const ENTRIES = {
   },
   positionSize: {
     term: 'Suggested position size',
-    what: 'The number of shares or coins such that hitting the stop loses about your risk budget, then reduced for correlation and for a weaker verdict, rounded down to a tradable lot, and capped as a share of the account.',
-    why: 'It converts a signal into a concrete, risk-controlled amount.',
+    what: 'The number of shares or coins such that hitting the stop loses about your risk budget, reduced for correlation with the other compared assets, rounded down to a tradable lot, and capped as a share of the account and at 5% of the 20-day volume.',
+    why: 'It is risk control, not a view on direction: it tells you how much a position can be, not whether to open one. It does not depend on the trend regime.',
     healthy: 'A size where the loss at the stop is within your risk budget.',
-    risky: 'Zero means the rules say not to open a new position (for example a SELL verdict).',
+    risky: 'Zero means not even one lot fits your limits (for example an expensive SGX board lot in a small account).',
   },
   positionValue: {
     term: 'Position value',
@@ -443,7 +420,7 @@ const ENTRIES = {
   periodRange: {
     term: 'Position in period range',
     what: 'Where the latest close sits between the lowest and highest close of the selected time range: 0% is the low, 100% is the high.',
-    why: 'It shows at a glance whether the price is near the top or the bottom of its recent range. It changes with the time range you pick; the verdict never does.',
+    why: 'It shows at a glance whether the price is near the top or the bottom of its recent range. It changes with the time range you pick; the trend regime never does.',
     healthy: 'In the upper half of the range.',
     risky: 'In the bottom quarter, close to the lows of the window.',
   },
@@ -584,14 +561,14 @@ const ENTRIES = {
     term: 'Relative strength (1 month)',
     what: 'How the asset did against its benchmark over the last 30 days: (1 + its return) ÷ (1 + the benchmark\'s) − 1.',
     why: 'It separates the asset\'s own performance from the market\'s: a stock that fell 5% while the market fell 10% held up well.',
-    healthy: 'A description, not a signal. Momentum is not tested here and is not part of the verdict.',
+    healthy: 'A description, not a signal. Over 2022–2026 momentum did not predict the next month on this watchlist, and it is not part of any score.',
     risky: 'Stock closes include dividends but indices do not, which flatters high-yield stocks slightly.',
   },
   relativeStrength3m: {
     term: 'Relative strength (3 months)',
     what: 'How the asset did against its benchmark over the last 91 days: (1 + its return) ÷ (1 + the benchmark\'s) − 1.',
     why: 'A longer view of whether the asset is leading or lagging its market.',
-    healthy: 'A description, not a signal. Momentum is not tested here and is not part of the verdict.',
+    healthy: 'A description, not a signal. Over 2022–2026 momentum did not predict the next month on this watchlist, and it is not part of any score.',
     risky: 'Over three months the dividend flattery is about a quarter of a stock\'s yearly yield, about 1.5% for a 6% REIT.',
   },
   portfolioBeta: {
@@ -634,7 +611,7 @@ const ENTRIES = {
     what: 'Days to the next Federal Reserve rate decision or US inflation (CPI) release, from a calendar kept by hand from the Fed and BLS schedules, with what else is due in the next 7 and 30 days.',
     why: 'Scheduled announcements move every asset at once, often with a gap at the open that no stop can catch. Knowing they are coming is the cheapest risk control there is.',
     healthy: 'More than 48 hours away, outside the plan for any trade you are about to open.',
-    risky: 'Within 48 hours. Context only: it changes no score, verdict or position size.',
+    risky: 'Within 48 hours. Context only: it changes no score, trend regime or position size.',
   },
   marketRegime: {
     term: 'Market regime',
@@ -692,12 +669,12 @@ const ENTRIES = {
     healthy: 'Within the planned amount at risk.',
     risky: 'Several times the planned amount, especially with earnings inside the next 21 trading days.',
   },
-  verdictBacktest: {
-    term: 'Verdict track record',
-    what: 'How the price-based (Technical) half of the verdict would have done over the stored years: each past day is rescored from the year behind it and compared with the next 21 trading days. The headline is the rank IC, the correlation between the score and what followed.',
-    why: 'A signal is only worth acting on if it has worked before. This is the same discipline the forecast row applies to the projection.',
-    healthy: 'A rank IC of 0.05 or more that is unlikely to be luck (t of 2 or more), with BUY days beating the asset\'s average day.',
-    risky: 'A negative IC, or BUY days that did no better than any other day: the verdict then describes the trend without predicting anything.',
+  scoreBacktest: {
+    term: 'Technical score track record',
+    what: 'How the Technical score would have done over the stored years: each past day is rescored from the year behind it and compared with the next 21 trading days. The headline is the rank IC, the correlation between the score and what followed, with the highest and lowest third of days by score.',
+    why: 'A score is only worth acting on if it has worked before. This is the same discipline the forecast row applies to the projection, and the reason QuantLens shows a trend regime rather than BUY, HOLD or SELL.',
+    healthy: 'A rank IC of 0.05 or more that is unlikely to be luck (t of 2 or more), with high-score days beating the asset\'s average day.',
+    risky: 'A negative IC, or high-score days that did no better than any other day: the score then describes the trend without predicting anything.',
   },
   maxDrawdown: {
     term: 'Maximum drawdown',
@@ -707,7 +684,7 @@ const ENTRIES = {
     risky: 'Deeper than about −25%. It uses daily closes, so intraday falls were larger.',
   },
 
-  /* ---------------- News and forecast (context, never part of the verdict) ---------------- */
+  /* ---------------- News and forecast (context, never part of a score) ---------------- */
   headlineTone: {
     term: 'Headline tone',
     what: 'The average wording of the three most recent unique news stories, from −1 (very negative) to +1 (very positive). Syndicated copies of the same story are counted once.',

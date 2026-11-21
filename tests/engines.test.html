@@ -179,7 +179,6 @@
     import * as technical from '../src/engines/technicalEngine.js';
     import * as fundamental from '../src/engines/fundamentalEngine.js';
     import * as correlation from '../src/engines/correlationEngine.js';
-    import * as advisor from '../src/engines/advisorEngine.js';
     import * as sizer from '../src/engines/positionSizerEngine.js';
     import * as monteCarlo from '../src/engines/monteCarloEngine.js';
     import * as portfolio from '../src/engines/portfolioEngine.js';
@@ -196,7 +195,7 @@
     import * as macroEngine from '../src/engines/macroCalendarEngine.js';
     import * as trends from '../src/engines/trendRegimeEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
-    import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
+    import { sortRows, BOARD_COLUMNS, DEFAULT_SORT, TREND_RANK } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
 
     /* ================================================================== */
@@ -358,7 +357,6 @@
         asset: makeAsset(assetOverrides),
         entryPrice: 100,
         atr: 2.5,
-        verdict: 'BUY',
         account: { ...ACCOUNT, ...accountOverrides },
         accountCurrency: 'USD',
         fxRate: 1.25,
@@ -366,29 +364,6 @@
         meanCorrelation: null,
         ...rest,
       });
-    }
-
-    /** Hand-built technical and fundamental results, so the advisor's rules can be tested in isolation. */
-    function advisorInputs({ tech, fund = null, close = 100, sma200 = 90, macdLine = 1, macdSignal = 0.5, rsi = 55, techCoverage = 1, fundCoverage = 1, assetClass = 'equity' }) {
-      const metric = (id, value, meta = {}) => tracer.traced({
-        id, label: id, value, unit: 'score', meta, formula: 'fixture',
-        steps: [tracer.step('fixture', 'fixture', value)], interpretation: tracer.interpretation('fixture'),
-      });
-      const fundamentalScore = fund === null
-        ? tracer.notAvailable({ id: 'fundamentalScore', label: 'Fundamental score', unit: 'score', reason: 'fixture: no fundamentals', meta: { coverage: 0 } })
-        : metric('fundamentalScore', fund, { coverage: fundCoverage });
-      return {
-        asset: makeAsset({ closes: [close - 1, close], assetClass }),
-        technical: {
-          metrics: {
-            technicalScore: metric('technicalScore', tech, { coverage: techCoverage }),
-            sma200: metric('sma200', sma200),
-            macd: metric('macd', macdLine - macdSignal, { line: macdLine, signal: macdSignal }),
-            rsi14: metric('rsi14', rsi),
-          },
-        },
-        fundamental: { metrics: { fundamentalScore } },
-      };
     }
 
     function findNonFinite(node, path = 'root', seen = new Set(), found = []) {
@@ -952,78 +927,38 @@
     });
 
     /* ================================================================== */
-    /* 6. Advisor engine                                                   */
+    /* 6. V3.3: the verdict is retired                                     */
     /* ================================================================== */
 
-    suite('advisorEngine: verdict, guardrails and confidence', () => {
-      test('verdict bands: 65 and above BUY, 45 to below 65 HOLD, below 45 SELL', () => {
-        expect(advisor.verdictForScore(65)).toBe('BUY');
-        expect(advisor.verdictForScore(64.99)).toBe('HOLD');
-        expect(advisor.verdictForScore(45)).toBe('HOLD');
-        expect(advisor.verdictForScore(44.99)).toBe('SELL');
-        expect(advisor.verdictForScore(null)).toBeNull();
+    suite('V3.3: no BUY, HOLD or SELL, no Composite, no Confidence', () => {
+      test('the advisor engine is gone', async () => {
+        let missing = false;
+        try {
+          await import('../src/engines/advisorEngine.js');
+        } catch {
+          missing = true;
+        }
+        expect(missing).toBeTrue();
       });
-      test('composite = 0.5 × Technical + 0.5 × Fundamental', () => {
-        const result = advisor.advise(advisorInputs({ tech: 80, fund: 60 }));
-        expect(result.metrics.compositeScore.value).toBeCloseTo(70, 1e-12);
-        expect(result.verdict).toBe('BUY');
-        expect(result.metrics.verdict.meta.capped).toBeFalse();
+      test('the glossary explains the trend regime and the score record, and nothing that was retired', () => {
+        for (const id of ['verdict', 'compositeScore', 'confidence', 'verdictBacktest']) expect(glossary.hasExplainer(id)).toBeFalse();
+        for (const id of ['trendRegime', 'regimeRecord', 'scoreBacktest', 'technicalScore', 'fundamentalScore']) expect(glossary.hasExplainer(id)).toBeTrue();
       });
-      test('crypto, or a stock with no Fundamental score, uses the Technical score alone', () => {
-        const result = advisor.advise(advisorInputs({ tech: 72, fund: null, assetClass: 'crypto' }));
-        expect(result.metrics.compositeScore.value).toBe(72);
-        expect(result.metrics.compositeScore.meta.technicalOnly).toBeTrue();
-        expect(result.metrics.confidence.value).toBe('Low');
+      test('the leaderboard ranks by trend regime, then 3-month relative strength', () => {
+        const ids = BOARD_COLUMNS.map((column) => column.id);
+        for (const id of ['verdict', 'compositeScore', 'confidence']) expect(ids.includes(id)).toBeFalse();
+        expect(ids.slice(0, 3)).toEqual(['ticker', 'trendRegime', 'relativeStrength3m']);
+        expect(BOARD_COLUMNS.find((column) => column.id === 'trendRegime').then).toBe('relativeStrength3m');
+        expect(Object.keys(TREND_RANK).sort((a, b) => TREND_RANK[b] - TREND_RANK[a])).toEqual([...trends.TREND_REGIMES]);
       });
-      test('downtrend guard: close below SMA200 with MACD below signal caps a BUY at HOLD', () => {
-        const result = advisor.advise(advisorInputs({ tech: 75, fund: 75, close: 80, sma200: 90, macdLine: -1, macdSignal: -0.5 }));
-        expect(result.metrics.verdict.meta.rawVerdict).toBe('BUY');
-        expect(result.verdict).toBe('HOLD');
-        expect(result.metrics.verdict.meta.triggered).toEqual(['downtrend']);
-      });
-      test('downtrend guard needs BOTH conditions', () => {
-        const belowAverageOnly = advisor.advise(advisorInputs({ tech: 75, fund: 75, close: 80, sma200: 90, macdLine: 1, macdSignal: 0.5 }));
-        const weakMacdOnly = advisor.advise(advisorInputs({ tech: 75, fund: 75, close: 100, sma200: 90, macdLine: -1, macdSignal: -0.5 }));
-        expect(belowAverageOnly.verdict).toBe('BUY');
-        expect(weakMacdOnly.verdict).toBe('BUY');
-      });
-      test('overheated guard: RSI above 80 caps a BUY at HOLD (80 exactly does not)', () => {
-        expect(advisor.advise(advisorInputs({ tech: 90, fund: 70, rsi: 80.1 })).verdict).toBe('HOLD');
-        expect(advisor.advise(advisorInputs({ tech: 90, fund: 70, rsi: 80 })).verdict).toBe('BUY');
-      });
-      test('guardrails never upgrade or downgrade a HOLD or a SELL', () => {
-        const sell = advisor.advise(advisorInputs({ tech: 20, fund: 40, close: 80, sma200: 90, macdLine: -1, macdSignal: 0, rsi: 85 }));
-        expect(sell.verdict).toBe('SELL');
-        expect(sell.metrics.verdict.meta.capped).toBeFalse();
-      });
-      test('weak-business guard: with 50/50 weights a Fundamental score below 30 can never reach BUY', () => {
-        // The best case is Technical 100 with Fundamental just under 30: composite just under 65.
-        const best = advisor.advise(advisorInputs({ tech: 100, fund: 29.99 }));
-        expect(best.metrics.compositeScore.value).toBeCloseTo(64.995, 1e-9);
-        expect(best.verdict).toBe('HOLD');
-        expect(best.guardrails.find((guard) => guard.id === 'weakFundamentals').triggered).toBeTrue();
-        // The guard is therefore a safety net for any future change of weights, and is documented as such.
-      });
-      test('confidence: High needs a gap of at most 20 and coverage of at least 80%', () => {
-        const confidence = (inputs) => advisor.advise(advisorInputs(inputs)).metrics.confidence.value;
-        expect(confidence({ tech: 80, fund: 60 })).toBe('High'); // gap exactly 20
-        expect(confidence({ tech: 80, fund: 59 })).toBe('Medium'); // gap 21
-        expect(confidence({ tech: 85, fund: 50 })).toBe('Medium'); // gap exactly 35
-        expect(confidence({ tech: 86, fund: 50 })).toBe('Low'); // gap 36
-        expect(confidence({ tech: 70, fund: 65, fundCoverage: 0.75 })).toBe('Medium'); // agree, but data incomplete
-      });
-      test('no Technical score means no verdict at all', () => {
-        const inputs = advisorInputs({ tech: 50, fund: 50 });
-        inputs.technical.metrics.technicalScore = tracer.notAvailable({ id: 'technicalScore', label: 'Technical score', unit: 'score', reason: 'fixture', meta: { coverage: 0 } });
-        const result = advisor.advise(inputs);
-        expect(result.verdict).toBeNull();
-        expect(result.metrics.verdict.status).toBe('na');
-        expect(result.metrics.confidence.status).toBe('na');
-      });
-      test('verdict, composite and confidence all satisfy the trace contract', () => {
-        const result = advisor.advise(advisorInputs({ tech: 75, fund: 75, close: 80, sma200: 90, macdLine: -1, macdSignal: -0.5 }));
-        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
-        expect(result.metrics.verdict.trace.dependsOn).toContain('compositeScore');
+      test('real snapshot: no trace of any asset mentions BUY, HOLD or SELL', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const metrics = { ...technical.analyzeTechnicals(asset).metrics, ...fundamental.analyzeFundamentals(asset, { fxRate: snapshot.fx.rate }).metrics };
+          expect(JSON.stringify(metrics).match(/\b(BUY|HOLD|SELL)\b|[Cc]omposite score|verdict/)).toBeNull();
+          expect(metrics.trendRegime.status).toBe('ok');                     // five years of candles: always defined
+        }
       });
     });
 
@@ -1052,13 +987,17 @@
         expect(gainAtTarget).toBe(2 * s.amountAtRisk);
         expect(gainAtTarget / -lossAtStop).toBe(sizer.SIZER_CONFIG.targetMultiple);
       });
-      test('verdict multiplier: BUY full size, HOLD half, SELL nothing', () => {
-        expect(size({ verdict: 'BUY' }).summary.units).toBe(20);
-        expect(size({ verdict: 'HOLD' }).summary.units).toBe(10);
-        const sell = size({ verdict: 'SELL' }).summary;
-        expect(sell.units).toBe(0);
-        expect(sell.zeroReason).toMatch(/SELL/);
-        expect(size({ verdict: null }).summary.zeroReason).toMatch(/no verdict/i);
+      test('the size is risk control only: no verdict, no multiplier, no view on direction', () => {
+        const result = size();
+        expect(result.summary.units).toBe(20);
+        expect('multiplier' in result.summary).toBeFalse();
+        expect('verdictMultiplier' in sizer.SIZER_CONFIG).toBeFalse();
+        expect(size({ verdict: 'SELL' }).summary.units).toBe(20);            // an old caller's verdict is ignored
+        const trace = result.metrics.positionSize.trace;
+        expect(trace.rawInputs.some((item) => /verdict/i.test(item.label))).toBeFalse();
+        expect(trace.steps.some((item) => /verdict|multiplier/i.test(item.description))).toBeFalse();
+        expect(trace.dependsOn.includes('verdict')).toBeFalse();
+        expect(trace.interpretation.caveat).toMatch(/not a view on direction/);
       });
       test('correlation haircut = 1 ÷ √(1 + (n − 1) × max(0, ρ̄))', () => {
         expect(sizer.correlationHaircut(3, 0.8).factor).toBeCloseTo(1 / Math.sqrt(2.6), 1e-12); // 0.6202
@@ -1145,7 +1084,7 @@
         }
       });
       test('portfolio heat is the total at risk divided by the account', () => {
-        const sizings = [size(), size({ verdict: 'HOLD' }), size({ verdict: 'SELL' })]; // 100 + 50 + 0
+        const sizings = [size(), size({ account: { riskPct: 0.5 } }), size({ asset: { lotSize: 100 } })]; // 100 + 50 + 0 (no lot fits)
         const heat = sizer.portfolioHeat(sizings, ACCOUNT, 'USD');
         expect(heat.value).toBeCloseTo(0.015, 1e-12);
         expect(heat.meta.total).toBe(150);
@@ -1154,7 +1093,7 @@
       test('every sizing metric satisfies the trace contract and names its inputs', () => {
         const result = size({ comparedCount: 3, meanCorrelation: 0.8, correlationIds: ['corr:A|B'] });
         for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
-        expect(result.metrics.positionSize.trace.steps.length).toBe(9);
+        expect(result.metrics.positionSize.trace.steps.length).toBe(8);
         expect(result.metrics.positionSize.trace.dependsOn).toContain('correlationHaircut');
         expect(result.metrics.correlationHaircut.trace.dependsOn).toEqual(['corr:A|B']);
       });
@@ -1271,19 +1210,28 @@
         expect(serializeUrlState(parseUrlState(''))).toBe('');
       });
       test('a full view round-trips through the URL unchanged', () => {
-        const query = '?t=MU,BLK,ETH-USD&ccy=SGD&mode=pro&class=equity&mkt=SG&sector=Financial+Services&verdict=buy';
+        const query = '?t=MU,BLK,ETH-USD&ccy=SGD&mode=pro&class=equity&mkt=SG&sector=Financial+Services&trend=uptrend';
         const view = parseUrlState(query);
         expect(view.selected).toEqual(['MU', 'BLK', 'ETH-USD']);
         expect(view.filters.sector).toBe('Financial Services');
         expect(serializeUrlState(view)).toBe(query);
       });
       test('parsing is forgiving: case, duplicates, a fourth ticker and garbage are all handled', () => {
-        const view = parseUrlState('?t=mu,MU,%3Cscript%3E,blk,eth-usd,amd&ccy=xyz&mode=PRO&mkt=sg&verdict=maybe');
+        const view = parseUrlState('?t=mu,MU,%3Cscript%3E,blk,eth-usd,amd&ccy=xyz&mode=PRO&mkt=sg&trend=maybe');
         expect(view.selected).toEqual(['MU', 'BLK', 'ETH-USD']); // de-duplicated, sanitised, capped at three
         expect(view.currency).toBe('USD');
         expect(view.mode).toBe('pro');
         expect(view.filters.market).toBe('SG');
-        expect(view.filters.verdict).toBe('all');
+        expect(view.filters.trend).toBe('all');
+        expect(parseUrlState('?trend=DOWNTREND').filters.trend).toBe('downtrend');
+      });
+      test('an old verdict= link is ignored safely, and the rest of the view survives', () => {
+        const view = parseUrlState('?mkt=SG&verdict=buy');
+        expect('verdict' in view.filters).toBeFalse();
+        expect(view.filters).toEqual({ ...storeModule.DEFAULT_FILTERS, market: 'SG' });
+        expect(serializeUrlState(view)).toBe('?mkt=SG');
+        const state = reduce(createInitialState('?verdict=sell'), actions.setFilter('verdict', 'sell'));
+        expect(state.filters).toEqual({ ...storeModule.DEFAULT_FILTERS });
       });
       test('"t" absent means the default trio; "t=" means nothing selected', () => {
         expect(parseUrlState('').selected).toEqual([...storeModule.DEFAULT_SELECTED]);
@@ -1333,15 +1281,15 @@
         expect(reduce(state, actions.livePrice('BTC-USD', 64000, 1, 'ws')).live.prices['BTC-USD'].price).toBe(64000);
       });
       test('the drawer trail supports drill-down, back and breadcrumb jumps', () => {
-        let state = reduce(createInitialState(''), actions.openTrace('AMD', 'verdict'));
-        state = reduce(state, actions.drillTrace('compositeScore'));
-        state = reduce(state, actions.drillTrace('technicalScore'));
-        state = reduce(state, actions.drillTrace('rsi14'));
-        expect(state.drawer.trail).toEqual(['verdict', 'compositeScore', 'technicalScore', 'rsi14']);
+        let state = reduce(createInitialState(''), actions.openTrace('AMD', 'positionSize'));
+        state = reduce(state, actions.drillTrace('riskPerUnit'));
+        state = reduce(state, actions.drillTrace('stopLoss'));
+        state = reduce(state, actions.drillTrace('atr14'));
+        expect(state.drawer.trail).toEqual(['positionSize', 'riskPerUnit', 'stopLoss', 'atr14']);
         state = reduce(state, actions.backTrace());
-        expect(state.drawer.traceId).toBe('technicalScore');
+        expect(state.drawer.traceId).toBe('stopLoss');
         state = reduce(state, actions.jumpTrace(0));
-        expect(state.drawer.trail).toEqual(['verdict']);
+        expect(state.drawer.trail).toEqual(['positionSize']);
         expect(reduce(state, actions.closeTrace()).drawer.open).toBeFalse();
       });
       test('the reducer returns the same object when nothing changes', () => {
@@ -1370,18 +1318,19 @@
         expect(storeModule.selectPrice(state, 'BTC-USD').price).toBe(64000);
         expect(storeModule.selectFx(state).rate).toBe(1.3);
       });
-      test('filters combine asset class, market, sector and verdict', () => {
+      test('filters combine asset class, market, sector and trend regime', () => {
         const assets = [
           { ticker: 'A', assetClass: 'equity', market: 'US', sector: 'Technology' },
           { ticker: 'B', assetClass: 'equity', market: 'SG', sector: 'Financial Services' },
           { ticker: 'C', assetClass: 'crypto', market: 'CRYPTO', sector: null },
         ];
-        const verdicts = { A: 'BUY', B: 'HOLD', C: 'SELL' };
-        const pick = (filters) => storeModule.filterAssets(assets, { ...storeModule.DEFAULT_FILTERS, ...filters }, verdicts).map((asset) => asset.ticker);
+        const regimes = { A: 'Uptrend', B: 'Pullback', C: 'Downtrend' };
+        const pick = (filters) => storeModule.filterAssets(assets, { ...storeModule.DEFAULT_FILTERS, ...filters }, regimes).map((asset) => asset.ticker);
         expect(pick({})).toEqual(['A', 'B', 'C']);
         expect(pick({ assetClass: 'equity', market: 'SG' })).toEqual(['B']);
-        expect(pick({ verdict: 'sell' })).toEqual(['C']);
-        expect(pick({ sector: 'Technology', verdict: 'hold' })).toEqual([]);
+        expect(pick({ trend: 'downtrend' })).toEqual(['C']);
+        expect(pick({ sector: 'Technology', trend: 'pullback' })).toEqual([]);
+        expect(storeModule.FILTER_OPTIONS.trend).toEqual(['all', ...trends.TREND_REGIMES.map((label) => label.toLowerCase())]);
       });
       test('this test page stored nothing in the browser', () => {
         expect(window.localStorage.length).toBe(0);
@@ -1832,7 +1781,7 @@
         for (const asset of snapshot.assets) {
           const tech = technical.analyzeTechnicals(asset);
           const fund = fundamental.analyzeFundamentals(asset, { fxRate: snapshot.fx.rate });
-          byTicker[asset.ticker] = { asset, tech, fund, advice: advisor.advise({ asset, technical: tech, fundamental: fund }) };
+          byTicker[asset.ticker] = { asset, tech, fund };
         }
         cache = { snapshot, byTicker };
         return cache;
@@ -1841,8 +1790,8 @@
       test('every metric of every asset satisfies the trace contract', async () => {
         const { byTicker } = await analysed();
         let count = 0;
-        for (const [ticker, { tech, fund, advice }] of Object.entries(byTicker)) {
-          for (const metrics of [tech.metrics, fund.metrics, advice.metrics]) {
+        for (const [ticker, { tech, fund }] of Object.entries(byTicker)) {
+          for (const metrics of [tech.metrics, fund.metrics]) {
             for (const [id, metric] of Object.entries(metrics)) {
               const errors = tracer.validateTrace(metric);
               if (errors.length) fail(`${ticker}.${id}: ${errors.join('; ')}`);
@@ -1856,15 +1805,15 @@
       test('no NaN or Infinity exists anywhere in the analysis', async () => {
         const { byTicker } = await analysed();
         for (const [ticker, result] of Object.entries(byTicker)) {
-          const found = findNonFinite({ metrics: [result.tech.metrics, result.fund.metrics, result.advice.metrics], series: result.tech.series });
+          const found = findNonFinite({ metrics: [result.tech.metrics, result.fund.metrics], series: result.tech.series });
           if (found.length) fail(`${ticker}: non-finite number at ${found[0]}`);
         }
       });
       test('every metric shown in the app has a Guided-mode explainer', async () => {
         const { byTicker } = await analysed();
         const ids = new Set(['price', 'correlation', 'portfolioHeat', 'monteCarlo', 'probStopFirst']);
-        for (const { tech, fund, advice } of Object.values(byTicker)) {
-          for (const metrics of [tech.metrics, fund.metrics, advice.metrics]) Object.keys(metrics).forEach((id) => ids.add(id));
+        for (const { tech, fund } of Object.values(byTicker)) {
+          for (const metrics of [tech.metrics, fund.metrics]) Object.keys(metrics).forEach((id) => ids.add(id));
         }
         Object.keys(size().metrics).forEach((id) => ids.add(id));
         // V2 metrics: news tone, the projection and its record, and the portfolio figures.
@@ -1901,7 +1850,7 @@
       });
       test('financial companies never receive an EBITDA-based score; crypto, ETFs and indices never receive a fundamental score', async () => {
         const { byTicker } = await analysed();
-        for (const { asset, fund, advice } of Object.values(byTicker)) {
+        for (const { asset, fund, tech } of Object.values(byTicker)) {
           if (fund.profile === 'FINANCIAL') {
             expect(fund.metrics.evEbitda.status).toBe('na');
             expect(fund.scoredIds).toEqual(['roe', 'priceToBook', 'netMargin', 'trailingPE']);
@@ -1909,9 +1858,8 @@
           if (['crypto', 'etf', 'index'].includes(asset.assetClass)) {
             expect(fund.metrics.fundamentalScore.status).toBe('na');
             expect(fund.scoredIds).toEqual([]);
-            expect(advice.metrics.compositeScore.meta.technicalOnly).toBeTrue();
-            expect(advice.metrics.confidence.value).toBe('Low');
-            expect(['BUY', 'HOLD', 'SELL']).toContain(advice.verdict); // still a verdict, from price behaviour
+            expect(trends.TREND_REGIMES).toContain(tech.metrics.trendRegime.value); // still a trend regime, from price behaviour
+            expect(fund.metrics.fundamentalScore.naReason).toMatch(/trend regime and Technical score use price behaviour only/);
           }
         }
       });
@@ -1941,7 +1889,6 @@
             asset,
             entryPrice: asset.quote.lastClose,
             atr: tracer.valueOf(byTicker[asset.ticker].tech.metrics.atr14),
-            verdict: byTicker[asset.ticker].advice.verdict,
             account: ACCOUNT,
             accountCurrency: currency,
             fxRate: snapshot.fx.rate,
@@ -2826,7 +2773,7 @@
           for (const metric of Object.values(windowOf(closes).metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
         }
       });
-      test('the window never touches the indicators behind the verdict', async () => {
+      test('the window never touches the indicators behind the trend regime', async () => {
         const raw = await rawSnapshot();
         const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
         const asset = snapshot.assets[0];
@@ -2939,24 +2886,30 @@
     });
 
     suite('leaderboardView: sorting', () => {
+      // trendRegime holds TREND_RANK: 5 Uptrend … 1 Downtrend.
       const rows = [
-        { ticker: 'CCC', values: { compositeScore: 50, periodVolatility: 0.4, ticker: 'CCC', price: null } },
-        { ticker: 'AAA', values: { compositeScore: 80, periodVolatility: 0.2, ticker: 'AAA', price: 10 } },
-        { ticker: 'DDD', values: { compositeScore: null, periodVolatility: null, ticker: 'DDD', price: 5 } },
-        { ticker: 'BBB', values: { compositeScore: 50, periodVolatility: Number.NaN, ticker: 'BBB', price: 7 } },
+        { ticker: 'CCC', values: { trendRegime: 3, relativeStrength3m: 0.30, periodVolatility: 0.4, ticker: 'CCC', price: null } },
+        { ticker: 'AAA', values: { trendRegime: 5, relativeStrength3m: 0.10, periodVolatility: 0.2, ticker: 'AAA', price: 10 } },
+        { ticker: 'DDD', values: { trendRegime: null, relativeStrength3m: null, periodVolatility: null, ticker: 'DDD', price: 5 } },
+        { ticker: 'BBB', values: { trendRegime: 3, relativeStrength3m: 0.20, periodVolatility: Number.NaN, ticker: 'BBB', price: 7 } },
       ];
-      const order = (key, direction) => sortRows(rows, key, direction).map((row) => row.ticker);
+      const order = (key, direction, then = null) => sortRows(rows, key, direction, then).map((row) => row.ticker);
 
-      test('the default ranking is Composite score, best first', () => {
-        expect(DEFAULT_SORT).toEqual({ key: 'compositeScore', direction: 'descending' });
-        expect(order(DEFAULT_SORT.key, DEFAULT_SORT.direction)).toEqual(['AAA', 'BBB', 'CCC', 'DDD']);
+      test('the default ranking is trend regime, Uptrend first, then 3-month relative strength', () => {
+        expect(DEFAULT_SORT).toEqual({ key: 'trendRegime', direction: 'descending' });
+        const then = BOARD_COLUMNS.find((column) => column.id === DEFAULT_SORT.key).then;
+        expect(order(DEFAULT_SORT.key, DEFAULT_SORT.direction, then)).toEqual(['AAA', 'CCC', 'BBB', 'DDD']);   // CCC's RS beats BBB's
+        expect(order('trendRegime', 'ascending', then)).toEqual(['CCC', 'BBB', 'AAA', 'DDD']);                // the tie-break stays strongest first
+        expect(TREND_RANK.Uptrend).toBeGreaterThan(TREND_RANK.Extended);
+        expect(TREND_RANK.Recovering).toBeGreaterThan(TREND_RANK.Downtrend);
       });
       test('equal values are ordered by ticker, in both directions', () => {
-        expect(order('compositeScore', 'ascending')).toEqual(['BBB', 'CCC', 'AAA', 'DDD']);
+        expect(order('trendRegime', 'ascending')).toEqual(['BBB', 'CCC', 'AAA', 'DDD']);
+        expect(order('trendRegime', 'descending')).toEqual(['AAA', 'BBB', 'CCC', 'DDD']);
       });
       test('assets with no value sink to the bottom whichever way the column is sorted', () => {
-        expect(order('compositeScore', 'descending')[3]).toBe('DDD');
-        expect(order('compositeScore', 'ascending')[3]).toBe('DDD');
+        expect(order('trendRegime', 'descending')[3]).toBe('DDD');
+        expect(order('trendRegime', 'ascending')[3]).toBe('DDD');
         // NaN and null are both "no value": they come last, in ticker order.
         expect(order('periodVolatility', 'ascending')).toEqual(['AAA', 'CCC', 'BBB', 'DDD']);
         expect(order('periodVolatility', 'descending')).toEqual(['CCC', 'AAA', 'BBB', 'DDD']);
@@ -3148,17 +3101,17 @@
         }
         expect(result.metrics.dividendYield.naReason).toMatch(/calculated level/);
       });
-      test('the verdict of an ETF or an index rests on price behaviour, and the trace names the reason', () => {
-        for (const [asset, phrase] of [[etf(), /an ETF is a basket/], [index(), /an index is a calculated level/]]) {
-          const tech = technical.analyzeTechnicals(asset);
-          const advice = advisor.advise({ asset, technical: tech, fundamental: fundamental.analyzeFundamentals(asset) });
-          expect(advice.metrics.compositeScore.value).toBe(tech.metrics.technicalScore.value);
-          expect(advice.metrics.compositeScore.trace.interpretation.summary).toMatch(phrase);
-          expect(advice.metrics.confidence.value).toBe('Low');
+      test('an ETF or an index is described by price behaviour alone, and the fundamental trace names the reason', () => {
+        for (const [asset, phrase] of [[etf(), /An ETF is a basket/], [index(), /An index is a calculated level/]]) {
+          const score = fundamental.analyzeFundamentals(asset).metrics.fundamentalScore;
+          expect(score.status).toBe('na');
+          expect(score.naReason).toMatch(phrase);
+          expect(score.naReason).toMatch(/trend regime and Technical score use price behaviour only/);
+          expect(technical.analyzeTechnicals(asset).metrics.technicalScore.status).toBe('ok');
         }
       });
       test('an index cannot be sized, an ETF is sized in shares like a stock', () => {
-        const args = { entryPrice: 100, atr: 2, verdict: 'BUY', account: { equity: 10000, riskPct: 1, atrMultiple: 2, maxPositionPct: 25 }, accountCurrency: 'USD', fxRate: 1.3 };
+        const args = { entryPrice: 100, atr: 2, account: { equity: 10000, riskPct: 1, atrMultiple: 2, maxPositionPct: 25 }, accountCurrency: 'USD', fxRate: 1.3 };
         const indexSizing = sizer.sizePosition({ asset: index(), ...args });
         expect(indexSizing.ok).toBeFalse();
         expect(indexSizing.metrics.positionSize.naReason).toMatch(/cannot be bought directly/);
@@ -3206,12 +3159,11 @@
         for (const asset of funds) {
           const tech = technical.analyzeTechnicals(asset);
           const fund = fundamental.analyzeFundamentals(asset, { fxRate: snapshot.fx.rate });
-          const advice = advisor.advise({ asset, technical: tech, fundamental: fund });
-          for (const metric of [...Object.values(tech.metrics), ...Object.values(fund.metrics), ...Object.values(advice.metrics)]) {
+          for (const metric of [...Object.values(tech.metrics), ...Object.values(fund.metrics)]) {
             expect(tracer.validateTrace(metric)).toEqual([]);
           }
           expect(asset.sector).toBeNull();
-          const sizing = sizer.sizePosition({ asset, entryPrice: asset.quote.lastClose, atr: tracer.valueOf(tech.metrics.atr14), verdict: advice.verdict, account: ACCOUNT_FOR_FUNDS, accountCurrency: 'USD', fxRate: snapshot.fx.rate });
+          const sizing = sizer.sizePosition({ asset, entryPrice: asset.quote.lastClose, atr: tracer.valueOf(tech.metrics.atr14), account: ACCOUNT_FOR_FUNDS, accountCurrency: 'USD', fxRate: snapshot.fx.rate });
           expect(sizing.ok).toBe(asset.assetClass === 'etf');
         }
       });
@@ -3236,7 +3188,7 @@
           for (let i = 1; i < dates.length; i += 1) if (dates[i] <= dates[i - 1]) fail(`${asset.ticker}: long series not ascending at ${dates[i]}`);
           expect(dates[dates.length - 1]).toBe(asset.quote.asOf);
           expect(close[close.length - 1]).toBe(asset.quote.lastClose);
-          // The candles' own year is untouched: indicators and the verdict still read it.
+          // The candles' own year is untouched: indicators and the trend regime still read it.
           expect(asset.series.dates.length).toBe(asset.candleCount);
           longest = Math.max(longest, asset.historyCount);
         }
@@ -3647,10 +3599,10 @@
     });
 
     /* ================================================================== */
-    /* 26. V3 verdict backtest                                              */
+    /* 26. V3 backtest: the Technical score's own track record              */
     /* ================================================================== */
 
-    suite('backtestEngine: the verdict\'s own track record', () => {
+    suite('backtestEngine: the Technical score\'s own track record', () => {
       test('ranks share ties, and Spearman correlation matches hand cases', () => {
         expect(backtest.averageRanks([10, 20, 20, 30])).toEqual([1, 2.5, 2.5, 4]);
         expect(backtest.spearman([1, 2, 3, 4], [10, 20, 30, 40])).toBeCloseTo(1, 1e-12);
@@ -3658,29 +3610,24 @@
         expect(backtest.spearman([1, 2, 3, 4], [1, 100, 2, 3])).toBeCloseTo(0.4, 1e-12); // monotone transforms do not matter, only order
         expect(backtest.spearman([1, 2], [1, 2])).toBeNull();
       });
-      test('band statistics: average forward return, hit rate and excess over all days', () => {
+      test('thirds: the highest and lowest third of days by score against all days, by hand', () => {
         const summary = backtest.summariseBacktest(
-          [70, 70, 50, 30, 30],
-          ['BUY', 'BUY', 'HOLD', 'SELL', 'SELL'],
-          [0.05, 0.01, 0, -0.02, 0.03],
+          [70, 70, 50, 30, 30, 60],
+          [0.05, 0.01, 0, -0.02, 0.03, 0.04],
         );
-        expect(summary.n).toBe(5);
-        expect(summary.base.mean).toBeCloseTo(0.014, 1e-12);
-        expect(summary.bands.BUY.mean).toBeCloseTo(0.03, 1e-12);
-        expect(summary.bands.BUY.hitRate).toBe(1);           // both BUY days rose
-        expect(summary.bands.SELL.hitRate).toBe(0.5);         // one of two SELL days fell
-        expect(summary.bands.BUY.excess).toBeCloseTo(0.016, 1e-12);
-        expect(summary.bands.SELL.share).toBe(0.4);
-        expect(summary.independent).toBe(0);                 // 5 days are not even one 21-day period
+        expect(summary.n).toBe(6);
+        expect(summary.base.mean).toBeCloseTo(0.11 / 6, 1e-12);
+        expect(summary.top.count).toBe(2);                    // the two 70s
+        expect(summary.top.mean).toBeCloseTo(0.03, 1e-12);
+        expect(summary.top.upShare).toBe(1);
+        expect(summary.top.excess).toBeCloseTo(0.03 - 0.11 / 6, 1e-12);
+        expect(summary.top.minScore).toBe(70);
+        expect(summary.bottom.mean).toBeCloseTo(0.005, 1e-12); // the two 30s: −2% and +3%
+        expect(summary.bottom.maxScore).toBe(30);
+        expect(summary.independent).toBe(0);                 // 6 days are not even one 21-day period
         expect(summary.tStat).toBeNull();
-      });
-      test('the safety rules cap a BUY exactly as the live advisor does', () => {
-        const strong = { score: 80, sma200: 90, macdLine: 1, macdSignal: 0.5, rsi: 60 };
-        expect(backtest.technicalVerdict(strong, 100)).toBe('BUY');
-        expect(backtest.technicalVerdict({ ...strong, rsi: 85 }, 100)).toBe('HOLD');                    // overheated
-        expect(backtest.technicalVerdict({ ...strong, macdLine: 0.1, macdSignal: 0.5 }, 85)).toBe('HOLD'); // below SMA200 while MACD falls
-        expect(backtest.technicalVerdict({ ...strong, score: 50 }, 100)).toBe('HOLD');
-        expect(backtest.technicalVerdict({ ...strong, score: 30 }, 100)).toBe('SELL');
+        expect('bands' in summary).toBeFalse();
+        expect('technicalVerdict' in backtest).toBeFalse();
       });
       test('the fast scorer equals the live Technical score on a synthetic year', () => {
         const closes = randomWalk(260, { seed: 41, sigma: 0.018 });
@@ -3691,10 +3638,11 @@
       test('without older history there is nothing to replay, and the record says so', () => {
         const asset = makeAsset({ ticker: 'BT', closes: randomWalk(260, { seed: 42 }) });
         const result = backtest.backtestAsset(asset);
-        expect(result.metrics.verdictBacktest.status).toBe('na');
-        expect(result.metrics.verdictBacktest.naReason).toMatch(/at least 120/);
+        expect(result.metrics.scoreBacktest.status).toBe('na');
+        expect(result.metrics.scoreBacktest.naReason).toMatch(/at least 120/);
+        expect(result.metrics.regimeRecord.status).toBe('na');
       });
-      test('real snapshot: the last replayed day reproduces today\'s live score and verdict', async () => {
+      test('real snapshot: the last replayed day reproduces today\'s live score and trend regime', async () => {
         const raw = await rawSnapshot();
         const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
         const result = mathWorker.handleRequest('backtest', { assets: snapshot.assets });
@@ -3703,13 +3651,11 @@
           const record = result.byTicker[asset.ticker];
           const tech = technical.analyzeTechnicals(asset);
           expect(record.lastScore).toBeCloseTo(tech.metrics.technicalScore.value, 1e-9);
-          if (asset.assetClass !== 'equity') {
-            // Without fundamentals the Technical score is the whole verdict, safety rules included.
-            const advice = advisor.advise({ asset, technical: tech, fundamental: fundamental.analyzeFundamentals(asset, { fxRate: snapshot.fx.rate }) });
-            expect(record.lastVerdict).toBe(advice.verdict);
-          }
-          const metric = record.metrics.verdictBacktest;
+          expect(record.lastLabel).toBe(tech.metrics.trendRegime.value);
+          expect('lastVerdict' in record).toBeFalse();
+          const metric = record.metrics.scoreBacktest;
           expect(tracer.validateTrace(metric)).toEqual([]);
+          expect(JSON.stringify(metric.trace).match(/\b(BUY|HOLD|SELL)\b|verdict/)).toBeNull();
           if (metric.status === 'ok') {
             reported += 1;
             expect(metric.meta.n).toBeAtLeast(backtest.BACKTEST_CONFIG.minScoredDays);
@@ -3718,6 +3664,7 @@
         }
         expect(reported).toBeGreaterThan(20);
         expect(result.summary.assets).toBe(reported);
+        for (const key of ['buy', 'hold', 'sell']) expect(key in result.summary).toBeFalse();
       });
       test('the compute store has a backtest slot', () => {
         expect(storeModule.COMPUTE_JOBS).toContain('backtest');
@@ -4219,12 +4166,12 @@
 
     suite('position sizing with liquidity: the volume cap and the spread cost', () => {
       const liquidity = (averageVolume, spread = 0.001) => ({ averageVolume, spread, tick: 0.1, asOf: '2026-11-20', unitName: 'shares' });
-      test('a large account is capped at 5% of daily volume, with a tenth step in the trace', () => {
+      test('a large account is capped at 5% of daily volume, with a ninth step in the trace', () => {
         const result = size({ account: { equity: 1e8, maxPositionPct: 100 }, liquidity: liquidity(10000) });
         expect(result.summary.liquidityBinding).toBeTrue();
         expect(result.summary.units).toBe(500);
-        expect(result.metrics.positionSize.trace.steps.length).toBe(10);
-        expect(result.metrics.positionSize.trace.steps[8].description).toMatch(/Liquidity cap/);
+        expect(result.metrics.positionSize.trace.steps.length).toBe(9);
+        expect(result.metrics.positionSize.trace.steps[7].description).toMatch(/Liquidity cap/);
         expect(result.metrics.volumeShare.value).toBeCloseTo(0.05, 1e-12);
         expect(result.metrics.positionSize.trace.interpretation.summary).toMatch(/5% of an average day's volume/);
       });
@@ -4245,7 +4192,7 @@
       });
       test('without liquidity data nothing changes and the new rows say why', () => {
         const result = size();
-        expect(result.metrics.positionSize.trace.steps.length).toBe(9);
+        expect(result.metrics.positionSize.trace.steps.length).toBe(8);
         expect(result.metrics.volumeShare.status).toBe('na');
         expect(result.metrics.spreadCost.status).toBe('na');
       });

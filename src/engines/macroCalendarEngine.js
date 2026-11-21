@@ -12,7 +12,7 @@
  * trigger and the next-event countdown look at. Times carry their own UTC offset, so no
  * daylight-saving arithmetic happens here.
  *
- * Context only: no score, verdict or position size uses the calendar. It does make the
+ * Context only: no score, trend regime or position size uses the calendar. It does make the
  * trading-day counts of the event layer skip market holidays (see holidaysFor).
  */
 
@@ -165,7 +165,7 @@ export function analyzeMacro(calendar, { now = new Date() } = {}) {
     interpretation: interpretation(
       `${title} on ${shortDay(next.date)} at ${clock}, ${calendarDays === 0 ? 'today' : calendarDays === 1 ? 'tomorrow' : `in ${calendarDays} days`}${insideSizing ? `, inside the ${MACRO_CONFIG.sizingHorizon}-day sizing horizon` : ''}.`,
       [threshold(`Within ${MACRO_CONFIG.triggerHours} hours`, 'Imminent: every asset can move at once', 'caution'), threshold('Further out', 'On the calendar', 'neutral')],
-      `Context only: no score, verdict or position size uses it. A scheduled announcement can move every asset at once, and a stop cannot protect against a gap at the open. Dates come from the Fed and BLS calendars as copied on ${calendar.updated}; FOMC dates are tentative until confirmed at the meeting before.${staleNote}`,
+      `Context only: no score, trend regime or position size uses it. A scheduled announcement can move every asset at once, and a stop cannot protect against a gap at the open. Dates come from the Fed and BLS calendars as copied on ${calendar.updated}; FOMC dates are tentative until confirmed at the meeting before.${staleNote}`,
     ),
   });
   return { status: 'fresh', next, within48h, next7, next30, metrics: { [id]: metric } };

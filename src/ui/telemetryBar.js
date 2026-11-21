@@ -173,7 +173,7 @@ export function mountTelemetryBar(root, app) {
           <span class="tick__price">N/A</span>
         </span>`;
     }
-    const title = `Market regime: ${regime.label.toLowerCase()}. ${regime.headline}. Context only: it changes no score, verdict or position size. Select to see how it is read.`;
+    const title = `Market regime: ${regime.label.toLowerCase()}. ${regime.headline}. Context only: it changes no score, trend regime or position size. Select to see how it is read.`;
     return `
       <button type="button" class="tick tick--button" data-trace="marketRegime" data-key="telemetry:marketRegime" data-regime="${regime.state}"
         aria-label="${h.esc(title)}" title="${h.esc(title)}">

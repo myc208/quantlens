@@ -153,13 +153,14 @@ export function mountCommandPalette(dialog, app) {
 
   function assetCommand(asset, state) {
     const analysis = app.analysis(asset.ticker);
-    const verdict = analysis ? analysis.advisor.verdict : null;
+    const regime = analysis ? analysis.technical.metrics.trendRegime : null;
+    const trend = regime && regime.status === 'ok' ? regime.value : null;
     const market = asset.market === 'CRYPTO' ? 'Crypto' : asset.market;
     const base = {
       group: 'Assets',
       title: asset.ticker,
-      hint: `${asset.name} · ${market}${verdict ? ` · ${verdict}` : ''}`,
-      keywords: [asset.name, asset.sector, market, asset.assetClass, verdict, 'asset', 'ticker'].filter(Boolean),
+      hint: `${asset.name} · ${market}${trend ? ` · ${trend}` : ''}`,
+      keywords: [asset.name, asset.sector, market, asset.assetClass, trend, 'asset', 'ticker'].filter(Boolean),
     };
     // In the Portfolio view an asset is added to (or removed from) the allocation;
     // everywhere else it is added to (or removed from) the comparison.
