@@ -615,6 +615,20 @@ const ENTRIES = {
     healthy: '2 or more.',
     risky: 'Below 1.3: effectively one bet.',
   },
+  trendRegime: {
+    term: 'Trend regime',
+    what: 'Where the price stands against its own averages: Uptrend, Extended (RSI above 70), Pullback, Recovering or Downtrend, from the 200-day average, the 20- and 50-day EMAs and RSI.',
+    why: 'It says what kind of market the asset is in, in plain words. It is a description, not a forecast: over 2022–2026 no trend or momentum signal predicted the next month on this watchlist.',
+    healthy: 'Uptrend: above the 200-day average with the shorter averages rising.',
+    risky: 'Downtrend: below the 200-day average with the shorter averages falling. Not a sell signal: see the regime track record for what followed.',
+  },
+  regimeRecord: {
+    term: 'Regime track record',
+    what: 'What followed past days with the same trend regime on this asset: the average return over the next 21 sessions, for every regime, overall and within normal, elevated and stressed VIX periods.',
+    why: 'It shows how much, or how little, a trend label has told you about the next month here, so a label is never mistaken for a prediction.',
+    healthy: 'There is no good or bad value: it is a record of the past, published so it can be checked.',
+    risky: 'Small samples: stressed VIX periods are a few short episodes, and overlapping 21-day windows share days.',
+  },
   nextMacroEvent: {
     term: 'Next FOMC / CPI',
     what: 'Days to the next Federal Reserve rate decision or US inflation (CPI) release, from a calendar kept by hand from the Fed and BLS schedules, with what else is due in the next 7 and 30 days.',

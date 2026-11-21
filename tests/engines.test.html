@@ -194,6 +194,7 @@
     import * as factors from '../src/engines/factorEngine.js';
     import * as liquidityEngine from '../src/engines/liquidityEngine.js';
     import * as macroEngine from '../src/engines/macroCalendarEngine.js';
+    import * as trends from '../src/engines/trendRegimeEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -4378,6 +4379,97 @@
           expect(real.z).toBeCloseTo(residuals[residuals.length - 1], 1e-12);
           expect(real.date).toBe(asset.longSeries.dates[asset.longSeries.dates.length - 1]);
         }
+      });
+    });
+
+    /* ================================================================== */
+    /* 32. V3.3 trend regimes and the regime-split track record             */
+    /* ================================================================== */
+
+    suite('trend regimes: a description of the trend, at its boundaries', () => {
+      const at = (overrides) => trends.classifyTrend({ close: 100, sma200: 90, ema20: 95, ema50: 94, rsi: 55, ...overrides });
+      test('the five regimes and their edges', () => {
+        expect(at({})).toBe('Uptrend');
+        expect(at({ close: 90 })).toBe('Uptrend');                          // exactly on the 200-day average counts as above
+        expect(at({ rsi: 70 })).toBe('Uptrend');                             // RSI exactly 70 is not extended
+        expect(at({ rsi: 70.01 })).toBe('Extended');
+        expect(at({ rsi: 75, ema20: 90, ema50: 94 })).toBe('Extended');      // extended is checked before the EMAs
+        expect(at({ ema20: 94, ema50: 94 })).toBe('Uptrend');                // equal EMAs count as rising
+        expect(at({ ema20: 93 })).toBe('Pullback');
+        expect(at({ close: 85 })).toBe('Recovering');
+        expect(at({ close: 85, rsi: 90 })).toBe('Recovering');               // RSI only matters above the 200-day average
+        expect(at({ close: 85, ema20: 93 })).toBe('Downtrend');
+        expect(at({ sma200: null })).toBeNull();
+      });
+      test('the live metric is traced, and only asks about RSI above the 200-day average', () => {
+        const up = trends.traceTrendRegime({ ticker: 'X', currency: 'USD' }, { close: 100, sma200: 90, ema20: 95, ema50: 94, rsi: 55, asOf: '2026-11-20' });
+        expect(up.value).toBe('Uptrend');
+        expect(up.tone).toBe('healthy');
+        expect(tracer.validateTrace(up)).toEqual([]);
+        expect(up.trace.steps.some((s) => /RSI/.test(s.description))).toBeTrue();
+        const down = trends.traceTrendRegime({ ticker: 'X', currency: 'USD' }, { close: 80, sma200: 90, ema20: 85, ema50: 88, rsi: 30, asOf: '2026-11-20' });
+        expect(down.value).toBe('Downtrend');
+        expect(down.trace.steps.some((s) => /RSI/.test(s.description))).toBeFalse();
+        expect(down.trace.interpretation.caveat).toMatch(/not a forecast/);
+        expect(trends.traceTrendRegime({ ticker: 'X', currency: 'USD' }, { close: 80, sma200: null, ema20: 1, ema50: 1, rsi: 1 }).status).toBe('na');
+      });
+      test('technicalEngine labels a steady rise and a steady fall', () => {
+        const rising = makeAsset({ ticker: 'UP', closes: Array.from({ length: 260 }, (_, i) => 100 * 1.002 ** i + (i % 3) * 0.2) });
+        expect(['Uptrend', 'Extended']).toContain(technical.analyzeTechnicals(rising).metrics.trendRegime.value);
+        const falling = makeAsset({ ticker: 'DN', closes: Array.from({ length: 260 }, (_, i) => 100 * 0.998 ** i + (i % 3) * 0.2) });
+        expect(technical.analyzeTechnicals(falling).metrics.trendRegime.value).toBe('Downtrend');
+      });
+    });
+
+    suite('backtest: what followed each regime, split by VIX regime', () => {
+      test('regime lookup takes the last VIX session on or before a date, and counts episodes', () => {
+        const regime = { rules: { elevatedLevel: 20, elevatedRatio: 0.95, invertedRatio: 1 },
+          history: { dates: ['2026-01-05', '2026-01-06', '2026-01-07', '2026-01-08'], vix: [14, 25, 30, 15], vix3m: [17, 26, 28, 18] } };
+        const of = backtest.regimeLookup(regime);
+        expect(of('2026-01-04')).toBeNull();
+        expect(of('2026-01-05')).toBe('normal');
+        expect(of('2026-01-06')).toBe('elevated');
+        expect(of('2026-01-07')).toBe('stressed');                           // 30 ÷ 28 ≥ 1: inverted
+        expect(of('2026-01-10')).toBe('normal');                             // a weekend takes Friday's
+        expect(backtest.regimeLookup(null)('2026-01-06')).toBeNull();
+        const episodes = backtest.regimeEpisodes(regime, '2026-01-05', '2026-01-08');
+        expect(episodes.normal).toEqual({ sessions: 2, episodes: 2 });
+        expect(episodes.stressed).toEqual({ sessions: 1, episodes: 1 });
+      });
+      test('by label and by VIX regime, computed by hand', () => {
+        const labels = ['Uptrend', 'Uptrend', 'Downtrend', 'Pullback', 'Downtrend'];
+        const states = ['normal', 'normal', 'stressed', 'normal', 'stressed'];
+        const scores = [70, 65, 20, 50, 25];
+        const forward = [0.02, 0.04, 0.10, -0.01, 0.06];
+        const summary = backtest.summariseRegimes(labels, states, scores, forward);
+        expect(summary.byLabel.Uptrend.mean).toBeCloseTo(0.03, 1e-12);
+        expect(summary.byLabel.Downtrend).toEqual({ count: 2, mean: 0.08, upShare: 1 });
+        expect(summary.byLabel.Extended.count).toBe(0);
+        expect(summary.byState.normal.count).toBe(3);
+        expect(summary.byState.stressed.labels.Downtrend.mean).toBeCloseTo(0.08, 1e-12);
+        expect(summary.byState.normal.ic).toBeNull();                        // fewer than 60 days: no IC
+        expect(summary.base.mean).toBeCloseTo(0.042, 1e-12);
+      });
+      test('real snapshot: every replay ends on today\'s live label, and the split adds up', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const regime = { history: snapshot.macro.regime.history, rules: snapshot.macro.regime.rules };
+        const result = backtest.backtestWatchlist({ assets: snapshot.assets, regime });
+        for (const asset of snapshot.assets) {
+          const record = result.byTicker[asset.ticker];
+          expect(record.lastLabel).toBe(technical.analyzeTechnicals(asset).metrics.trendRegime.value);
+          expect(tracer.validateTrace(record.metrics.regimeRecord)).toEqual([]);
+        }
+        const { labels, states, regimeAvailable, span } = result.summary;
+        expect(regimeAvailable).toBeTrue();
+        expect(span.from < span.to).toBeTrue();
+        const labelled = Object.values(labels).reduce((sum, band) => sum + band.count, 0);
+        const split = Object.values(states).reduce((sum, band) => sum + band.count, 0);
+        expect(split).toBe(labelled);                                        // every replayed day has a VIX regime
+        expect(states.stressed.episodes).toBeGreaterThan(0);
+        const plain = backtest.backtestWatchlist({ assets: snapshot.assets.slice(0, 3) });
+        expect(plain.summary.regimeAvailable).toBeFalse();
+        expect(Object.values(plain.summary.states).every((band) => band.count === 0)).toBeTrue();
       });
     });
 

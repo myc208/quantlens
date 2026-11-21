@@ -19,17 +19,26 @@
  * today's fundamentals, and scoring 2022 with 2026 accounts would leak the future into
  * the test (look-ahead bias). For ETFs, indices and crypto the Technical score is the
  * whole verdict; for stocks it is the half that moves day to day.
+ *
+ * V3.3 adds the regime track record: every replayed day also gets its trend regime
+ * (Uptrend, Extended, Pullback, Recovering, Downtrend) and the VIX regime of that day
+ * (normal, elevated, stressed, from macro.regime.history), and the forward returns are
+ * reported by label, overall and within each VIX regime.
  */
 
 import { isNum, safeDiv, mean, pearson, interpolateAnchors, weightedScore, minOf, maxOf, percentile } from '../core/precisionMath.js';
 import { traced, notAvailable, input, step, threshold, interpretation, fmtN, fmtPct } from '../core/derivationTracer.js';
 import { TECH_CONFIG, smaSeries, emaSeries, macdSeries, rsiSeries } from './technicalEngine.js';
 import { ADVISOR_CONFIG, verdictForScore } from './advisorEngine.js';
+import { classifyTrend, TREND_REGIMES } from './trendRegimeEngine.js';
+import { classifyRegime, REGIME_STATES } from './regimeEngine.js';
 
 export const BACKTEST_CONFIG = Object.freeze({
   horizon: 21,          // trading sessions ahead
   minScoredDays: 120,   // days with a known outcome before the record is reported
   noiseIc: 0.05,        // |IC| below this is indistinguishable from noise in practice
+  minLabelDays: 20,     // days with a label before its average is reported
+  minStateDays: 60,     // days within a VIX regime before an IC is computed there
 });
 
 /**
@@ -86,11 +95,60 @@ export function technicalScoreAt(close, high, low) {
   ]);
   return {
     score: result.score,
+    close: price,
     sma200: isNum(sma200) ? sma200 : null,
+    ema20: isNum(ema20) ? ema20 : null,
+    ema50: isNum(ema50) ? ema50 : null,
     macdLine: isNum(line) ? line : null,
     macdSignal: isNum(signal) ? signal : null,
     rsi: isNum(rsi) ? rsi : null,
   };
+}
+
+/**
+ * A function from an ISO date to the VIX regime of the last session on or before it
+ * (normal | elevated | stressed), or null before the history starts.
+ * @param {{ history:{dates:string[], vix:number[], vix3m:number[]}, rules:object }|null} regime the normalised macro.regime
+ */
+export function regimeLookup(regime) {
+  if (!regime || !regime.history || !Array.isArray(regime.history.dates) || !regime.history.dates.length || !regime.rules) return () => null;
+  const { dates, vix, vix3m } = regime.history;
+  const states = dates.map((_, i) => classifyRegime(vix[i], vix3m[i], regime.rules));
+  return (iso) => {
+    if (iso < dates[0]) return null;
+    let low = 0;
+    let high = dates.length - 1;
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (dates[middle] <= iso) low = middle;
+      else high = middle - 1;
+    }
+    return states[low];
+  };
+}
+
+/** Count, mean and share up of a list of forward returns. */
+function describeReturns(returns) {
+  if (!returns.length) return { count: 0, mean: null, upShare: null };
+  return { count: returns.length, mean: mean(returns), upShare: returns.filter((r) => r > 0).length / returns.length };
+}
+
+/** Forward returns by trend label, overall and within each VIX regime. */
+export function summariseRegimes(labels, states, scores, forward) {
+  const byLabel = {};
+  for (const label of TREND_REGIMES) byLabel[label] = describeReturns(forward.filter((_, i) => labels[i] === label));
+  const byState = {};
+  for (const state of REGIME_STATES) {
+    const inside = forward.map((_, i) => i).filter((i) => states[i] === state);
+    const labelsInside = {};
+    for (const label of TREND_REGIMES) labelsInside[label] = describeReturns(inside.filter((i) => labels[i] === label).map((i) => forward[i]));
+    byState[state] = {
+      ...describeReturns(inside.map((i) => forward[i])),
+      ic: inside.length >= BACKTEST_CONFIG.minStateDays ? spearman(inside.map((i) => scores[i]), inside.map((i) => forward[i])) : null,
+      labels: labelsInside,
+    };
+  }
+  return { byLabel, byState, base: describeReturns(forward) };
 }
 
 /** The verdict a Technical score implies, with the two price-based safety rules applied. */
@@ -156,7 +214,7 @@ export function summariseBacktest(scores, verdicts, forward) {
  * The verdict's track record for one asset.
  * @param {{ ticker:string, assetClass:string, series:{dates:string[], high:number[], low:number[], close:number[]}, longSeries:{dates:string[], close:number[]} }} asset
  */
-export function backtestAsset(asset) {
+export function backtestAsset(asset, { regimeOf = () => null } = {}) {
   const id = 'verdictBacktest';
   const label = 'Verdict track record (backtest)';
   const horizon = BACKTEST_CONFIG.horizon;
@@ -169,35 +227,47 @@ export function backtestAsset(asset) {
 
   const scores = [];
   const verdicts = [];
+  const labels = [];
+  const states = [];
   const forward = [];
   const days = [];
   let lastPoint = null;
   for (let t = window - 1; t < long.close.length; t += 1) {
     const from = t - window + 1;
     const point = technicalScoreAt(long.close.slice(from, t + 1), highs.slice(from, t + 1), lows.slice(from, t + 1));
-    if (t === long.close.length - 1) lastPoint = { ...point, verdict: technicalVerdict(point, long.close[t]) };
+    if (t === long.close.length - 1) lastPoint = { ...point, verdict: technicalVerdict(point, long.close[t]), label: classifyTrend(point) };
     if (!isNum(point.score) || t + horizon >= long.close.length) continue;
     scores.push(point.score);
     verdicts.push(technicalVerdict(point, long.close[t]));
+    labels.push(classifyTrend(point));
+    states.push(regimeOf(long.dates[t]));
     forward.push(long.close[t + horizon] / long.close[t] - 1);
     days.push(long.dates[t]);
   }
 
-  const result = { ticker: asset.ticker, lastScore: lastPoint ? lastPoint.score : null, lastVerdict: lastPoint ? lastPoint.verdict : null, days: days.length };
+  const result = {
+    ticker: asset.ticker, lastScore: lastPoint ? lastPoint.score : null, lastVerdict: lastPoint ? lastPoint.verdict : null,
+    lastLabel: lastPoint ? lastPoint.label : null, days: days.length,
+    span: days.length ? { from: days[0], to: days[days.length - 1] } : null,
+  };
+  const recordId = 'regimeRecord';
+  const recordLabel = 'Regime track record (backtest)';
+  const recordFormula = `Average return over the next ${horizon} sessions after each past day with the same trend regime, overall and within each VIX regime`;
   if (days.length < BACKTEST_CONFIG.minScoredDays) {
+    const reason = `Only ${days.length} past days have both a full year of history behind them and a ${horizon}-day outcome; at least ${BACKTEST_CONFIG.minScoredDays} are needed. ${historyCount <= 0 ? 'This snapshot holds no history older than the current year.' : ''}`.trim();
     return {
       ...result,
       summary: null,
+      regimes: null,
       metrics: {
-        [id]: notAvailable({
-          id, label, unit: 'ratio', formula,
-          reason: `Only ${days.length} past days have both a full year of history behind them and a ${horizon}-day outcome; at least ${BACKTEST_CONFIG.minScoredDays} are needed. ${historyCount <= 0 ? 'This snapshot holds no history older than the current year.' : ''}`.trim(),
-        }),
+        [id]: notAvailable({ id, label, unit: 'ratio', formula, reason }),
+        [recordId]: notAvailable({ id: recordId, label: recordLabel, unit: 'pct', formula: recordFormula, reason }),
       },
     };
   }
 
   const summary = summariseBacktest(scores, verdicts, forward);
+  const regimes = summariseRegimes(labels, states, scores, forward);
   const { ic, tStat, independent, bands, base } = summary;
   const meaningful = isNum(tStat) && Math.abs(tStat) >= 2 && Math.abs(ic) >= BACKTEST_CONFIG.noiseIc;
   let tone = 'neutral';
@@ -217,7 +287,9 @@ export function backtestAsset(asset) {
   return {
     ...result,
     summary,
+    regimes,
     metrics: {
+      [recordId]: regimeRecordMetric(asset, result.lastLabel, regimes, { days, horizon, recordId, recordLabel, recordFormula }),
       [id]: traced({
         id, label, value: ic, unit: 'ratio', tone,
         meta: { ...summary, from: days[0], to: days[days.length - 1], horizon, window, meaningful },
@@ -251,16 +323,74 @@ export function backtestAsset(asset) {
   };
 }
 
+/** What followed the asset's current trend regime, and every other one, as a traced metric. */
+function regimeRecordMetric(asset, current, regimes, { days, horizon, recordId, recordLabel, recordFormula }) {
+  const { byLabel, byState, base } = regimes;
+  const pct = (value) => (isNum(value) ? `${value >= 0 ? '+' : ''}${fmtPct(value, 2)}` : 'N/A');
+  const meta = { label: current, horizon, n: days.length, from: days[0], to: days[days.length - 1], base, byLabel, byState };
+  const own = current ? byLabel[current] : null;
+  if (!own || own.count < BACKTEST_CONFIG.minLabelDays) {
+    return notAvailable({
+      id: recordId, label: recordLabel, unit: 'pct', formula: recordFormula, meta,
+      reason: current
+        ? `Only ${own ? own.count : 0} of the ${days.length} past days were in a ${current} regime; at least ${BACKTEST_CONFIG.minLabelDays} are needed to report what followed.`
+        : 'The current trend regime is not defined yet.',
+    });
+  }
+  const stateSteps = REGIME_STATES.filter((state) => byState[state].count > 0).map((state) => {
+    const inside = byState[state].labels[current];
+    return step(`Within ${state} VIX regimes`, `${byState[state].count} days, ${inside.count} of them ${current}`,
+      inside.count >= BACKTEST_CONFIG.minLabelDays ? `${pct(inside.mean)} after ${current} days · ${pct(byState[state].mean)} on all` : `too few ${current} days`);
+  });
+  return traced({
+    id: recordId, label: recordLabel, value: own.mean, unit: 'pct', tone: 'neutral',
+    meta,
+    formula: recordFormula,
+    rawInputs: [
+      input('Days replayed', days.length, 'days', `${days[0]} to ${days[days.length - 1]}, each labelled from the window ending that day`),
+      input('Average return over all those days', base.mean, 'fraction', `${horizon}-session forward returns`),
+    ],
+    steps: [
+      ...TREND_REGIMES.map((label) => step(`${label} days`, `${byLabel[label].count} days`,
+        byLabel[label].count ? `${pct(byLabel[label].mean)} on average, rose ${fmtPct(byLabel[label].upShare, 0)} of the time` : 'none')),
+      step('All days', `${base.count} days`, `${pct(base.mean)} on average`),
+      ...stateSteps,
+    ],
+    interpretation: interpretation(
+      `After ${current} days, ${asset.ticker} moved ${pct(own.mean)} on average over the next ${horizon} sessions, against ${pct(base.mean)} on all ${base.count} days (${own.count} were ${current}).`,
+      [],
+      `What followed, not a forecast: the label describes the trend. Over 2022–2026 no trend regime, and no simple trend or momentum signal, predicted the next month on this watchlist. Overlapping ${horizon}-day windows share days, and stressed VIX regimes cover only a few short episodes, so their averages rest on very little.`,
+    ),
+  });
+}
+
+/** Contiguous runs of each VIX regime between two dates, from the stored history. */
+export function regimeEpisodes(regime, from, to) {
+  const counts = Object.fromEntries(REGIME_STATES.map((state) => [state, { sessions: 0, episodes: 0 }]));
+  if (!regime || !regime.history || !regime.rules) return counts;
+  const { dates, vix, vix3m } = regime.history;
+  let previous = null;
+  for (let i = 0; i < dates.length; i += 1) {
+    if (dates[i] < from || dates[i] > to) continue;
+    const state = classifyRegime(vix[i], vix3m[i], regime.rules);
+    counts[state].sessions += 1;
+    if (state !== previous) counts[state].episodes += 1;
+    previous = state;
+  }
+  return counts;
+}
+
 /**
  * Backtest every asset of the watchlist (run in the Web Worker).
- * @param {{ assets: object[] }} payload
+ * @param {{ assets: object[], regime?: object }} payload regime: the normalised macro.regime, for the VIX split
  */
-export function backtestWatchlist({ assets }) {
+export function backtestWatchlist({ assets, regime = null }) {
   const byTicker = {};
   const ics = [];
   const pooled = { BUY: [], HOLD: [], SELL: [], all: [] };
+  const regimeOf = regimeLookup(regime);
   for (const asset of Array.isArray(assets) ? assets : []) {
-    const result = backtestAsset(asset);
+    const result = backtestAsset(asset, { regimeOf });
     byTicker[asset.ticker] = result;
     if (result.summary && isNum(result.summary.ic)) ics.push(result.summary.ic);
   }
@@ -276,9 +406,36 @@ export function backtestWatchlist({ assets }) {
     const count = list.reduce((total, item) => total + item.count, 0);
     return count ? { count, mean: list.reduce((total, item) => total + item.count * item.mean, 0) / count } : { count: 0, mean: null };
   };
+  // Pool the regime track record: by trend label, and by label within each VIX regime.
+  const results = Object.values(byTicker).filter((result) => result.regimes);
+  const labels = {};
+  for (const label of TREND_REGIMES) {
+    labels[label] = weighted(results.map((result) => result.regimes.byLabel[label]).filter((band) => band.count).map((band) => ({ count: band.count, mean: band.mean })));
+  }
+  const states = {};
+  for (const state of REGIME_STATES) {
+    const icList = results.map((result) => result.regimes.byState[state].ic).filter(isNum);
+    const stateLabels = {};
+    for (const label of TREND_REGIMES) {
+      stateLabels[label] = weighted(results.map((result) => result.regimes.byState[state].labels[label]).filter((band) => band.count).map((band) => ({ count: band.count, mean: band.mean })));
+    }
+    states[state] = {
+      ...weighted(results.map((result) => result.regimes.byState[state]).filter((band) => band.count).map((band) => ({ count: band.count, mean: band.mean }))),
+      meanIc: icList.length ? mean(icList) : null,
+      icAssets: icList.length,
+      labels: stateLabels,
+    };
+  }
+  const span = results.length ? { from: results.map((result) => result.span.from).sort()[0], to: results.map((result) => result.span.to).sort().at(-1) } : null;
+  const episodes = span ? regimeEpisodes(regime, span.from, span.to) : null;
+  if (episodes) for (const state of REGIME_STATES) Object.assign(states[state], episodes[state]);
   return {
     byTicker,
     summary: {
+      labels,
+      states,
+      span,
+      regimeAvailable: Boolean(regime && regime.history && regime.history.dates && regime.history.dates.length),
       assets: ics.length,
       meanIc: ics.length ? mean(ics) : null,
       positiveIc: ics.filter((ic) => ic > 0).length,

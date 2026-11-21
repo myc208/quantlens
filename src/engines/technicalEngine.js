@@ -28,6 +28,7 @@ import {
 import {
   traced, notAvailable, input, step, threshold, interpretation, valueOf, fmtN, fmtPct,
 } from '../core/derivationTracer.js';
+import { traceTrendRegime } from './trendRegimeEngine.js';
 
 export const TECH_CONFIG = Object.freeze({
   smaPeriods: Object.freeze([50, 200]),
@@ -972,6 +973,11 @@ export function analyzeTechnicals(asset) {
   metrics.rsiScore = traceRsiScore(ctx, metrics.rsi14);
   metrics.rangeScore = traceRangeScore(ctx, metrics.range52w);
   metrics.technicalScore = traceTechnicalScore(ctx, metrics);
+  // V3.3: the trend regime, a description of where the price stands (not a forecast).
+  metrics.trendRegime = traceTrendRegime(asset, {
+    close: close[ctx.last], sma200: valueOf(metrics.sma200), ema20: valueOf(metrics.ema20), ema50: valueOf(metrics.ema50),
+    rsi: valueOf(metrics.rsi14), asOf: series.dates[ctx.last] ?? null,
+  });
 
   return {
     ticker: asset.ticker,

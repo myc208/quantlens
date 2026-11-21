@@ -155,6 +155,8 @@ SENTIMENT_LABELS = {"positive", "neutral", "negative"}
 # session has closed (plus a buffer for Yahoo's delayed quotes).
 SESSION_CLOSE = {"US": dtime(16, 0), "SG": dtime(17, 0), "UK": dtime(16, 30)}
 SESSION_OPEN = {"US": dtime(9, 30), "SG": dtime(9, 0), "UK": dtime(8, 0)}
+# US half days (from the macro calendar's market-early-close entries) close at 1:00 p.m. New York.
+EARLY_CLOSE = {"US": dtime(13, 0)}
 MARKET_TIMEZONES = {"US": "America/New_York", "SG": "Asia/Singapore", "UK": "Europe/London"}
 CLOSE_BUFFER_MINUTES = 20
 
@@ -474,7 +476,22 @@ def fetch_history(symbol: str, period: str, interval: str, timeout: float = 10) 
     return frame
 
 
-def build_candles(history: pd.DataFrame, market: str, now_utc: datetime) -> list[list[Any]]:
+def session_close(market: str, day: str, early_closes: frozenset[str] = frozenset()) -> dtime:
+    """When the market's session ends on a local date: 1:00 p.m. on a US half day, the usual close otherwise."""
+    if day in early_closes and market in EARLY_CLOSE:
+        return EARLY_CLOSE[market]
+    return SESSION_CLOSE.get(market, dtime(23, 59))
+
+
+def early_close_dates(calendar: Any, market: str = "US") -> frozenset[str]:
+    """The half days of a market listed in the macro calendar block (empty if it is unavailable)."""
+    if not isinstance(calendar, dict) or calendar.get("status") != "fresh":
+        return frozenset()
+    return frozenset(event["date"] for event in calendar.get("events", [])
+                     if isinstance(event, dict) and event.get("type") == "market-early-close" and event.get("market") == market)
+
+
+def build_candles(history: pd.DataFrame, market: str, now_utc: datetime, early_closes: frozenset[str] = frozenset()) -> list[list[Any]]:
     """Convert a yfinance history frame to ``[date, o, h, l, c, v]`` rows.
 
     Drops rows with missing or non-positive prices, repairs high/low so that
@@ -514,7 +531,7 @@ def build_candles(history: pd.DataFrame, market: str, now_utc: datetime) -> list
         today_utc = now_utc.strftime("%Y-%m-%d")
         candles = [c for c in candles if c[0] < today_utc]
     elif candles[-1][0] == today_local:
-        close_at = SESSION_CLOSE.get(market, dtime(23, 59))
+        close_at = session_close(market, today_local, early_closes)
         cutoff_minutes = close_at.hour * 60 + close_at.minute + CLOSE_BUFFER_MINUTES
         now_minutes = local_now.hour * 60 + local_now.minute
         if now_minutes < cutoff_minutes:
@@ -802,7 +819,7 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
         f"{symbol} price history",
         lambda: fetch_history(symbol, history_cfg["period"], history_cfg["interval"], settings.request_timeout),
         settings.max_retries, settings.retry_delay, deadline)
-    candles, older = split_history(build_candles(history, entry["market"], now_utc))
+    candles, older = split_history(build_candles(history, entry["market"], now_utc, getattr(settings, "early_closes", frozenset())))
     if len(candles) < MIN_CANDLES:
         raise FetchError(f"{symbol} has only {len(candles)} completed candles (minimum {MIN_CANDLES})")
     dividends = dividend_rows(history, candles[-1][0]) if pays_out else []
@@ -1615,9 +1632,9 @@ def empty_regime(note: str) -> dict[str, Any]:
             "historyFields": list(REGIME_HISTORY_FIELDS), "history": [], "note": note}
 
 
-def regime_closes(frame: pd.DataFrame, now_utc: datetime) -> dict[str, float]:
+def regime_closes(frame: pd.DataFrame, now_utc: datetime, early_closes: frozenset[str] = frozenset()) -> dict[str, float]:
     """Completed daily closes of one VIX index by date. Today's value is dropped until the
-    US close plus the usual buffer: before then it is an intraday level, not a close."""
+    US close (1:00 p.m. on a half day) plus the usual buffer: before then it is an intraday level."""
     closes: dict[str, float] = {}
     for stamp, value in frame["Close"].items():
         level = clean_number(value, digits=2)
@@ -1625,7 +1642,7 @@ def regime_closes(frame: pd.DataFrame, now_utc: datetime) -> dict[str, float]:
             closes[stamp.strftime("%Y-%m-%d")] = level
     new_york = pd.Timestamp(now_utc).tz_convert(MARKET_TIMEZONES["US"])
     today = new_york.strftime("%Y-%m-%d")
-    close_at = SESSION_CLOSE["US"]
+    close_at = session_close("US", today, early_closes)
     if today in closes and new_york.hour * 60 + new_york.minute < close_at.hour * 60 + close_at.minute + CLOSE_BUFFER_MINUTES:
         del closes[today]
     return closes
@@ -1671,7 +1688,7 @@ def fetch_regime(settings: argparse.Namespace, now_utc: datetime) -> dict[str, A
             frame = with_retry(f"{symbol} level",
                                lambda symbol=symbol: fetch_history(symbol, REGIME_HISTORY_PERIOD, "1d", settings.request_timeout),
                                settings.max_retries, settings.retry_delay, deadline)
-            series[role] = regime_closes(frame, now_utc)
+            series[role] = regime_closes(frame, now_utc, getattr(settings, "early_closes", frozenset()))
         except Exception as exc:  # noqa: BLE001
             if role != "short":
                 raise FetchError(f"{symbol} unavailable: {str(exc)[:160]}") from exc
@@ -3408,10 +3425,13 @@ def main(argv: list[str] | None = None) -> int:
     for currency, entry in macro["riskFree"].items():
         shown = "unavailable" if entry["yield"] is None else f"{entry['yield'] * 100:.2f}%"
         LOG.info("risk-free %s: %s [%s] %s", currency, shown, entry["status"], entry["name"])
+    # The calendar is read first: its US half days decide when today's session counts as complete.
+    calendar = build_calendar(settings.calendar, now_utc)
+    settings.early_closes = early_close_dates(calendar, "US")
     macro["regime"] = build_regime(previous, settings, now_utc)
     LOG.info("market regime: %s, %d sessions of history", regime_summary(macro["regime"]), len(macro["regime"]["history"]))
-    macro["calendar"] = build_calendar(settings.calendar, now_utc)
-    LOG.info("macro calendar: %s, %d events", calendar_summary(macro["calendar"], now_utc), len(macro["calendar"]["events"]))
+    macro["calendar"] = calendar
+    LOG.info("macro calendar: %s, %d events, %d US half days", calendar_summary(calendar, now_utc), len(calendar["events"]), len(settings.early_closes))
 
     assets: list[dict[str, Any]] = []
     refreshed: list[dict[str, Any]] = []

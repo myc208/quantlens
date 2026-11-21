@@ -599,7 +599,10 @@ function submitBacktest(snapshot) {
     series: { dates: asset.series.dates, high: asset.series.high, low: asset.series.low, close: asset.series.close },
     longSeries: asset.longSeries,
   }));
-  jobs.submit('backtest', jobKey('backtest', snapshot.generatedAt, assets.length), 'backtest', { assets });
+  // The VIX history splits the track record by regime (normal, elevated, stressed).
+  const regime = snapshot.macro && snapshot.macro.regime && snapshot.macro.regime.status !== 'unavailable'
+    ? { history: snapshot.macro.regime.history, rules: snapshot.macro.regime.rules } : null;
+  jobs.submit('backtest', jobKey('backtest', snapshot.generatedAt, assets.length), 'backtest', { assets, regime });
 }
 
 store.subscribe((next, previous) => {

@@ -24,7 +24,7 @@ import sys
 import time
 import unittest
 import urllib.error
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -1713,6 +1713,43 @@ class RiskFirstBriefing(unittest.TestCase):
             self.assertIsNotNone(row["nextEarnings"]["tradingDays"])
         self.assertTrue(any(row["nextExDividend"] for row in signals))
         self.assertTrue(any(row["relativeStrength3m"] is not None for row in signals))
+
+
+class EarlyCloses(unittest.TestCase):
+    """US half days from the macro calendar end the session at 1:00 p.m. New York (V3.3)."""
+
+    @staticmethod
+    def us_frame(last_day: str):
+        index = pd.DatetimeIndex([pd.Timestamp("2026-11-25", tz="America/New_York"), pd.Timestamp(last_day, tz="America/New_York")])
+        return pd.DataFrame({"Open": [10.0, 11.0], "High": [10.5, 11.5], "Low": [9.5, 10.5], "Close": [10.2, 11.2], "Volume": [100, 100]}, index=index)
+
+    def test_session_close_on_a_half_day(self):
+        half = frozenset({"2026-11-27"})
+        self.assertEqual(ff.session_close("US", "2026-11-27", half), dtime(13, 0))
+        self.assertEqual(ff.session_close("US", "2026-11-25", half), dtime(16, 0))
+        self.assertEqual(ff.session_close("SG", "2026-11-27", half), dtime(17, 0))   # SGX is not a US half day
+
+    def test_half_days_come_from_the_calendar(self):
+        block = ff.build_calendar(ff.DEFAULT_CALENDAR, datetime(2026, 11, 22, tzinfo=timezone.utc))
+        self.assertEqual(ff.early_close_dates(block), frozenset({"2026-11-27", "2026-12-24", "2027-11-26"}))
+        self.assertEqual(ff.early_close_dates(ff.empty_calendar("down")), frozenset())
+        self.assertEqual(ff.early_close_dates(None), frozenset())
+
+    def test_a_half_day_candle_is_kept_after_1_20_pm_not_before(self):
+        half = frozenset({"2026-11-27"})
+        frame = self.us_frame("2026-11-27")
+        before = datetime(2026, 11, 27, 18, 15, tzinfo=timezone.utc)   # 1:15 p.m. in New York (EST)
+        after = datetime(2026, 11, 27, 18, 25, tzinfo=timezone.utc)    # 1:25 p.m.: closed at 1:00, past the buffer
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "US", before, half)], ["2026-11-25"])
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "US", after, half)], ["2026-11-25", "2026-11-27"])
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "US", after)], ["2026-11-25"])   # a normal day closes at 4:00
+
+    def test_the_vix_close_follows_the_same_rule(self):
+        index = pd.DatetimeIndex([pd.Timestamp("2026-11-25", tz="America/Chicago"), pd.Timestamp("2026-11-27", tz="America/Chicago")])
+        frame = pd.DataFrame({"Close": [24.5, 26.0]}, index=index)
+        after = datetime(2026, 11, 27, 18, 25, tzinfo=timezone.utc)
+        self.assertEqual(ff.regime_closes(frame, after, frozenset({"2026-11-27"})), {"2026-11-25": 24.5, "2026-11-27": 26.0})
+        self.assertEqual(ff.regime_closes(frame, after), {"2026-11-25": 24.5})
 
 
 if __name__ == "__main__":
