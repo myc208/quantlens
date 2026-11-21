@@ -184,6 +184,7 @@ flowchart LR
 ```
 .github/workflows/update-market-data.yml   refresh, two test gates, deploy to Pages, Telegram briefing
 scripts/watchlist.json                     the 30 assets to track
+scripts/macro_calendar.json                FOMC decisions and minutes, US CPI releases, NYSE and SGX holidays (kept by hand)
 scripts/fetch_fundamentals.py              prices, history, dividends, events, statements, news, yields,
                                            forecasts -> validated JSON; --notify sends the Telegram briefing
 scripts/signals.mjs                        runs the site's engines in Node.js for the briefing's signals
@@ -605,7 +606,7 @@ A stop-loss assumes the price passes through it. An earnings release can gap the
 | `after-close` | close of the next session ÷ close of the release day |
 | `unknown` | close of the session after ÷ close of the session before: two sessions, so the move is captured either way |
 
-**Estimating the ex-dividend date.** Yahoo lists a future ex-date for few stocks (5 of the 18 payers on 21 November 2026). Otherwise the date is estimated as the last ex-date plus the median gap between the last nine payments (gaps outside 20 to 400 days are ignored), rolled forward at most twice, and labelled as an estimate. Trading days are counted as weekdays; exchange holidays are not known, so a count can run a day or two long, and the trace says so.
+**Estimating the ex-dividend date.** Yahoo lists a future ex-date for few stocks (5 of the 18 payers on 21 November 2026). Otherwise the date is estimated as the last ex-date plus the median gap between the last nine payments (gaps outside 20 to 400 days are ignored), rolled forward at most twice, and labelled as an estimate. Trading days are counted as weekdays less the market's holidays from the macro calendar (NYSE for US listings, SGX for Singapore); London's holidays are not listed, so a count for `CSPX.L` can run a day long.
 
 What the 21 November 2026 snapshot shows:
 
@@ -613,6 +614,24 @@ What the 21 November 2026 snapshot shows:
 - **Size.** Typical earnings-day moves range from 1.2% (`U11.SI`) to 9.8% (`ORCL`). The worst falls on record include −17.3% for `AMD` and −16.2% for `MU`.
 - **What it means for sizing.** The gap matters most where the stop is tight compared with the stock's earnings history. With the default stop of 2 × ATR, `WMT`'s worst earnings-day fall (−11.4%) is 2.5 times its stop distance, `C6L.SI`'s (−9.5%) 2.4 times and `LLY`'s (−14.1%) 2.2 times: a repeat would cost more than twice the planned 1R loss, because a gap does not stop at the stop. At the other end, `MU`'s worst fall (−16.2%) is 0.8 times its stop distance: after its recent swings, its ATR stop is already wider than its worst earnings gap. The gap-risk row puts the number next to the planned loss either way.
 - **Inside the sizing horizon.** `MU` (around 17 December, after the close) and `ORCL` (around 14 December) report within the next 21 trading days, so their sizing rows, simulation and projection all carry the warning.
+
+### The macro calendar: FOMC, CPI and market holidays
+
+Company events are not the only scheduled gaps. `scripts/macro_calendar.json` holds the Federal Reserve's rate decisions and minutes, the US CPI releases, and the weekday closures of the NYSE and SGX, transcribed from the Fed, BLS, NYSE and Ministry of Manpower pages it links to. It is kept by hand, like the watchlist, and copied into an optional `macro.calendar` block of the snapshot on every run (the last 30 days and everything ahead).
+
+```jsonc
+{ "type": "fomc-decision", "date": "2026-12-09", "at": "2026-12-09T14:00:00-05:00", "meeting": "2026-12-08/09", "projections": true }
+{ "type": "cpi",           "date": "2026-12-10", "at": "2026-12-10T08:30:00-05:00", "period": "2026-11" }
+{ "type": "fomc-meeting",  "date": "2027-10-27", "meeting": "2027-10-26/27", "decision": false }
+{ "type": "market-holiday", "date": "2026-11-26", "market": "US", "name": "Thanksgiving Day" }
+```
+
+- **Times carry their UTC offset**, so nothing downstream does daylight-saving arithmetic. Gate 1 checks every offset against New York's rules, every CPI at 8:30 a.m., every decision on the second day of its meeting, and every derived minutes date at three weeks after its decision.
+- **What is in it and what is not.** Projections are marked only where the Fed's calendar shows them (December 2026); the 2027 meetings are not marked until it does. The Fed's revised 2027 schedule has no December meeting, and its October meeting is a strategy meeting with no policy decision, so it is listed but never treated as market-moving. 2027 minutes dates follow the Fed's stated rule and are flagged `derived` until the calendar lists them.
+- **It never fails a run.** An unreadable or invalid file gives an unavailable block and a warning. Coverage is checked against the file's own `updated` date, not today's, so the tests do not start failing as time passes; when the calendar is within 60 days of running out, the step summary and the explanation view say so.
+- **On the site:** a **Next macro** pill in the top bar (amber within 48 hours) opens the next FOMC decision or CPI release with its time in New York and Singapore, the US trading days until then and what else is due in the next 7 days. The Events section repeats it for each compared asset and says when it falls inside the 21-day sizing horizon, and the risk sandbox notes when the first simulated horizon contains it.
+- **Holidays make trading-day counts exact.** Thanksgiving week has four US sessions, not five, which matters for "earnings within 5 trading days".
+- Context only, like the regime: it changes no score, verdict or position size.
 
 Where it appears: an **Events** section in the comparison, a **gap-risk** row in sizing, a warning on the projection when earnings fall inside its 30 days, a banner above the Monte Carlo fan when a release falls inside the simulated horizon, an `Earnings 23d` chip on the leaderboard, and an earnings section in the Telegram briefing.
 

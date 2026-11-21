@@ -290,8 +290,12 @@ export function mountRiskSandboxModal(dialog, app) {
     ? ` On past release days ${esc(ticker)} moved ${esc(h.formatPercent(earningsMove.value, 1))} either way (median), and fell as much as ${esc(h.formatPercent(-earningsMove.meta.worst, 1))}.` : ''} A gap can open below the stop.</p>
         </div>
       </div>` : '';
+    const macro = app.trace(ticker, 'nextMacroEvent');
+    const macroNote = macro && macro.status === 'ok' && macro.meta.insideSizing ? `
+      <p class="alloc__note">${h.toneMark(macro.meta.within48h ? 'caution' : 'neutral')} ${esc(macro.meta.title)} on ${esc(h.shortDate(macro.meta.date))} falls inside the first ${21}-day horizon. These paths contain no announcement-day jump.</p>` : '';
     const html = `
       ${eventWarning}
+      ${macroNote}
       <div class="${stale ? 'is-stale' : ''}" data-role="simulation">
       <div>
         <div class="sandbox__block-title">

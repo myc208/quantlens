@@ -1408,5 +1408,123 @@ class MarketRegime(unittest.TestCase):
             self.assertGreater(len(regime["history"]), 1000)                 # five years, not one
 
 
+class MacroCalendar(unittest.TestCase):
+    """scripts/macro_calendar.json and the macro.calendar block (V3.2)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.calendar = ff.load_json(ff.DEFAULT_CALENDAR)
+
+    def mutated(self, change):
+        calendar = copy.deepcopy(self.calendar)
+        change(calendar)
+        return ff.validate_macro_calendar(calendar)
+
+    def event(self, kind):
+        return next(event for event in self.calendar["events"] if event["type"] == kind)
+
+    def test_the_committed_calendar_is_valid_and_spans_both_offsets(self):
+        self.assertEqual(ff.validate_macro_calendar(self.calendar), [])
+        offsets = {event["at"][-6:] for event in self.calendar["events"] if "at" in event}
+        self.assertEqual(offsets, {"-05:00", "-04:00"})                       # winter and summer time both present
+        kinds = {event["type"] for event in self.calendar["events"]}
+        self.assertTrue({"fomc-decision", "fomc-minutes", "cpi", "market-holiday", "fomc-meeting"} <= kinds)
+
+    def test_every_time_carries_new_yorks_offset_for_that_day(self):
+        self.assertEqual(ff.new_york_offset("2027-03-13", "08:30"), "-05:00")   # the Saturday before the clocks change
+        self.assertEqual(ff.new_york_offset("2027-03-15", "08:30"), "-04:00")
+        self.assertEqual(ff.new_york_offset("2027-11-08", "14:00"), "-05:00")
+        bad = dict(self.event("cpi"), date="2027-04-13", at="2027-04-13T08:30:00-05:00", period="2027-03")
+        self.assertTrue(any("08:30:00-04:00" in error for error in ff.validate_calendar_event(bad, "e")))
+        late = dict(self.event("cpi"), at=self.event("cpi")["at"].replace("08:30", "09:00"))
+        self.assertTrue(ff.validate_calendar_event(late, "e"))               # CPI is always 08:30
+
+    def test_fomc_rules(self):
+        decision = self.event("fomc-decision")
+        self.assertEqual(ff.meeting_days("2026-12-08/09"), (date(2026, 12, 8), date(2026, 12, 9)))
+        self.assertEqual(ff.meeting_days("2027-04-30/01"), (date(2027, 4, 30), date(2027, 5, 1)))  # across a month end
+        self.assertIsNone(ff.meeting_days("2026-12-08/10"))
+        wrong_day = dict(decision, date="2026-12-08", at="2026-12-08T14:00:00-05:00")
+        self.assertTrue(any("second day" in error for error in ff.validate_calendar_event(wrong_day, "e")))
+        self.assertTrue(ff.validate_calendar_event(dict(decision, projections=False), "e"))
+        no_decision = {"type": "fomc-meeting", "date": "2027-10-27", "meeting": "2027-10-26/27", "decision": True}
+        self.assertTrue(ff.validate_calendar_event(no_decision, "e"))
+        strategy = [event for event in self.calendar["events"] if event["type"] == "fomc-meeting"]
+        self.assertEqual([event["date"] for event in strategy], ["2027-10-27"])   # no decision at the strategy meeting
+        self.assertNotIn("at", strategy[0])
+
+    def test_derived_minutes_are_three_weeks_after_the_decision(self):
+        def shift(calendar):
+            minutes = next(event for event in calendar["events"] if event["type"] == "fomc-minutes" and event.get("derived"))
+            minutes["date"] = "2027-02-18"
+            minutes["at"] = "2027-02-18T14:00:00-05:00"
+        self.assertTrue(any("21 days" in error for error in self.mutated(shift)))
+
+    def test_structure_order_and_duplicates(self):
+        self.assertTrue(self.mutated(lambda c: c["events"].reverse()))
+        self.assertTrue(self.mutated(lambda c: c["events"].append(copy.deepcopy(c["events"][-1]))))
+        self.assertTrue(self.mutated(lambda c: c["events"][0].update(type="nfp")))
+        self.assertTrue(self.mutated(lambda c: c["events"][0].update(extra=1)))
+        self.assertTrue(self.mutated(lambda c: c.update(extra=1)))
+        self.assertTrue(self.mutated(lambda c: c["sources"].update(fomc="http://insecure.example")))
+        weekend = {"type": "market-holiday", "date": "2027-05-01", "market": "SG", "name": "Labour Day"}
+        self.assertTrue(any("weekend" in error for error in ff.validate_calendar_event(weekend, "e")))
+        old_period = dict(self.event("cpi"), period=self.event("cpi")["date"][:7])
+        self.assertTrue(ff.validate_calendar_event(old_period, "e"))          # CPI reports an earlier month
+
+    def test_coverage_is_judged_against_the_files_own_date_not_today(self):
+        self.assertTrue(any("60 days" in error for error in self.mutated(lambda c: c.update(updated="2027-11-15"))))
+        self.assertEqual(self.mutated(lambda c: c.update(updated="2026-01-15")), [])
+        outside = self.mutated(lambda c: c["coverage"].update(to="2027-06-30"))
+        self.assertTrue(any("outside the coverage" in error for error in outside))
+
+    def test_the_snapshot_block_keeps_the_last_30_days_and_warns_when_the_calendar_runs_out(self):
+        now = datetime(2026, 12, 15, 22, 30, tzinfo=timezone.utc)
+        block = ff.build_calendar(ff.DEFAULT_CALENDAR, now)
+        self.assertEqual(ff.validate_calendar_block(block), [])
+        self.assertEqual(block["status"], "fresh")
+        self.assertEqual(block["events"][0]["date"], "2026-11-18")           # 27 days back; 10 Nov is older than 30
+        self.assertIsNone(block["note"])
+        late = datetime(2027, 11, 15, 22, 30, tzinfo=timezone.utc)
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            ending = ff.build_calendar(ff.DEFAULT_CALENDAR, late)
+        self.assertIn("runs out on 2027-12-31", ending["note"])
+        self.assertIn("NEEDS UPDATING", ff.calendar_summary(ending, late))
+        self.assertEqual(ff.calendar_summary(block, now), "next FOMC 2027-01-27 · CPI 2027-01-13 (covers to 2027-12-31)")
+
+    def test_a_broken_file_never_fails_the_run(self):
+        now = datetime(2026, 11, 22, 22, 30, tzinfo=timezone.utc)
+        with self.assertLogs(ff.LOG, level="WARNING"):
+            missing = ff.build_calendar(Path("no/such/macro_calendar.json"), now)
+        self.assertEqual(missing["status"], "unavailable")
+        self.assertEqual(ff.validate_calendar_block(missing), [])
+        broken = copy.deepcopy(self.calendar)
+        broken["events"][0]["date"] = "not a date"
+        target = Path(self.id().replace(".", "_") + ".json")
+        try:
+            target.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertLogs(ff.LOG, level="WARNING"):
+                self.assertEqual(ff.build_calendar(target, now)["status"], "unavailable")
+        finally:
+            target.unlink(missing_ok=True)
+
+    def test_macro_validation_accepts_a_snapshot_without_a_calendar_and_rejects_a_bad_one(self):
+        rates = {"USD": ff.risk_free_entry("US 10-year Treasury yield", "^TNX", 0.05, "2026-11-16", "yahoo", "fresh"),
+                 "SGD": ff.risk_free_entry("Singapore 10-year SGS benchmark yield", None, 0.023, "2026-11-16", "mas", "fresh")}
+        self.assertEqual(ff.validate_macro({"riskFree": rates}), [])
+        good = ff.build_calendar(ff.DEFAULT_CALENDAR, datetime(2026, 11, 22, tzinfo=timezone.utc))
+        self.assertEqual(ff.validate_macro({"riskFree": rates, "calendar": good}), [])
+        bad = copy.deepcopy(good)
+        bad["events"][0]["date"] = "2030-01-01"
+        self.assertTrue(ff.validate_macro({"riskFree": rates, "calendar": bad}))
+
+    def test_events_render_one_per_line(self):
+        snapshot = copy.deepcopy(ff.load_json(SNAPSHOT_PATH))
+        snapshot["macro"]["calendar"] = ff.build_calendar(ff.DEFAULT_CALENDAR, datetime(2026, 11, 22, tzinfo=timezone.utc))
+        text = ff.render_snapshot(snapshot)
+        self.assertEqual(json.loads(text), snapshot)
+        self.assertIn('\n        {"type":"fomc-decision","date":"2026-12-09","at":"2026-12-09T14:00:00-05:00","meeting":"2026-12-08/09","projections":true},\n', text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

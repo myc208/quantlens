@@ -16,9 +16,11 @@ for every asset (stocks, REITs, ETFs, indices and crypto):
   the same model did over the previous 30 days (Prophet on ``log(close)``,
   weekly seasonality only, fitted by optimisation),
 
-plus three macro inputs: the US and Singapore 10-year government yields, used as
-risk-free rates; five years of daily USD/SGD closes; and the market regime, read
-from the VIX term structure (^VIX9D, ^VIX, ^VIX3M) with five years of history.
+plus four macro inputs: the US and Singapore 10-year government yields, used as
+risk-free rates; five years of daily USD/SGD closes; the market regime, read
+from the VIX term structure (^VIX9D, ^VIX, ^VIX3M) with five years of history;
+and the macro calendar (FOMC decisions and minutes, US CPI releases, NYSE and
+SGX holidays), kept by hand in scripts/macro_calendar.json and validated here.
 
 With ``--notify`` it instead sends a short daily briefing about the snapshot to
 Telegram (the market regime, top BUY and SELL signals, earnings in the next 30
@@ -98,6 +100,7 @@ except ImportError:  # pragma: no cover - exercised only when the package is mis
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WATCHLIST = REPO_ROOT / "scripts" / "watchlist.json"
 DEFAULT_OUTPUT = REPO_ROOT / "data" / "market_snapshot.json"
+DEFAULT_CALENDAR = REPO_ROOT / "scripts" / "macro_calendar.json"
 
 SCHEMA_VERSION = 3
 CANDLE_FIELDS = ["date", "open", "high", "low", "close", "volume"]
@@ -227,6 +230,26 @@ REGIME_HISTORY_PERIOD = "5y"
 REGIME_HISTORY_MAX_ROWS = 1400   # five years of sessions is about 1,255
 REGIME_STALE_LIMIT_DAYS = 5      # an older reading is not carried over
 REGIME_LEVEL_BOUNDS = (1.0, 200.0)
+
+# Macro calendar (V3.2): FOMC decisions and minutes, US CPI releases and market holidays, kept by
+# hand in scripts/macro_calendar.json and copied into macro.calendar on every run.
+CALENDAR_TYPES = {
+    # type: (required keys beyond type/date, optional keys, New York time of `at` or None)
+    "fomc-decision": ({"at", "meeting"}, {"projections"}, "14:00"),
+    "fomc-meeting": ({"meeting", "decision"}, set(), None),
+    "fomc-minutes": ({"at", "meeting"}, {"derived"}, "14:00"),
+    "cpi": ({"at", "period"}, set(), "08:30"),
+    "market-holiday": ({"market", "name"}, set(), None),
+    "market-early-close": ({"at", "market", "name"}, set(), "13:00"),
+}
+CALENDAR_MARKETS = {"US", "SG"}
+CALENDAR_FILE_KEYS = ["updated", "coverage", "sources", "notes", "events"]
+CALENDAR_BLOCK_KEYS = ["status", "updated", "coverage", "events", "note"]
+CALENDAR_LOOKBACK_DAYS = 30      # recent past events stay in the snapshot, for "since" context
+CALENDAR_WARN_DAYS = 60          # warn when the calendar runs out sooner than this
+CALENDAR_MINUTES_LAG = 21        # the Fed releases minutes three weeks after the decision
+MEETING_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})/(\d{2})$")
+PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 MONTHS = {name: number for number, name in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
 
@@ -1657,6 +1680,189 @@ def build_regime(previous: dict[str, Any] | None, settings: argparse.Namespace, 
     return empty_regime("The VIX curve could not be read in this run.")
 
 
+# --------------------------------------------------------------------------- #
+# Macro calendar: FOMC, CPI and market holidays (kept by hand, copied every run)
+# --------------------------------------------------------------------------- #
+
+def new_york_offset(day: str, hhmm: str) -> str:
+    """The UTC offset of New York at a local date and time, as "-05:00" or "-04:00"."""
+    stamp = pd.Timestamp(f"{day} {hhmm}").tz_localize(MARKET_TIMEZONES["US"])
+    minutes = int(stamp.utcoffset().total_seconds() // 60)
+    sign = "-" if minutes < 0 else "+"
+    return f"{sign}{abs(minutes) // 60:02d}:{abs(minutes) % 60:02d}"
+
+
+def meeting_days(meeting: Any) -> tuple[date, date] | None:
+    """'2026-12-08/09' -> (8 Dec 2026, 9 Dec 2026); None if malformed or not consecutive."""
+    match = MEETING_RE.match(meeting) if isinstance(meeting, str) else None
+    if not match:
+        return None
+    try:
+        first = date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+    second = first + timedelta(days=1)
+    return (first, second) if second.day == int(match.group(2)) else None
+
+
+def validate_calendar_event(event: Any, where: str) -> list[str]:
+    if not isinstance(event, dict) or event.get("type") not in CALENDAR_TYPES:
+        return [f"{where} must be an object with a type in {sorted(CALENDAR_TYPES)}"]
+    required, optional, local_time = CALENDAR_TYPES[event["type"]]
+    keys = set(event) - {"type", "date"}
+    errors: list[str] = []
+    if not is_iso_date(event.get("date")):
+        return [f"{where}.date must be an ISO date"]
+    if not required <= keys or not keys <= required | optional:
+        return [f"{where} ({event['type']}) must have {sorted(required)} and may have {sorted(optional)}"]
+    day = date.fromisoformat(event["date"])
+    if day.weekday() >= 5:
+        errors.append(f"{where} falls on a weekend")
+    if local_time is not None:
+        expected = f"{event['date']}T{local_time}:00{new_york_offset(event['date'], local_time)}"
+        if event["at"] != expected:
+            errors.append(f"{where}.at must be {expected} (New York time with its UTC offset)")
+    if "meeting" in event:
+        days = meeting_days(event["meeting"])
+        if days is None:
+            errors.append(f"{where}.meeting must look like 2026-12-08/09 (two consecutive days)")
+        elif event["type"] in {"fomc-decision", "fomc-meeting"} and days[1] != day:
+            errors.append(f"{where} must fall on the second day of its meeting")
+        elif event["type"] == "fomc-minutes" and day <= days[1]:
+            errors.append(f"{where}: minutes come after the meeting")
+    if event["type"] == "fomc-meeting" and event.get("decision") is not False:
+        errors.append(f"{where}: an fomc-meeting entry is a meeting without a decision (decision: false)")
+    for flag in ("projections", "derived"):
+        if flag in event and event[flag] is not True:
+            errors.append(f"{where}.{flag} must be true when present")
+    if event["type"] == "cpi" and not (isinstance(event["period"], str) and PERIOD_RE.match(event["period"])
+                                         and event["period"] < event["date"][:7]):
+        errors.append(f"{where}.period must be an earlier month, like 2026-11")
+    if "market" in event and event["market"] not in CALENDAR_MARKETS:
+        errors.append(f"{where}.market must be one of {sorted(CALENDAR_MARKETS)}")
+    if "name" in event and not (isinstance(event["name"], str) and event["name"].strip()):
+        errors.append(f"{where}.name must be a non-empty string")
+    return errors
+
+
+def validate_calendar_events(events: Any, coverage: dict[str, str], where: str) -> list[str]:
+    if not isinstance(events, list):
+        return [f"{where} must be a list"]
+    errors: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    last_day = ""
+    decisions: dict[str, date] = {}
+    for index, event in enumerate(events):
+        here = f"{where}[{index}]"
+        problems = validate_calendar_event(event, here)
+        if problems:
+            errors.extend(problems)
+            continue
+        if event["date"] < last_day:
+            errors.append(f"{here} is out of date order")
+        last_day = event["date"]
+        if not coverage["from"] <= event["date"] <= coverage["to"]:
+            errors.append(f"{here} lies outside the coverage {coverage['from']} to {coverage['to']}")
+        key = (event["type"], event["date"], event.get("market", ""))
+        if key in seen:
+            errors.append(f"{here} duplicates another {event['type']} on {event['date']}")
+        seen.add(key)
+        if event["type"] == "fomc-decision":
+            decisions[event["meeting"]] = date.fromisoformat(event["date"])
+        if event["type"] == "fomc-minutes" and event.get("derived"):
+            decided = decisions.get(event["meeting"])
+            if decided is not None and date.fromisoformat(event["date"]) != decided + timedelta(days=CALENDAR_MINUTES_LAG):
+                errors.append(f"{here}: derived minutes must be {CALENDAR_MINUTES_LAG} days after the decision")
+    return errors
+
+
+def validate_coverage(coverage: Any, where: str) -> list[str]:
+    if not (isinstance(coverage, dict) and sorted(coverage) == ["from", "to"] and is_iso_date(coverage.get("from"))
+            and is_iso_date(coverage.get("to")) and coverage["from"] <= coverage["to"]):
+        return [f"{where} must be {{from, to}} ISO dates in order"]
+    return []
+
+
+def validate_macro_calendar(calendar: Any) -> list[str]:
+    """The hand-kept file. Coverage is judged against the file's own `updated` date, never
+    today's, so the tests do not start failing just because time passes."""
+    if not isinstance(calendar, dict) or sorted(calendar) != sorted(CALENDAR_FILE_KEYS):
+        return [f"macro_calendar.json must contain exactly {CALENDAR_FILE_KEYS}"]
+    errors = validate_coverage(calendar["coverage"], "coverage")
+    if not is_iso_date(calendar["updated"]):
+        errors.append("updated must be an ISO date")
+    if not (isinstance(calendar["sources"], dict) and calendar["sources"]
+            and all(isinstance(url, str) and url.startswith("https://") for url in calendar["sources"].values())):
+        errors.append("sources must map names to https URLs")
+    if not (isinstance(calendar["notes"], list) and all(isinstance(note, str) for note in calendar["notes"])):
+        errors.append("notes must be a list of strings")
+    if errors:
+        return errors
+    errors.extend(validate_calendar_events(calendar["events"], calendar["coverage"], "events"))
+    horizon = date.fromisoformat(calendar["updated"]) + timedelta(days=CALENDAR_WARN_DAYS)
+    if date.fromisoformat(calendar["coverage"]["to"]) < horizon:
+        errors.append(f"coverage must reach at least {CALENDAR_WARN_DAYS} days past the updated date")
+    return errors
+
+
+def empty_calendar(note: str) -> dict[str, Any]:
+    return {"status": "unavailable", "updated": None, "coverage": None, "events": [], "note": note}
+
+
+def build_calendar(path: Path, now_utc: datetime) -> dict[str, Any]:
+    """macro.calendar for the snapshot. Never raises: an unreadable or invalid file gives an
+    unavailable block and a warning, never a failed run."""
+    try:
+        calendar = load_json(path)
+    except (OSError, ValueError) as exc:
+        warn(f"macro calendar unreadable ({exc}); the snapshot has no macro calendar")
+        return empty_calendar("The macro calendar could not be read.")
+    errors = validate_macro_calendar(calendar)
+    if errors:
+        warn(f"macro calendar invalid ({'; '.join(errors[:3])}); the snapshot has no macro calendar")
+        return empty_calendar("The macro calendar file is invalid.")
+    today = now_utc.date()
+    since = (today - timedelta(days=CALENDAR_LOOKBACK_DAYS)).isoformat()
+    events = [event for event in calendar["events"] if event["date"] >= since]
+    note = None
+    if date.fromisoformat(calendar["coverage"]["to"]) < today + timedelta(days=CALENDAR_WARN_DAYS):
+        note = (f"The macro calendar runs out on {calendar['coverage']['to']}: "
+                "add the next year's dates to scripts/macro_calendar.json.")
+        warn(note)
+    return {"status": "fresh", "updated": calendar["updated"], "coverage": dict(calendar["coverage"]), "events": events, "note": note}
+
+
+def validate_calendar_block(block: Any) -> list[str]:
+    where = "macro.calendar"
+    if not isinstance(block, dict) or sorted(block) != sorted(CALENDAR_BLOCK_KEYS):
+        return [f"{where} must contain exactly the documented keys"]
+    if block["status"] not in {"fresh", "unavailable"}:
+        return [f"{where}.status must be fresh or unavailable"]
+    if block["note"] is not None and not isinstance(block["note"], str):
+        return [f"{where}.note must be a string or null"]
+    if block["status"] == "unavailable":
+        return [] if block["events"] == [] and block["coverage"] is None else [f"{where} must carry no events when unavailable"]
+    errors = validate_coverage(block["coverage"], f"{where}.coverage")
+    if not is_iso_date(block["updated"]):
+        errors.append(f"{where}.updated must be an ISO date")
+    if errors:
+        return errors
+    return validate_calendar_events(block["events"], block["coverage"], f"{where}.events")
+
+
+def calendar_summary(block: Any, now_utc: datetime) -> str:
+    """Next FOMC decision and CPI release, for logs and the step summary."""
+    if not isinstance(block, dict) or block.get("status") != "fresh":
+        return "unavailable"
+    now_iso = now_utc.isoformat()
+    parts = []
+    for kind, label in (("fomc-decision", "FOMC"), ("cpi", "CPI")):
+        upcoming = [event for event in block["events"] if event["type"] == kind
+                    and pd.Timestamp(event["at"]).tz_convert("UTC").isoformat() > now_iso]
+        parts.append(f"{label} {upcoming[0]['date']}" if upcoming else f"{label} none listed")
+    return f"next {' · '.join(parts)} (covers to {block['coverage']['to']})" + (" · NEEDS UPDATING" if block["note"] else "")
+
+
 def fetch_fx(config: dict[str, str], previous: dict[str, Any] | None, settings: argparse.Namespace) -> dict[str, Any]:
     """Latest USD/SGD rate plus one year of daily closes (for multi-currency portfolio maths)."""
     symbol = config["yahooSymbol"]
@@ -2005,6 +2211,9 @@ def validate_macro(macro: Any) -> list[str]:
     # Optional, so that a snapshot written before V3.1 still validates; the pipeline always writes it.
     if "regime" in macro:
         errors.extend(validate_regime(macro["regime"]))
+    # Likewise the macro calendar (V3.2).
+    if "calendar" in macro:
+        errors.extend(validate_calendar_block(macro["calendar"]))
     return errors
 
 
@@ -2198,6 +2407,9 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
     regime = clone["macro"].get("regime")
     if isinstance(regime, dict) and isinstance(regime.get("history"), list):
         regime["history"] = compact(regime["history"], 6, "regime")
+    calendar = clone["macro"].get("calendar")
+    if isinstance(calendar, dict) and isinstance(calendar.get("events"), list):
+        calendar["events"] = compact(calendar["events"], 6, "calendar")
     for index, asset in enumerate(clone["assets"]):
         asset["candles"] = compact(asset["candles"], 6, f"candles_{index}")
         asset["history"] = compact(asset["history"], 6, f"history_{index}")
@@ -2262,6 +2474,7 @@ def write_step_summary(snapshot: dict[str, Any], elapsed: float) -> None:
         f"Generated {snapshot['generatedAt']} in {elapsed:.0f}s · USD/SGD {snapshot['fx']['rate']} ({snapshot['fx']['asOf']})",
         f"Risk-free: USD {rate(rates['USD'])} · SGD {rate(rates['SGD'])}",
         f"Market regime: {regime_summary(snapshot['macro'].get('regime'))}",
+        f"Macro calendar: {calendar_summary(snapshot['macro'].get('calendar'), datetime.now(timezone.utc))}",
         "",
         "| Ticker | Status | Candles | Last candle | Last close | Period | News | Tone | Forecast |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -2738,6 +2951,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--notify", action="store_true",
                         help="send the daily Telegram briefing for the snapshot at --output and exit (never fails; "
                              "needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, otherwise does nothing)")
+    parser.add_argument("--calendar", type=Path, default=DEFAULT_CALENDAR,
+                        help="the hand-kept macro calendar (FOMC, CPI, market holidays) copied into the snapshot")
     parser.add_argument("--previous", type=Path, default=None,
                         help="with --notify: the snapshot before this run, to detect shifts in headline tone")
     parser.add_argument("--verbose", action="store_true")
@@ -2821,6 +3036,8 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("risk-free %s: %s [%s] %s", currency, shown, entry["status"], entry["name"])
     macro["regime"] = build_regime(previous, settings, now_utc)
     LOG.info("market regime: %s, %d sessions of history", regime_summary(macro["regime"]), len(macro["regime"]["history"]))
+    macro["calendar"] = build_calendar(settings.calendar, now_utc)
+    LOG.info("macro calendar: %s, %d events", calendar_summary(macro["calendar"], now_utc), len(macro["calendar"]["events"]))
 
     assets: list[dict[str, Any]] = []
     refreshed: list[dict[str, Any]] = []

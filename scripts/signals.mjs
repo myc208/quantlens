@@ -21,19 +21,23 @@ import { analyzeFundamentals } from '../src/engines/fundamentalEngine.js';
 import { advise } from '../src/engines/advisorEngine.js';
 import { valueOf } from '../src/core/derivationTracer.js';
 import { analyzeEvents } from '../src/engines/eventEngine.js';
+import { holidaysFor } from '../src/engines/macroCalendarEngine.js';
 
 async function main() {
   const path = process.argv[2] ?? 'data/market_snapshot.json';
   const raw = JSON.parse(await readFile(path, 'utf8'));
   const snapshot = normaliseSnapshot(raw, new Date(raw.generatedAt));
+  const calendar = snapshot.macro ? snapshot.macro.calendar : null;
+  const holidays = { US: holidaysFor(calendar, 'US'), SG: holidaysFor(calendar, 'SG') };
   const assets = snapshot.assets.map((asset) => {
     // Exactly what main.js does for each asset when the page loads.
     const technical = analyzeTechnicals(asset);
     const fundamental = analyzeFundamentals(asset, { fxRate: snapshot.fx.rate });
     const advice = advise({ asset, technical, fundamental });
     const confidence = advice.metrics.confidence;
-    // Days are counted from the snapshot's own date, so the message matches the data it describes.
-    const events = analyzeEvents(asset, { now: new Date(raw.generatedAt) }).metrics;
+    // Days are counted from the snapshot's own date, so the message matches the data it describes;
+    // trading days skip the market's holidays from the macro calendar.
+    const events = analyzeEvents(asset, { now: new Date(raw.generatedAt), holidays: holidays[asset.market] ?? null }).metrics;
     const next = events.nextEarnings;
     const move = events.earningsMove;
     return {
