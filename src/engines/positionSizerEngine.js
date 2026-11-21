@@ -12,7 +12,10 @@
  *   6. Verdict multiplier: BUY 1.0 · HOLD 0.5 · SELL 0
  *   7. Units = raw × haircut × multiplier, rounded DOWN to the lot size
  *   8. Cap: position value ≤ max position % of the account
- *   9. Outputs: units, position value, amount at risk, 2R target
+ *   9. Liquidity cap (V3.1, when volume is known): units ≤ 5% of the 20-day average volume;
+ *      above 1% the position is flagged as large enough to move the price
+ *  10. Outputs: units, position value, amount at risk, 2R target, share of daily volume,
+ *      and the round-trip cost of the spread (at least one tick each way)
  *
  * Why the haircut has that shape: n equally sized positions with average
  * pairwise correlation ρ̄ have combined risk proportional to √(n + n(n−1)ρ̄).
@@ -26,6 +29,7 @@ import { isNum, safeDiv, floorToStep, convertCurrency } from '../core/precisionM
 import {
   traced, notAvailable, input, step, threshold, interpretation, fmtN, fmtPct,
 } from '../core/derivationTracer.js';
+import { LIQUIDITY_CONFIG } from './liquidityEngine.js';
 
 export const SIZER_CONFIG = Object.freeze({
   verdictMultiplier: Object.freeze({ BUY: 1, HOLD: 0.5, SELL: 0 }),
@@ -53,6 +57,8 @@ const METRIC_SPECS = Object.freeze({
   positionValue: { label: 'Position value', unit: 'currency', formula: 'Position value = Units × Entry' },
   amountAtRisk: { label: 'Amount at risk', unit: 'currency', formula: 'Amount at risk = Units × Risk per unit' },
   target2R: { label: '2R target', unit: 'currency', formula: 'Target = Entry + 2 × Risk per unit' },
+  volumeShare: { label: 'Share of 20-day volume', unit: 'pct', formula: 'Share = Units ÷ 20-day average volume (capped at 5%, flagged above 1%)' },
+  spreadCost: { label: 'Spread cost (round trip, at least)', unit: 'currency', formula: 'Spread cost = Position value × minimum spread (one tick ÷ price)' },
 });
 
 function unavailable(asset, reason) {
@@ -78,10 +84,12 @@ function unavailable(asset, reason) {
  * @param {number} [args.comparedCount] number of assets being compared (1..3)
  * @param {number|null} [args.meanCorrelation] mean correlation of this asset with the others
  * @param {string[]} [args.correlationIds] ids of the pair metrics behind the mean, for drill-down
+ * @param {{averageVolume:number, spread:number|null, tick:number|null, asOf:string, unitName:string}|null} [args.liquidity]
+ *   liquidityEngine's summary: enables the volume cap and the spread cost (V3.1)
  */
 export function sizePosition({
   asset, entryPrice, entrySource = 'last daily close', atr, verdict, account, accountCurrency, fxRate,
-  comparedCount = 1, meanCorrelation = null, correlationIds = [],
+  comparedCount = 1, meanCorrelation = null, correlationIds = [], liquidity = null,
 }) {
   const assetCurrency = asset.currency;
   const unitName = asset.assetClass === 'crypto' ? 'coins' : 'shares';
@@ -142,7 +150,13 @@ export function sizePosition({
   const capValue = equityInAsset * capFraction;
   const capUnits = floorToStep(capValue / entryPrice, lot);
   const capBinding = roundedUnits > capUnits;
-  const units = capBinding ? capUnits : roundedUnits;
+  const cappedUnits = capBinding ? capUnits : roundedUnits;
+
+  // Step 9 (when volume is known): never more than 5% of an average day's volume.
+  const adv = liquidity && isNum(liquidity.averageVolume) && liquidity.averageVolume > 0 ? liquidity.averageVolume : null;
+  const liquidityCap = adv !== null ? floorToStep(LIQUIDITY_CONFIG.capShare * adv, lot) : null;
+  const liquidityBinding = liquidityCap !== null && cappedUnits > liquidityCap;
+  const units = liquidityBinding ? liquidityCap : cappedUnits;
 
   // Step 9: outputs.
   const positionValueAsset = units * entryPrice;
@@ -158,6 +172,7 @@ export function sizePosition({
     if (!hasVerdict) zeroReason = 'There is no verdict for this asset, so no new position is suggested.';
     else if (multiplier === 0) zeroReason = 'The verdict is SELL, so no new position is suggested.';
     else if (capUnits === 0) zeroReason = `One lot of ${fmtN(lot, 6)} ${unitName} costs ${fmtN(lot * entryPrice, 2)} ${assetCurrency}, which is more than your ${fmtN(account.maxPositionPct, 0)}% position limit (${fmtN(capValue, 2)} ${assetCurrency}).`;
+    else if (liquidityCap === 0) zeroReason = `5% of an average day's volume (${fmtN(adv, 0)} ${unitName}) is less than one lot of ${fmtN(lot, 6)}: too thinly traded to size.`;
     else zeroReason = `Your risk budget covers ${fmtN(adjustedUnits, 2)} ${unitName}, which is less than one tradable lot of ${fmtN(lot, 6)}.`;
   }
 
@@ -240,7 +255,7 @@ export function sizePosition({
   const positionSize = traced({
     id: 'positionSize', ...METRIC_SPECS.positionSize, value: units,
     tone: units === 0 ? 'caution' : verdict === 'BUY' ? 'healthy' : 'neutral',
-    meta: { unitName, lotSize: lot, capBinding, rawUnits, adjustedUnits, verdict: hasVerdict ? verdict : null, zeroReason },
+    meta: { unitName, lotSize: lot, capBinding, liquidityBinding, liquidityCap, rawUnits, adjustedUnits, verdict: hasVerdict ? verdict : null, zeroReason },
     rawInputs: [
       input('Account equity', equity, accountCurrency, 'your input (kept in memory only)'),
       input('Risk per trade', riskFraction, 'fraction', 'your input'),
@@ -261,12 +276,16 @@ export function sizePosition({
       step('6. Verdict multiplier (BUY 1, HOLD 0.5, SELL 0)', hasVerdict ? verdict : 'no verdict', multiplier),
       step(`7. Adjust, then round down to a lot of ${fmtN(lot, 6)}`, `${fmtN(rawUnits)} × ${fmtN(haircut.factor)} × ${multiplier} = ${fmtN(adjustedUnits)}`, roundedUnits),
       step(`8. Cap: position value at most ${fmtPct(capFraction, 0)} of the account`, `${fmtN(capValue, 2)} ÷ ${fmtN(entryPrice)} = at most ${fmtN(capUnits, 6)} ${unitName}`, capBinding ? `Cap applies: ${fmtN(capUnits, 6)}` : 'Within the cap'),
-      step(`9. Suggested size in ${unitName}`, capBinding ? `min(${fmtN(roundedUnits, 6)}, ${fmtN(capUnits, 6)})` : fmtN(roundedUnits, 6), units),
+      ...(liquidityCap !== null
+        ? [step(`9. Liquidity cap: at most ${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} of the 20-day average volume`, `${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} × ${fmtN(adv, 0)} = at most ${fmtN(liquidityCap, 6)} ${unitName}`, liquidityBinding ? `Cap applies: ${fmtN(liquidityCap, 6)}` : 'Within the cap')]
+        : []),
+      step(`${liquidityCap !== null ? '10' : '9'}. Suggested size in ${unitName}`,
+        capBinding || liquidityBinding ? `min(${[roundedUnits, capUnits, liquidityCap].filter((value) => value !== null).map((value) => fmtN(value, 6)).join(', ')})` : fmtN(roundedUnits, 6), units),
     ],
     interpretation: interpretation(
       units === 0
         ? zeroReason
-        : `${fmtN(units, 6)} ${unitName} costs about ${fmtN(positionValue, 2)} ${accountCurrency} (${fmtPct(pctOfAccount)} of the account) and would lose about ${fmtN(amountAtRisk, 2)} ${accountCurrency} (${fmtPct(riskPctActual)}) if the stop at ${fmtN(stop)} ${assetCurrency} is hit.${capBinding ? ' The size is limited by your maximum position cap, not by the stop distance.' : ''}`,
+        : `${fmtN(units, 6)} ${unitName} costs about ${fmtN(positionValue, 2)} ${accountCurrency} (${fmtPct(pctOfAccount)} of the account) and would lose about ${fmtN(amountAtRisk, 2)} ${accountCurrency} (${fmtPct(riskPctActual)}) if the stop at ${fmtN(stop)} ${assetCurrency} is hit.${liquidityBinding ? ` The size is limited to ${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} of an average day's volume, so that it could be traded without dominating the market.` : capBinding ? ' The size is limited by your maximum position cap, not by the stop distance.' : ''}`,
       [
         threshold('BUY', 'Full size', 'healthy'),
         threshold('HOLD', 'Half size', 'neutral'),
@@ -330,17 +349,74 @@ export function sizePosition({
     dependsOn: ['riskPerUnit'],
   });
 
+  /* ---------------- V3.1: liquidity ---------------- */
+
+  let volumeShare;
+  const share = adv !== null ? units / adv : null;
+  if (share === null) {
+    volumeShare = notAvailable({ id: 'volumeShare', ...METRIC_SPECS.volumeShare, reason: asset.assetClass === 'index' ? 'An index is not traded.' : 'No 20-day volume is available for this asset.' });
+  } else {
+    const flagged = share > LIQUIDITY_CONFIG.flagShare;
+    const daysToExit = share / 0.2; // trading a fifth of each day's volume
+    volumeShare = traced({
+      id: 'volumeShare', ...METRIC_SPECS.volumeShare, value: share, tone: liquidityBinding || flagged ? 'caution' : 'healthy',
+      meta: { averageVolume: adv, unitName, flagged, liquidityBinding, capShare: LIQUIDITY_CONFIG.capShare, flagShare: LIQUIDITY_CONFIG.flagShare, daysToExit },
+      rawInputs: [input('Units', units, unitName, 'positionSizerEngine: positionSize'), input('20-day average volume', adv, unitName, 'liquidityEngine: averageVolume', liquidity.asOf)],
+      steps: [
+        step('Units ÷ 20-day average volume', `${fmtN(units, 6)} ÷ ${fmtN(adv, 0)}`, fmtPct(share, 3)),
+        step('Days to exit, trading a fifth of each day\'s volume', `${fmtPct(share, 3)} ÷ 20%`, fmtN(daysToExit, 3)),
+      ],
+      interpretation: interpretation(
+        liquidityBinding
+          ? `The position was cut to ${fmtPct(LIQUIDITY_CONFIG.capShare, 0)} of an average day's volume, so that it could be traded without dominating the market.`
+          : flagged
+            ? `The position is ${fmtPct(share, 2)} of an average day's volume: large enough that buying or selling it in one go may move the price.`
+            : `The position is ${fmtPct(share, share < 0.0001 ? 5 : 3)} of an average day's volume: it can be bought or sold without being noticed.`,
+        [threshold(`Up to ${fmtPct(LIQUIDITY_CONFIG.flagShare, 0)}`, 'Unnoticeable', 'healthy'), threshold(`${fmtPct(LIQUIDITY_CONFIG.flagShare, 0)} – ${fmtPct(LIQUIDITY_CONFIG.capShare, 0)}`, 'May move the price', 'caution'), threshold(`${fmtPct(LIQUIDITY_CONFIG.capShare, 0)}`, 'The size is capped here', 'caution')],
+        'An average hides quiet days: on a thin session the same order is a larger share of the volume.',
+      ),
+      dependsOn: ['positionSize', 'averageVolume'],
+    });
+  }
+
+  let spreadCost;
+  const spread = liquidity && isNum(liquidity.spread) ? liquidity.spread : null;
+  if (spread === null || !isNum(positionValue)) {
+    spreadCost = notAvailable({ id: 'spreadCost', ...METRIC_SPECS.spreadCost, reason: asset.assetClass === 'crypto' || asset.market === 'UK'
+      ? 'No reliable spread is available for this market: its price grid is not modelled, and the range-based estimate overstates spreads.'
+      : 'No spread is available for this asset.' });
+  } else {
+    const cost = positionValue * spread;
+    const ofRisk = safeDiv(cost, amountAtRisk);
+    spreadCost = traced({
+      id: 'spreadCost', ...METRIC_SPECS.spreadCost, value: cost, tone: isNum(ofRisk) && ofRisk > 0.1 ? 'caution' : 'healthy',
+      meta: { currency: accountCurrency, spread, tick: liquidity.tick, ofRisk },
+      rawInputs: [input('Position value', positionValue, accountCurrency, 'positionSizerEngine: positionValue'), input('Minimum spread', spread, 'fraction', 'liquidityEngine: spreadEstimate (one tick ÷ price)', liquidity.asOf)],
+      steps: [
+        step('Position value × minimum spread', `${fmtN(positionValue, 2)} × ${fmtPct(spread, 4)}`, cost),
+        ...(isNum(ofRisk) ? [step('As a share of the amount at risk', `${fmtN(cost, 2)} ÷ ${fmtN(amountAtRisk, 2)}`, fmtPct(ofRisk, 1))] : []),
+      ],
+      interpretation: interpretation(
+        `Buying at the ask and later selling at the bid costs at least ${fmtN(cost, 2)} ${accountCurrency} in spread${isNum(ofRisk) ? `, ${fmtPct(ofRisk, 1)} of what the stop risks` : ''}.`,
+        [threshold('Up to 10% of the amount at risk', 'Small next to the risk', 'healthy'), threshold('Above 10%', 'Eats into the trade', 'caution')],
+        'A floor: one tick each way. Fees, a wider spread in a fast market and slippage come on top.',
+      ),
+      dependsOn: ['positionValue', 'spreadEstimate'],
+    });
+  }
+
   return {
     ticker: asset.ticker,
     ok: true,
     metrics: {
       riskBudget, stopLoss, riskPerUnit: riskPerUnitMetric, correlationHaircut: haircutMetric,
       positionSize, positionValue: positionValueMetric, amountAtRisk: amountAtRiskMetric, target2R,
+      volumeShare, spreadCost,
     },
     summary: {
       units, unitName, entryPrice, stop, target, riskPerUnit, assetCurrency, accountCurrency,
       positionValue, positionValueAsset, pctOfAccount, amountAtRisk, amountAtRiskAsset, riskPctActual,
-      haircut: haircut.factor, multiplier, capBinding, zeroReason,
+      haircut: haircut.factor, multiplier, capBinding, liquidityBinding, volumeShare: share, zeroReason,
     },
   };
 }

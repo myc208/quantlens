@@ -40,6 +40,7 @@ import { analyzeRisk, positionTailRisk } from './engines/riskEngine.js';
 import { analyzeEvents, gapRisk } from './engines/eventEngine.js';
 import { analyzeRegime, describeRegime } from './engines/regimeEngine.js';
 import { analyzeFactors, benchmarkFor } from './engines/factorEngine.js';
+import { analyzeLiquidity } from './engines/liquidityEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
 import { advise } from './engines/advisorEngine.js';
@@ -95,6 +96,7 @@ const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'
 const TONES = ['healthy', 'neutral', 'caution', 'risky'];
 const TONE_WORDS = { healthy: 'healthy', neutral: 'neutral', caution: 'caution', risky: 'risky' };
 const MULTIPLE_IDS = new Set(['evEbitda', 'trailingPE', 'forwardPE', 'priceToBook', 'debtToEquity']);
+const FINE_PERCENT_IDS = new Set(['spreadEstimate', 'rangeSpread', 'volumeShare']);
 // Changes read better with an explicit sign: "+4.2%" cannot be mistaken for a level.
 const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown', 'relativeStrength1m', 'relativeStrength3m']);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -181,8 +183,13 @@ function formatMetric(metric, { withCurrency = false, native = false } = {}) {
   switch (unit) {
     case 'score': return formatNumber(value, 0);
     case 'index': return formatNumber(value, 1);
-    case 'pct': return SIGNED_IDS.has(metric.id) ? signedPercent(value, 1) : formatPercent(value, 1);
-    case 'shares': return formatUnits(value);
+    case 'pct':
+      if (SIGNED_IDS.has(metric.id)) return signedPercent(value, 1);
+      // Spreads and shares of daily volume are often far below 0.1%.
+      if (FINE_PERCENT_IDS.has(metric.id)) return formatPercent(value, value === 0 || value >= 0.001 ? 2 : value >= 0.0001 ? 3 : 4);
+      return formatPercent(value, 1);
+    // An average volume is a count of units per day, not a holding: whole units read better.
+    case 'shares': return metric.id === 'averageVolume' ? formatNumber(value, 0) : formatUnits(value);
     case 'days': return `${formatNumber(value, 0)} ${value === 1 ? 'day' : 'days'}`;
     case 'currency': {
       const sourceCurrency = metric.meta ? metric.meta.currency : null;
@@ -259,7 +266,9 @@ function analyseAsset(asset, fxRate, now) {
   const forecast = analyzeForecast(asset);
   // Scheduled events: earnings and ex-dividend dates, and the typical earnings-day move.
   const events = analyzeEvents(asset, { now });
-  return { asset, technical, fundamental, advisor, sentiment, forecast, events };
+  // Liquidity from the last 20 sessions: volume, traded value, Amihud and the tick-floor spread.
+  const liquidity = analyzeLiquidity(asset, { fxRate });
+  return { asset, technical, fundamental, advisor, sentiment, forecast, events, liquidity };
 }
 
 function verdicts() {
@@ -431,6 +440,7 @@ function comparison() {
       comparedCount: assets.length,
       meanCorrelation: correlation.meanByTicker[asset.ticker],
       correlationIds: correlation.pairsByTicker[asset.ticker] ?? [],
+      liquidity: analysis.liquidity.summary,
     });
     sizings[asset.ticker] = sizing;
     return sizing;
@@ -642,7 +652,7 @@ function traceIndex(ticker) {
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
   const index = buildTraceIndex(
-    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics] : null,
+    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics, analysis.liquidity.metrics] : null,
     view ? view.metrics : null,
     view ? view.risk.metrics : null,
     view ? view.factors.metrics : null,

@@ -192,6 +192,7 @@
     import * as backtest from '../src/engines/backtestEngine.js';
     import * as regimes from '../src/engines/regimeEngine.js';
     import * as factors from '../src/engines/factorEngine.js';
+    import * as liquidityEngine from '../src/engines/liquidityEngine.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -1880,6 +1881,7 @@
         // V3.1: the market regime.
         regimes.REGIME_METRIC_IDS.forEach((id) => ids.add(id));
         factors.FACTOR_METRIC_IDS.forEach((id) => ids.add(id));
+        liquidityEngine.LIQUIDITY_METRIC_IDS.forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -4118,6 +4120,141 @@
         expect(effectiveBets.value).toBeAtLeast(1);
         expect(effectiveBets.value).toBeAtMost(set.length);
         expect(concentration.meta.crowded).toBe(concentration.value >= 0.6 && concentration.meta.crowd.length >= 2);
+      });
+    });
+
+    /* ================================================================== */
+    /* 30. V3.1 liquidity and tradability                                   */
+    /* ================================================================== */
+
+    // An asset with 25 sessions of given closes, highs, lows and volumes.
+    function liquidAsset({ closes, highs, lows, volumes, ...overrides }) {
+      const asset = makeAsset({ closes, highs: highs ?? closes.map((c) => c * 1.002), lows: lows ?? closes.map((c) => c * 0.998), ...overrides });
+      asset.series.volume = volumes;
+      return asset;
+    }
+
+    suite('liquidityEngine: volume, traded value, Amihud and the spread', () => {
+      test('the SGX and US price grids at their boundaries', () => {
+        const sg = { market: 'SG', assetClass: 'equity' };
+        expect(liquidityEngine.tickSize(sg, 0.199)).toBe(0.001);
+        expect(liquidityEngine.tickSize(sg, 0.2)).toBe(0.005);
+        expect(liquidityEngine.tickSize(sg, 0.999)).toBe(0.005);
+        expect(liquidityEngine.tickSize(sg, 1)).toBe(0.01);
+        expect(liquidityEngine.tickSize({ market: 'US', assetClass: 'etf' }, 635)).toBe(0.01);
+        expect(liquidityEngine.tickSize({ market: 'US', assetClass: 'equity' }, 0.5)).toBe(0.0001);
+        expect(liquidityEngine.tickSize({ market: 'UK', assetClass: 'etf' }, 760)).toBeNull();
+        expect(liquidityEngine.tickSize({ market: 'CRYPTO', assetClass: 'crypto' }, 58000)).toBeNull();
+        expect(liquidityEngine.tickSize({ market: 'US', assetClass: 'index' }, 6900)).toBeNull();
+      });
+      test('Corwin–Schultz matches an independent Python implementation', () => {
+        const trend = liquidityEngine.corwinSchultz([10.20, 10.30, 10.40, 10.20, 9.95, 10.10], [9.90, 10.05, 10.30, 9.80, 9.70, 9.95], [10.00, 10.25, 10.35, 9.85, 9.90, 10.05]);
+        expect(trend[0]).toBeCloseTo(0.009653927482754362, 1e-15);
+        expect(trend.slice(1)).toEqual([0, 0, 0, 0]);                       // negative two-day estimates are set to zero
+        const bounce = liquidityEngine.corwinSchultz([10.05, 10.06, 10.05, 10.06, 10.05], [10.00, 10.01, 10.00, 10.01, 10.00], [10.03, 10.02, 10.04, 10.01, 10.03]);
+        for (const value of bounce) expect(value).toBeCloseTo(0.002578049376733319, 1e-15);
+        expect(liquidityEngine.corwinSchultz([10.0, 10.6], [9.9, 10.4], [10.0, 10.5])).toEqual([0]);   // the overnight gap is removed first
+      });
+      test('volume, traded value and Amihud by hand', () => {
+        const closes = Array.from({ length: 25 }, (_, i) => 10 + (i % 2 ? 0.1 : 0));
+        const volumes = Array.from({ length: 25 }, (_, i) => 1000 + 10 * i);
+        const result = liquidityEngine.analyzeLiquidity(liquidAsset({ closes, volumes }));
+        const last = (list) => list.slice(-20);
+        const adv = last(volumes).reduce((s, v) => s + v, 0) / 20;
+        const value = last(volumes).reduce((s, v, i) => s + v * last(closes)[i], 0) / 20;
+        expect(result.metrics.averageVolume.value).toBeCloseTo(adv, 1e-9);
+        expect(result.metrics.dollarVolume.value).toBeCloseTo(value, 1e-6);
+        let impact = 0;
+        for (let i = 1; i < 20; i += 1) impact += Math.abs(last(closes)[i] / last(closes)[i - 1] - 1) / (last(closes)[i] * last(volumes)[i]);
+        expect(result.metrics.amihud.value).toBeCloseTo((impact / 19) * 1e10, 1e-6);   // per dollar × 10⁶ × 10⁴
+        expect(result.metrics.spreadEstimate.value).toBeCloseTo(0.01 / closes[closes.length - 1], 1e-12); // a US$0.01 tick on the last close
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('crypto volume is already in US dollars; units divide by the close', () => {
+        const closes = Array.from({ length: 25 }, () => 50000);
+        const volumes = Array.from({ length: 25 }, () => 2e9);
+        const coin = liquidAsset({ ticker: 'BTC-USD', closes, volumes, assetClass: 'crypto', market: 'CRYPTO' });
+        const result = liquidityEngine.analyzeLiquidity(coin);
+        expect(result.metrics.dollarVolume.value).toBe(2e9);
+        expect(result.metrics.averageVolume.value).toBe(40000);
+        expect(result.metrics.spreadEstimate.status).toBe('na');
+        expect(result.metrics.spreadEstimate.naReason).toMatch(/no tick floor/);
+        expect(result.metrics.rangeSpread.status).toBe('ok');
+      });
+      test('thin trading is flagged, indices are not traded, SGD converts for Amihud', () => {
+        const closes = Array.from({ length: 25 }, () => 2.12);
+        const volumes = Array.from({ length: 25 }, (_, i) => (i % 6 === 0 ? 0 : 50000));
+        const reit = liquidAsset({ ticker: 'REIT.SI', closes, volumes, market: 'SG', currency: 'SGD', lotSize: 100 });
+        const result = liquidityEngine.analyzeLiquidity(reit, { fxRate: 1.25 });
+        expect(result.metrics.averageVolume.meta.thin).toBeTrue();
+        expect(result.metrics.averageVolume.tone).toBe('caution');
+        expect(result.metrics.dollarVolume.meta.usd).toBeCloseTo(result.metrics.dollarVolume.value / 1.25, 1e-9);
+        expect(result.metrics.spreadEstimate.value).toBeCloseTo(0.01 / 2.12, 1e-12);   // S$0.01 tick from S$1
+        expect(result.metrics.spreadEstimate.tone).toBe('caution');
+        const index = liquidityEngine.analyzeLiquidity(liquidAsset({ ticker: '^STI', closes, volumes, assetClass: 'index' }));
+        for (const id of liquidityEngine.LIQUIDITY_METRIC_IDS) expect(index.metrics[id].naReason).toMatch(/not traded/);
+      });
+      test('real snapshot: every traded asset has liquidity figures, and the spread is the tick floor where the grid is known', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const result = liquidityEngine.analyzeLiquidity(asset, { fxRate: snapshot.fx.rate });
+          for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+          if (asset.assetClass === 'index') {
+            expect(result.metrics.dollarVolume.status).toBe('na');
+            continue;
+          }
+          expect(result.metrics.averageVolume.value).toBeGreaterThan(0);
+          expect(result.metrics.dollarVolume.meta.usd).toBeGreaterThan(0);
+          const last = asset.series.close[asset.series.close.length - 1];
+          const tick = liquidityEngine.tickSize(asset, last);
+          if (tick === null) expect(result.metrics.spreadEstimate.status).toBe('na');
+          else expect(result.metrics.spreadEstimate.value).toBeCloseTo(tick / last, 1e-12);
+        }
+      });
+    });
+
+    suite('position sizing with liquidity: the volume cap and the spread cost', () => {
+      const liquidity = (averageVolume, spread = 0.001) => ({ averageVolume, spread, tick: 0.1, asOf: '2026-11-20', unitName: 'shares' });
+      test('a large account is capped at 5% of daily volume, with a tenth step in the trace', () => {
+        const result = size({ account: { equity: 1e8, maxPositionPct: 100 }, liquidity: liquidity(10000) });
+        expect(result.summary.liquidityBinding).toBeTrue();
+        expect(result.summary.units).toBe(500);
+        expect(result.metrics.positionSize.trace.steps.length).toBe(10);
+        expect(result.metrics.positionSize.trace.steps[8].description).toMatch(/Liquidity cap/);
+        expect(result.metrics.volumeShare.value).toBeCloseTo(0.05, 1e-12);
+        expect(result.metrics.positionSize.trace.interpretation.summary).toMatch(/5% of an average day's volume/);
+      });
+      test('above 1% of volume the position is flagged but not cut', () => {
+        const result = size({ liquidity: liquidity(1000) });                // 20 shares of a 1,000-share day: 2%
+        expect(result.summary.liquidityBinding).toBeFalse();
+        expect(result.metrics.volumeShare.value).toBeCloseTo(result.summary.units / 1000, 1e-12);
+        expect(result.metrics.volumeShare.meta.flagged).toBeTrue();
+        expect(result.metrics.volumeShare.tone).toBe('caution');
+      });
+      test('the spread cost is position value × the minimum spread, set against the amount at risk', () => {
+        const result = size({ liquidity: liquidity(1e7, 0.0047) });
+        const { positionValue, amountAtRisk } = result.summary;
+        expect(result.metrics.spreadCost.value).toBeCloseTo(positionValue * 0.0047, 1e-9);
+        expect(result.metrics.spreadCost.meta.ofRisk).toBeCloseTo((positionValue * 0.0047) / amountAtRisk, 1e-12);
+        expect(result.metrics.volumeShare.meta.flagged).toBeFalse();
+        for (const id of ['volumeShare', 'spreadCost']) expect(tracer.validateTrace(result.metrics[id])).toEqual([]);
+      });
+      test('without liquidity data nothing changes and the new rows say why', () => {
+        const result = size();
+        expect(result.metrics.positionSize.trace.steps.length).toBe(9);
+        expect(result.metrics.volumeShare.status).toBe('na');
+        expect(result.metrics.spreadCost.status).toBe('na');
+      });
+      test('invariant: across account sizes and volumes the cap is never exceeded and units are whole lots', () => {
+        for (const equity of [1e3, 1e5, 1e7, 1e9]) {
+          for (const averageVolume of [150, 5000, 2e6]) {
+            const result = size({ account: { equity, maxPositionPct: 100 }, asset: { lotSize: 100 }, liquidity: liquidity(averageVolume) });
+            const { units } = result.summary;
+            expect(units).toBeAtMost(0.05 * averageVolume + 1e-9);
+            expect(units % 100).toBe(0);
+          }
+        }
       });
     });
 

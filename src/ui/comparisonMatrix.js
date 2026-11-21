@@ -89,6 +89,18 @@ const SECTIONS = Object.freeze([
     ],
   },
   {
+    id: 'liquidity',
+    title: 'Liquidity',
+    note: 'The last 20 sessions, whatever the time range',
+    rows: [
+      { id: 'dollarVolume' },
+      { id: 'averageVolume' },
+      { id: 'spreadEstimate' },
+      { id: 'amihud', pro: true },
+      { id: 'rangeSpread', pro: true },
+    ],
+  },
+  {
     id: 'events',
     title: 'Events',
     note: 'Scheduled releases that can gap the price past a stop',
@@ -173,6 +185,8 @@ const SIZING_SECTION = Object.freeze({
     { id: 'positionVar95' },
     { id: 'positionCvar95', pro: true },
     { id: 'gapRisk' },
+    { id: 'volumeShare' },
+    { id: 'spreadCost' },
     { id: 'riskBudget', pro: true },
     { id: 'riskPerUnit', pro: true },
   ],
@@ -290,6 +304,20 @@ export function mountComparisonMatrix(root, app) {
         return isNum(meta.returns) ? sub(`From ${meta.returns} daily returns${meta.returns < 40 ? ' · rough' : ''}`) : '';
       case 'maxDrawdown':
         return metric.value < 0 ? sub(`${h.shortDate(meta.peakDate)} to ${h.shortDate(meta.troughDate)}`) : sub('No fall from a high');
+      case 'averageVolume':
+        return sub(`${meta.unitName} a day${meta.thin ? ` · ${meta.zeroDays} days without trades` : ''}`);
+      case 'dollarVolume':
+        return isNum(meta.usd) ? sub(`≈ US$${h.formatCompact(meta.usd)} a day`) : sub('a day');
+      case 'spreadEstimate':
+        return sub(`One tick of ${h.formatNumber(meta.tick, meta.tick < 0.01 ? 3 : 2)} ${meta.currency}`);
+      case 'amihud':
+        return sub('bps of price move per US$1M traded');
+      case 'rangeSpread':
+        return sub(isNum(meta.multipleOfTick) ? `${h.formatNumber(meta.multipleOfTick, meta.multipleOfTick < 10 ? 1 : 0)}× the one-tick floor · not used for costs` : 'Not used for costs');
+      case 'volumeShare':
+        return sub(meta.liquidityBinding ? `Capped at ${h.formatPercent(meta.capShare, 0)} of daily volume` : meta.flagged ? 'May move the price' : 'of an average day');
+      case 'spreadCost':
+        return isNum(meta.ofRisk) ? sub(`${h.formatPercent(meta.ofRisk, 1)} of the amount at risk`) : '';
       case 'beta':
         return sub(`${h.formatNumber(meta.low, 2)} to ${h.formatNumber(meta.high, 2)} · ${meta.observations} ${meta.frequency} returns${meta.rough ? ' · rough' : ''}`);
       case 'rSquared':
