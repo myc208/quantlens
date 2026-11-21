@@ -4362,6 +4362,25 @@
       });
     });
 
+    suite('briefing: the latest move in σ is the bootstrap\'s own residual', () => {
+      test('latestShock equals the last filtered residual, on a synthetic series and on every real asset', async () => {
+        const closes = randomWalk(120, { seed: 77, sigma: 0.02 });
+        const shock = risk.latestShock(closes);
+        const filtered = risk.filteredResiduals(closes);
+        expect(shock.z).toBeCloseTo(filtered.residuals[filtered.residuals.length - 1], 1e-12);
+        expect(shock.dailyReturn).toBeCloseTo(closes[119] / closes[118] - 1, 1e-15);
+        expect(risk.latestShock(closes.slice(0, 15))).toBeNull();           // too short to seed the EWMA
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        for (const asset of snapshot.assets) {
+          const real = risk.latestShock(asset.longSeries.close, asset.longSeries.dates);
+          const residuals = risk.filteredResiduals(asset.longSeries.close).residuals;
+          expect(real.z).toBeCloseTo(residuals[residuals.length - 1], 1e-12);
+          expect(real.date).toBe(asset.longSeries.dates[asset.longSeries.dates.length - 1]);
+        }
+      });
+    });
+
     /* ================================================================== */
     /* Runner and report                                                   */
     /* ================================================================== */

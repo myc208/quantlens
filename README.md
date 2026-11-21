@@ -10,7 +10,9 @@
 
 > QuantLens is an educational tool. Its verdicts, position sizes, risk figures and portfolio statistics come from fixed, published rules so that they can be checked. They are not financial advice.
 
-**What V3.1 adds:** a market regime read from the VIX term structure (normal, elevated or stressed when the curve inverts), shown as a pill, a banner and the first line of the Telegram briefing; beta, R², idiosyncratic volatility and relative strength against each asset's natural benchmark; the portfolio's beta to the S&P 500 and a crowding check that names holdings that are one bet in disguise; and liquidity from the stored candles (traded value, Amihud illiquidity, the tick-floor spread) with a volume cap and a spread cost in position sizing. Three extra requests a day; everything else comes from data already in the snapshot.
+**What V3.2 adds:** a risk-first Telegram briefing (the regime first; a ⚡ block that appears only when something happened, with the Singapore time of any FOMC or CPI release within 48 hours; tradable assets in US / Global, SGX and Crypto buckets; the next 30 days; a one-line status) with a week-ahead edition at weekends; and a hand-kept macro calendar of FOMC decisions, CPI releases and NYSE and SGX holidays, shown on the site and used to make trading-day counts exact. No new requests.
+
+**V3.1 added** a market regime read from the VIX term structure (normal, elevated or stressed when the curve inverts), shown as a pill, a banner and the first line of the Telegram briefing; beta, R², idiosyncratic volatility and relative strength against each asset's natural benchmark; the portfolio's beta to the S&P 500 and a crowding check that names holdings that are one bet in disguise; and liquidity from the stored candles (traded value, Amihud illiquidity, the tick-floor spread) with a volume cap and a spread cost in position sizing. Three extra requests a day; everything else comes from data already in the snapshot.
 
 **V3 added** a 30-asset watchlist with seven macro bellwethers; five years of history and a `5Y` range; a risk model built from the returns that actually happened (EWMA volatility, historical VaR and CVaR, a filtered block-bootstrap Monte Carlo, Ledoit-Wolf covariance shrinkage, weekly returns across time zones); an event layer with earnings dates, each stock's typical earnings-day move and the gap risk of a sized position; a five-year backtest of the verdict itself, shown in the interface with its result, which is not flattering; and a Telegram briefing that can go to several chats.
 
@@ -188,7 +190,7 @@ scripts/macro_calendar.json                FOMC decisions and minutes, US CPI re
 scripts/fetch_fundamentals.py              prices, history, dividends, events, statements, news, yields,
                                            forecasts -> validated JSON; --notify sends the Telegram briefing
 scripts/signals.mjs                        runs the site's engines in Node.js for the briefing's signals
-scripts/test_fetch_fundamentals.py         128 unit tests for the pipeline (Gate 1)
+scripts/test_fetch_fundamentals.py         151 unit tests for the pipeline (Gate 1)
 scripts/run_browser_tests.py               headless Chrome/Edge runner for the test page (Gate 2)
 scripts/requirements.txt                   yfinance, vaderSentiment, prophet (pipeline only)
 data/market_snapshot.json                  schema v3 snapshot (committed)
@@ -206,7 +208,7 @@ src/engines/   technicalEngine.js  fundamentalEngine.js  correlationEngine.js  a
 src/ui/        telemetryBar.js  appTabs.js  commandPalette.js  screenerPanel.js
                comparisonMatrix.js  leaderboardView.js  portfolioSandbox.js
                derivationDrawer.js  riskSandboxModal.js  regimeBanner.js
-tests/engines.test.html                    350 browser-run tests in 46 suites, zero dependencies
+tests/engines.test.html                    358 browser-run tests in 48 suites, zero dependencies
 ```
 
 ---
@@ -893,7 +895,7 @@ flowchart LR
   D --> REF
   P --> TEST["test"]
   PR --> TEST
-  REF --> V["validate snapshot"] --> G1["Gate 1: 128 pipeline unit tests"] --> G2["Gate 2: 350 browser tests in headless Chrome"] --> C["commit snapshot"]
+  REF --> V["validate snapshot"] --> G1["Gate 1: 151 pipeline unit tests"] --> G2["Gate 2: 358 browser tests in headless Chrome"] --> C["commit snapshot"]
   C --> TG["Telegram briefing, always runs, never fails the job"]
   V -.->|"any failure"| TG
   TEST --> V2["validate, Gate 1, Gate 2"]
@@ -907,7 +909,7 @@ flowchart LR
 | `test` | every push and pull request | Validate the committed snapshot → Gate 1 → Gate 2. |
 | `deploy` | after a successful `refresh` or `test`, never on a pull request | Publish the static site to GitHub Pages. |
 
-**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 128 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API, including several recipients.
+**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 151 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, 5 trading days against 6, exactly 48 hours), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, and a failed step moved to the top.
 
 **Gate 2: the browser suite, headless** (`python scripts/run_browser_tests.py --min-tests 100`). The runner starts a local web server, launches headless Chrome or Edge at `tests/engines.test.html`, and waits for the page to report its results to a one-time same-origin URL. It uses only the Python standard library.
 
@@ -955,53 +957,110 @@ Nothing else is configured. The next scheduled or manually dispatched refresh se
 
 ### What it says
 
+Risk first, signal only: nothing is printed just to say nothing happened. On weekdays (the run for Friday 20 November 2026, from that day's snapshot):
+
 ```
-QuantLens daily briefing
-Sat 21 Nov 2026
+QuantLens daily briefing · Fri 20 Nov 2026
 🔴 Market regime: stressed · VIX curve inverted (VIX 35.9 above VIX3M 30.9), 4th session in a row
 
-✅ Every check passed. 30 assets, 30 fresh. The site redeploys with this data.
-
-Top BUY signals
-1. C6L.SI Singapore Airlines Limited · 70/100 · High confidence
-2. XOM Exxon Mobil Corporation · 66/100 · Low confidence
-
-Top SELL signals
-1. BTC-USD Bitcoin · 8/100 · Low confidence
-2. AVAX-USD Avalanche · 9/100 · Low confidence
-3. ^IXIC Nasdaq Composite · 12/100 · Low confidence
-...
-
-Earnings in the next 30 days
-⚠ ORCL ~14 Dec (in 23 days) · typical move ±9.8%, worst −13.5%
-⚠ MU ~17 Dec (in 26 days) · typical move ±5.8%, worst −16.2%
-
-All verdicts: 2 BUY · 11 HOLD · 17 SELL
-
-Headline tone shifts
-• ^DJI negative → positive (−0.38 → +0.36)
+⚡ Triggers today
+• Moves beyond 2.5σ: CSPX.L −3.4% (−3.4σ) · VOO −3.4% (−2.6σ) · MU −13.9% (−2.6σ)
+• Tone: AMD positive → negative (+0.15 → −0.29)
    (its newest headline)
-• BRK-B positive → negative (+0.24 → −0.13)
-   (its newest headline)
-...
 
-Open QuantLens · Run log
+US / Global · 1 BUY · 8 HOLD · 8 SELL
+BUY: XOM 66
+SELL: CSPX.L 13 · VOO 14 · TSLA 23
+Movers: TSLA −7.6% (−2.5σ) · SNDK −16.1% (−2.4σ)
+3M RS leaders: WMT +37.0% · BRK-B +27.7% vs S&P 500
+
+SGX · 1 BUY · 3 HOLD · 2 SELL
+BUY: C6L.SI 70
+SELL: U11.SI 41 · A17U.SI 44
+Movers: A17U.SI −2.3% (−2.0σ) · D05.SI −1.8% (−1.7σ)
+3M RS leaders: C6L.SI +15.2% · J69U.SI +14.0% vs STI
+
+Crypto (24/7) · 0 BUY · 0 HOLD · 3 SELL
+SELL: BTC-USD 8 · AVAX-USD 9 · ETH-USD 13
+Movers: ETH-USD −7.7% (−2.5σ) · BTC-USD −5.0% (−2.0σ)
+3M RS leaders: AVAX-USD +10.6% vs BTC
+
+Next 30 days
+Closures: US closed Thu 26 Nov (Thanksgiving Day) · US closes 1:00 PM ET Fri 27 Nov
+Macro: FOMC rate decision (+ projections) Wed 9 Dec · US CPI (November) Thu 10 Dec
+Earnings: ORCL ~14 Dec ±9.8% (worst −13.5%) · MU ~17 Dec ±5.8% (worst −16.2%)
+Ex-dividend: C6L.SI 25 Nov · NEM 25 Nov · CCJ 30 Nov · BLK 8 Dec · WMT 11 Dec
+
+Tradable: 2 BUY · 11 HOLD · 13 SELL
+✅ 30/30 fresh · Open QuantLens · Run log
 Rule-based signals for learning, not financial advice.
 ```
 
-(Built from the 21 November 2026 snapshot against the previous day's; headlines omitted here.)
+Two days before the December meeting the ⚡ block leads with the macro calendar, in New York and Singapore time:
+
+```
+⚡ Triggers today
+• FOMC rate decision (+ projections): Wed 9 Dec 2:00 PM ET · Thu 3:00 AM SGT · in 20 h
+• US CPI (November): Thu 10 Dec 8:30 AM ET · Thu 9:30 PM SGT · in 39 h
+```
+
+Saturday and Sunday runs (by UTC day) carry no new equity session, so they send the week-ahead edition instead of repeating Friday:
+
+```
+QuantLens · week ahead · Sun 22 Nov 2026
+🔴 Market regime (Friday close): stressed · VIX curve inverted (VIX 35.9 above VIX3M 30.9), 4th session in a row
+
+Next 7 days
+• Wed 25 Nov: ex-dividend C6L.SI, NEM
+• Thu 26 Nov: US closed (Thanksgiving Day)
+• Fri 27 Nov: US closes 1:00 PM ET
+• No FOMC, CPI or watchlist earnings. Next: FOMC rate decision (+ projections) Wed 9 Dec
+
+Next 30 days watch
+Macro: FOMC rate decision (+ projections) Wed 9 Dec · US CPI (November) Thu 10 Dec
+Earnings: ORCL ~14 Dec ±9.8% (worst −13.5%) · MU ~17 Dec ±5.8% (worst −16.2%)
+Ex-dividend: CCJ 30 Nov · BLK 8 Dec · WMT 11 Dec
+
+Weekend crypto check (UTC day to 20 Nov)
+BTC-USD −5.0% (−2.0σ) · SELL 8
+ETH-USD −7.7% (−2.5σ) · SELL 13 · 3M vs BTC −14.2%
+AVAX-USD −6.7% (−1.5σ) · SELL 9 · 3M vs BTC +10.6%
+
+Crypto: 0 BUY · 0 HOLD · 3 SELL
+✅ 30/30 fresh · Open QuantLens · Run log
+Rule-based signals for learning, not financial advice.
+```
+
+(Built from the 21 November 2026 snapshot; headlines omitted here.)
+
+**The ⚡ block** appears only when at least one of these fires, in this order:
+
+| Trigger | Fires when | Not repeated |
+|---|---|---|
+| **Macro** | an FOMC rate decision or a CPI release is within 48 hours (inclusive at exactly 48 h). Minutes and the meeting without a decision are listed ahead, never triggers | — |
+| **VIX curve** | the first session of an inversion (`invertedStreak` 1), or the first session out of one | once per session: a weekend does not repeat Friday's |
+| **Moves** | a tradable asset's latest session moved more than 2.5σ, measured as `ln(Cₜ ÷ Cₜ₋₁) ÷ σₜ₋₁` against the EWMA volatility known the day before. That is exactly the bootstrap's filtered residual, so the briefing and the simulator agree. Up to five, largest first | once per new session, by comparing with the previous snapshot; on a US holiday US names simply have no new session |
+| **Earnings** | a tradable stock reports within 5 trading days, counted with the market's holidays from the macro calendar (weekdays only; the weekend edition lists the week ahead instead) | a countdown, by design |
+| **Tone** | a tradable asset's headline tone flipped sign or moved by 0.25, fresh news only, at most three, each with its headline | once per snapshot |
+
+Measured over 2023 to 2026, a move beyond 2.5σ happened on about 42% of weekdays, so on most days the block is not there at all.
+
+**The body:**
 
 | Part | Rule |
 |---|---|
-| **Regime** | One line under the date: 🟢 normal, 🟡 elevated (with the curve described as flat or in contango) or 🔴 stressed (inverted, with the run length). Built from the stored block, so it needs no Node.js. A reading carried over from an earlier day says so. Held back with the signals when a check failed. |
-| **Signals** | Up to five BUYs by Composite score, best first, and up to five SELLs, worst first, with each verdict's confidence. Then the count of every verdict. |
-| **Earnings** | Stocks reporting in the next 30 calendar days, soonest first, at most five, with the typical and worst earnings-day move where at least four past releases are known. Dates carry a `~` because a scheduled date is the provider's expectation, not a confirmed time. |
-| **Headline tone shifts** | Assets whose headline tone flipped between positive and negative, or whose mean VADER score moved by at least 0.25 since the previous snapshot. Fresh news only, largest move first, at most five, each with its newest headline. |
-| **Status** | Which of the five steps (refresh, schema validation, Gate 1, Gate 2, commit) failed first, if any. A failed refresh reports the last good snapshot's signals and says so. A failed check withholds the signals entirely, because that data was not published. |
+| **Regime** | One line under the title: 🟢 normal, 🟡 elevated (curve flat or in contango) or 🔴 stressed (inverted, with the run length). At weekends it names the session it describes ("Friday close"). |
+| **Buckets** | US / Global (US and London listings), SGX, Crypto (24/7). Indices are not tradable and appear nowhere. Each bucket: its verdict tally, then at most three BUYs (best first), three SELLs (worst first), two movers at 1.5σ or more that are not already triggers and had a new session, and the two strongest positive 3-month relative-strength readings. A line with nothing to show is left out. |
+| **Next 30 days** | Closures within 7 days; FOMC decisions and minutes and CPI releases not already triggered; earnings not already triggered, with the typical and worst move; ex-dividend dates (`~` marks an estimate). |
+| **Week ahead** | Saturday and Sunday: no equity verdicts or movers. The next 7 days in date order (closures, macro events with their New York and Singapore times, earnings, ex-dividends), or one line naming the next FOMC or CPI when the week is quiet; the next 30 days; and the crypto market, whose latest completed UTC day is Friday's on the Saturday run and Saturday's on the Sunday run. |
+| **Footer** | The verdict tally of tradable assets (crypto only at weekends), one status line with the links, a warning if the macro calendar is running out, and the disclaimer. |
+| **Failures** | A failed step moves to the top, where it cannot be missed. A failed check withholds the regime and the signals, because that data was not published; a failed refresh reports the last good snapshot and says so. |
+
+The message is shortened from the bottom of the body if it ever approached Telegram's limit, never from the footer.
 
 ### How it is built
 
-- **One source of truth for the signals.** The verdicts and earnings dates come from the site's own JavaScript engines, run in Node.js by `scripts/signals.mjs` over the same snapshot. Re-implementing the scoring in Python would create a second copy that could quietly disagree with the site.
+- **One source of truth for the signals.** The verdicts, the moves in σ, 3-month relative strength and the earnings and ex-dividend dates come from the site's own JavaScript engines, run in Node.js by `scripts/signals.mjs` over the same snapshot. Re-implementing them in Python would create a second copy that could quietly disagree with the site. The regime and the macro calendar are read straight from the snapshot, so they reach the message even if Node.js is missing.
 - **No new dependencies.** The message is sent with Python's `urllib.request` to the Bot API's `sendMessage`, formatted as MarkdownV2 with every special character escaped. If Telegram rejects the formatting for a chat, the same content is resent to that chat as plain text.
 - **The status is real.** The briefing is the last step of the refresh job and runs whatever happened before it (`if: always()`). Each earlier step's outcome is passed in as an environment variable, so the message reports the gates and the commit, not just the fetch.
 - **Least exposure.** The two secrets are given to the briefing step only, not to the steps that run third-party data code.
@@ -1242,9 +1301,9 @@ Pearson correlation of log returns, computed only on dates when both assets trad
 
 Two suites, both run in CI as deployment gates.
 
-**`tests/engines.test.html`: 350 tests in 46 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
+**`tests/engines.test.html`: 358 tests in 48 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
 
-**`scripts/test_fetch_fundamentals.py`: 128 tests** of the Python pipeline, standard-library `unittest`.
+**`scripts/test_fetch_fundamentals.py`: 151 tests** of the Python pipeline, standard-library `unittest`.
 
 Every formula is verified against an independent source of truth:
 
@@ -1381,7 +1440,7 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 
 **How do you spot a crowded portfolio?** The first principal component alone is a trap: it is mostly the most volatile holding. I flag "one bet" only when the common driver explains at least 60% of the variance and at least two holdings correlate 0.8 or more with it, and I run it on the sample covariance, because shrinkage would erase the very correlations the check looks for. It names MU and SNDK in a chip portfolio, the two banks among Singapore names, and the miners inside an otherwise diversified mix.
 
-**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 478 tests comparing engines with hand calculations, a published example, closed-form results, an independent NumPy implementation and independent recomputation, including a check that the backtest's last day reproduces the live score for every asset.
+**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 509 tests comparing engines with hand calculations, a published example, closed-form results, an independent NumPy implementation and independent recomputation, including a check that the backtest's last day reproduces the live score for every asset.
 
 **What was the hardest correctness problem?** Data, not formulas. Summing four quarters into a trailing figure is wrong if one quarter is missing, and the provider silently omits them. In V3, earnings timestamps: Yahoo reports them in New York time, so a Singapore release stamped 19:00 in New York is really 08:00 the next morning in Singapore, a different day and before the open; and a midnight stamp means "time unknown", not "before the open". Getting either wrong measures the reaction on the wrong day.
 

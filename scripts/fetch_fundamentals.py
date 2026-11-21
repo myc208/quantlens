@@ -23,8 +23,11 @@ and the macro calendar (FOMC decisions and minutes, US CPI releases, NYSE and
 SGX holidays), kept by hand in scripts/macro_calendar.json and validated here.
 
 With ``--notify`` it instead sends a short daily briefing about the snapshot to
-Telegram (the market regime, top BUY and SELL signals, earnings in the next 30
-days, notable shifts in headline tone, and the pipeline's status) to one chat or several:
+Telegram to one chat or several: risk first (the market regime, then a ⚡ block
+that appears only when something happened: moves beyond 2.5σ, a VIX inversion
+starting or ending, earnings within 5 trading days, FOMC or CPI within 48 hours,
+headline tone shifts), tradable assets in three buckets, the next 30 days, and a
+one-line status. Saturday and Sunday runs get a week-ahead edition instead.
 TELEGRAM_CHAT_ID may hold comma-separated ids. It never fails: missing
 credentials skip it silently, and an unreachable API is a warning.
 
@@ -264,6 +267,24 @@ BRIEFING_MAX_SHIFTS = 5
 BRIEFING_EARNINGS_DAYS = 30      # list earnings releases this many calendar days ahead
 BRIEFING_MAX_EARNINGS = 5
 SENTIMENT_SHIFT_MIN = 0.25       # a move in headline tone at least this large is notable
+# V3.2 briefing: risk first, bucketed, signal only.
+BRIEFING_MOVE_SIGMA = 2.5        # a session move beyond this many EWMA σ is a trigger
+BRIEFING_MOVER_SIGMA = 1.5       # ...and beyond this, a notable mover in its bucket
+BRIEFING_EARNINGS_TRIGGER = 5    # earnings within this many trading days are a trigger
+BRIEFING_MACRO_HOURS = 48        # FOMC decisions and CPI releases within this many hours are a trigger
+BRIEFING_MAX_MOVES = 5
+BRIEFING_MAX_TONE = 3
+BRIEFING_BUCKET_SIGNALS = 3      # BUYs and SELLs listed per bucket
+BRIEFING_BUCKET_MOVERS = 2
+BRIEFING_BUCKET_LEADERS = 2
+BRIEFING_WEEK_DAYS = 7
+BRIEFING_MAX_EX_DIVIDENDS = 6
+BRIEFING_BUCKETS = (("global", "US / Global", "S&P 500"), ("sgx", "SGX", "STI"), ("crypto", "Crypto (24/7)", "BTC"))
+MARKET_MOVING = {"fomc-decision", "cpi"}
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+WEEKDAY_FULL = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+               "October", "November", "December")
 SIGNALS_SCRIPT = REPO_ROOT / "scripts" / "signals.mjs"
 # A Telegram chat id: a user or group number (groups and channels are negative), or a public @channel.
 CHAT_ID_RE = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$")
@@ -2545,8 +2566,14 @@ def pipeline_outcome(env: dict[str, str]) -> tuple[str, str | None]:
     return "passed", None
 
 
+def finite_or_none(value: Any) -> float | None:
+    return value if is_finite_number(value) else None
+
+
 def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
-    """Every asset's verdict and Composite score, from the site's own JavaScript engines.
+    """Every asset's verdict, Composite score and the figures the briefing needs (bucket,
+    the latest move in σ, 3-month relative strength, the next earnings and ex-dividend
+    dates), from the site's own JavaScript engines.
 
     Running the engines (rather than re-implementing them in Python) guarantees
     the briefing says exactly what the site shows. Returns None, with a warning,
@@ -2584,15 +2611,34 @@ def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
         composite = row.get("composite") if is_finite_number(row.get("composite")) else None
         confidence = row.get("confidence") if row.get("confidence") in {"High", "Medium", "Low"} else None
         name = row.get("name") if isinstance(row.get("name"), str) else row["ticker"]
+        def whole(value: Any) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
         upcoming = row.get("nextEarnings")
         next_earnings = None
-        if (isinstance(upcoming, dict) and is_iso_date(upcoming.get("date")) and isinstance(upcoming.get("days"), int)
-                and not isinstance(upcoming.get("days"), bool) and upcoming["days"] >= 0):
-            next_earnings = {"date": upcoming["date"], "days": upcoming["days"]}
-        signals.append({"ticker": row["ticker"], "name": name, "verdict": verdict,
-                        "composite": composite, "confidence": confidence, "nextEarnings": next_earnings,
-                        "typicalMove": row.get("typicalMove") if is_finite_number(row.get("typicalMove")) else None,
-                        "worstMove": row.get("worstMove") if is_finite_number(row.get("worstMove")) else None})
+        if isinstance(upcoming, dict) and is_iso_date(upcoming.get("date")) and whole(upcoming.get("days")):
+            next_earnings = {"date": upcoming["date"], "days": upcoming["days"],
+                             "tradingDays": upcoming["tradingDays"] if whole(upcoming.get("tradingDays")) else None,
+                             "dateTo": upcoming["dateTo"] if is_iso_date(upcoming.get("dateTo")) else None,
+                             "timing": upcoming["timing"] if upcoming.get("timing") in EARNINGS_TIMINGS else None}
+        dividend = row.get("nextExDividend")
+        next_dividend = None
+        if isinstance(dividend, dict) and is_iso_date(dividend.get("date")) and whole(dividend.get("days")):
+            next_dividend = {"date": dividend["date"], "days": dividend["days"], "estimated": dividend.get("estimated") is True}
+        market = row.get("market") if row.get("market") in MARKETS else None
+        signals.append({
+            "ticker": row["ticker"], "name": name, "verdict": verdict, "composite": composite, "confidence": confidence,
+            "assetClass": row.get("assetClass") if row.get("assetClass") in ASSET_CLASSES else None,
+            "market": market,
+            "bucket": row.get("bucket") if row.get("bucket") in {"global", "sgx", "crypto"} else None,
+            "tradable": row.get("tradable") is True,
+            "quoteAsOf": row.get("quoteAsOf") if is_iso_date(row.get("quoteAsOf")) else None,
+            "nextEarnings": next_earnings, "nextExDividend": next_dividend,
+            "typicalMove": finite_or_none(row.get("typicalMove")), "worstMove": finite_or_none(row.get("worstMove")),
+            "dailyReturn": finite_or_none(row.get("dailyReturn")), "zScore": finite_or_none(row.get("zScore")),
+            "relativeStrength3m": finite_or_none(row.get("relativeStrength3m")),
+            "benchmark": row.get("benchmark") if isinstance(row.get("benchmark"), str) else None,
+        })
     return signals
 
 
@@ -2649,22 +2695,26 @@ def ordinal(number: int) -> str:
     return f"{number}{suffix}"
 
 
-def regime_line(regime: Any) -> str | None:
+def regime_line(regime: Any, close_label: bool = False) -> str | None:
     """The briefing's first line: the market regime from the VIX curve. None for a snapshot
-    written before V3.1 (it has no regime block at all)."""
+    written before V3.1 (it has no regime block at all). `close_label` names the session it
+    describes ("Friday close"), for the weekend edition."""
     if regime is None:
         return None
     if not isinstance(regime, dict) or regime.get("status") not in {"fresh", "stale"}:
         return "⚪ Market regime unavailable: the VIX curve could not be read"
     vix, vix3m = regime["levels"]["vix"], regime["levels"]["vix3m"]
+    name = "Market regime"
+    if close_label and is_iso_date(regime.get("asOf")):
+        name = f"Market regime ({WEEKDAY_FULL[date.fromisoformat(regime['asOf']).weekday()]} close)"
     if regime["state"] == "stressed":
         streak = regime["invertedStreak"] or 1
         run = "first inverted session" if streak == 1 else f"{ordinal(streak)} session in a row"
-        line = f"🔴 Market regime: stressed · VIX curve inverted (VIX {vix:.1f} above VIX3M {vix3m:.1f}), {run}"
+        line = f"🔴 {name}: stressed · VIX curve inverted (VIX {vix:.1f} above VIX3M {vix3m:.1f}), {run}"
     else:
         shape = "flat" if regime["ratio"] >= regime["rules"]["elevatedRatio"] else "in contango"
         mark = "🟡" if regime["state"] == "elevated" else "🟢"
-        line = f"{mark} Market regime: {regime['state']} · VIX {vix:.1f}, curve {shape} (VIX3M {vix3m:.1f})"
+        line = f"{mark} {name}: {regime['state']} · VIX {vix:.1f}, curve {shape} (VIX3M {vix3m:.1f})"
     if regime["status"] == "stale":
         line += f" · reading of {short_date(regime['asOf'])}"
     return line
@@ -2683,90 +2733,413 @@ def briefing_links(env: dict[str, str]) -> list[tuple[str, str]]:
     return links
 
 
-def build_briefing(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]] | None,
-                   shifts: list[dict[str, Any]] | None, outcome: str, failed_step: str | None,
-                   now: datetime, links: list[tuple[str, str]], fmt: BriefingFormat) -> str:
-    """The message text. `shifts` is None when there was nothing to compare against."""
-    lines = [fmt.bold("QuantLens daily briefing"), fmt.text(now.strftime("%a %d %b %Y").replace(" 0", " "))]
-    # The regime follows the same rule as the signals: data that failed a check is not reported.
-    held_back = outcome == "failed" and failed_step not in {"data refresh", "commit"}
-    if isinstance(snapshot, dict) and not held_back:
-        macro = snapshot.get("macro")
-        line = regime_line(macro.get("regime") if isinstance(macro, dict) else None)
-        if line:
-            lines.append(fmt.text(line))
+# --------------------------------------------------------------------------- #
+# Briefing building blocks (V3.2)
+# --------------------------------------------------------------------------- #
 
+def day_label(iso: str) -> str:
+    """'2026-12-09' -> 'Wed 9 Dec'."""
+    day = date.fromisoformat(iso)
+    return f"{WEEKDAY_NAMES[day.weekday()]} {day.day} {day.strftime('%b')}"
+
+
+def clock_12(moment: pd.Timestamp) -> str:
+    """2:00 PM, 9:30 AM (portable: no %-I)."""
+    hour = moment.hour % 12 or 12
+    return f"{hour}:{moment.minute:02d} {'AM' if moment.hour < 12 else 'PM'}"
+
+
+def event_clocks(at: str) -> tuple[str, str]:
+    """('2:00 PM ET', 'Thu 3:00 AM SGT') for an event time with its UTC offset."""
+    moment = pd.Timestamp(at)
+    singapore = moment.tz_convert(MARKET_TIMEZONES["SG"])
+    return f"{clock_12(moment.tz_convert(MARKET_TIMEZONES['US']))} ET", f"{WEEKDAY_NAMES[singapore.weekday()]} {clock_12(singapore)} SGT"
+
+
+def percent(value: float, digits: int = 1) -> str:
+    """+37.0%, −13.9% (true minus)."""
+    return signed(value * 100, digits) + "%" if value else f"{0:.{digits}f}%"
+
+
+def macro_label(event: dict[str, Any]) -> str:
+    kind = event["type"]
+    if kind == "fomc-decision":
+        return "FOMC rate decision" + (" (+ projections)" if event.get("projections") else "")
+    if kind == "cpi":
+        return f"US CPI ({MONTH_NAMES[int(event['period'][5:7]) - 1]})"
+    if kind == "fomc-minutes":
+        return "FOMC minutes"
+    if kind == "fomc-meeting":
+        return "FOMC strategy meeting (no decision)"
+    if kind == "market-holiday":
+        return f"{'US markets' if event['market'] == 'US' else 'SGX'} closed ({event['name']})"
+    if kind == "market-early-close":
+        return f"US markets close 1:00 PM ET ({event['name']})"
+    return kind
+
+
+def calendar_events(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+    macro = snapshot.get("macro") if isinstance(snapshot, dict) else None
+    block = macro.get("calendar") if isinstance(macro, dict) else None
+    if not isinstance(block, dict) or block.get("status") != "fresh" or not isinstance(block.get("events"), list):
+        return []
+    return [event for event in block["events"] if isinstance(event, dict) and event.get("type") in CALENDAR_TYPES]
+
+
+def event_hours(event: dict[str, Any], now: datetime) -> float | None:
+    """Hours from now to a timed event (None for date-only events)."""
+    if not event.get("at"):
+        return None
+    return (pd.Timestamp(event["at"]).tz_convert("UTC") - pd.Timestamp(now).tz_convert("UTC")).total_seconds() / 3600
+
+
+def upcoming_calendar(events: list[dict[str, Any]], now: datetime, days: int, after_days: int = -1) -> list[dict[str, Any]]:
+    """Events still ahead, dated within `days` of today (and beyond `after_days`)."""
+    today = now.astimezone(timezone.utc).date()
+    out = []
+    for event in events:
+        ahead = (date.fromisoformat(event["date"]) - today).days
+        hours = event_hours(event, now)
+        if after_days < ahead <= days and (hours > 0 if hours is not None else ahead >= 0):
+            out.append(event)
+    return out
+
+
+def regime_transition(regime: Any) -> dict[str, Any]:
+    """Day 1 of an inversion, or the first session out of one, from the stored history."""
+    none = {"dayOne": False, "uninverted": False, "priorStreak": 0}
+    if not isinstance(regime, dict) or regime.get("status") not in {"fresh", "stale"} or not regime.get("history"):
+        return none
+    rule = regime["rules"]["invertedRatio"]
+    rows = regime["history"]
+    inverted = [row[2] / row[3] >= rule for row in rows]
+    prior = 0
+    for flag in reversed(inverted[:-1]):
+        if not flag:
+            break
+        prior += 1
+    return {"dayOne": inverted[-1] and prior == 0, "uninverted": (not inverted[-1]) and prior > 0, "priorStreak": prior}
+
+
+def is_weekend_run(now: datetime) -> bool:
+    """Saturday and Sunday runs (UTC) carry no new equity session: they get the week-ahead edition."""
+    return now.astimezone(timezone.utc).weekday() >= 5
+
+
+def previous_dates(previous: dict[str, Any] | None) -> dict[str, str]:
+    """Each asset's last session in the previous snapshot, to tell a new session from a repeat."""
+    if not isinstance(previous, dict) or not isinstance(previous.get("assets"), list):
+        return {}
+    return {asset.get("ticker"): (asset.get("quote") or {}).get("asOf") for asset in previous["assets"] if isinstance(asset, dict)}
+
+
+def new_session(row: dict[str, Any], before: dict[str, str]) -> bool:
+    old = before.get(row["ticker"])
+    return row.get("quoteAsOf") is not None and (old is None or row["quoteAsOf"] > old)
+
+
+def sigma(z: float) -> str:
+    return f"{signed(z, 1)}σ"
+
+
+def move_text(row: dict[str, Any]) -> str:
+    return f"{row['ticker']} {percent(row['dailyReturn'])} ({sigma(row['zScore'])})"
+
+
+def earnings_size(row: dict[str, Any]) -> str:
+    if row.get("typicalMove") is None or row.get("worstMove") is None:
+        return "too few past releases to size the move"
+    return f"±{row['typicalMove'] * 100:.1f}% (worst {percent(row['worstMove'])})"
+
+
+TIMING_WORDS = {"before-open": "before the open", "during-session": "during the session", "after-close": "after the close"}
+
+
+def briefing_triggers(snapshot: dict[str, Any], signals: list[dict[str, Any]], shifts: list[dict[str, Any]] | None,
+                      previous: dict[str, Any] | None, now: datetime, weekend: bool, fmt: BriefingFormat) -> tuple[list[str], dict[str, set]]:
+    """The ⚡ block: only what happened or is about to. Returns its lines (none on a quiet day)
+    and what it already mentioned, so the rest of the message does not repeat it."""
+    lines: list[str] = []
+    seen: dict[str, set] = {"moves": set(), "earnings": set(), "events": set()}
+    # T4: an FOMC decision or CPI release within 48 hours, with the time in New York and Singapore.
+    for event in calendar_events(snapshot):
+        hours = event_hours(event, now)
+        if event["type"] in MARKET_MOVING and hours is not None and 0 < hours <= BRIEFING_MACRO_HOURS:
+            et, sgt = event_clocks(event["at"])
+            lines.append(fmt.text(f"• {macro_label(event)}: {day_label(event['date'])} {et} · {sgt} · in {round(hours)} h"))
+            seen["events"].add((event["type"], event["date"]))
+    # T2: the first session of an inversion, or the first one out of it (once per session).
+    macro = snapshot.get("macro") or {}
+    regime = macro.get("regime")
+    old_macro = previous.get("macro") if isinstance(previous, dict) else None
+    old_regime = old_macro.get("regime") if isinstance(old_macro, dict) else None
+    old_as_of = old_regime.get("asOf") if isinstance(old_regime, dict) else None
+    if isinstance(regime, dict) and regime.get("status") in {"fresh", "stale"} and (old_as_of is None or regime["asOf"] > old_as_of):
+        change = regime_transition(regime)
+        vix, vix3m = regime["levels"]["vix"], regime["levels"]["vix3m"]
+        if change["dayOne"]:
+            lines.append(fmt.text(f"• VIX curve inverted today, day 1: VIX {vix:.1f} above VIX3M {vix3m:.1f}"))
+        elif change["uninverted"]:
+            run = f"{change['priorStreak']} inverted session{'s' if change['priorStreak'] != 1 else ''}"
+            lines.append(fmt.text(f"• VIX curve no longer inverted: {regime['state']} after {run} (VIX {vix:.1f}, VIX3M {vix3m:.1f})"))
+    # T1: a session move beyond 2.5σ of the EWMA volatility, once per new session (crypto only at weekends).
+    before = previous_dates(previous)
+    moves = [row for row in signals if row.get("tradable") and row.get("zScore") is not None and row.get("dailyReturn") is not None
+             and abs(row["zScore"]) > BRIEFING_MOVE_SIGMA and new_session(row, before) and (not weekend or row.get("bucket") == "crypto")]
+    moves.sort(key=lambda row: (-abs(row["zScore"]), row["ticker"]))
+    if moves:
+        shown = " · ".join(move_text(row) for row in moves[:BRIEFING_MAX_MOVES])
+        extra = f" · +{len(moves) - BRIEFING_MAX_MOVES} more" if len(moves) > BRIEFING_MAX_MOVES else ""
+        lines.append(fmt.text(f"• Moves beyond {BRIEFING_MOVE_SIGMA}σ: {shown}{extra}"))
+        seen["moves"] = {row["ticker"] for row in moves}
+    # T3: earnings within 5 trading days (weekdays; the weekend edition lists the week ahead).
+    if not weekend:
+        soon = [row for row in signals if row.get("tradable") and row.get("nextEarnings")
+                and row["nextEarnings"].get("tradingDays") is not None and row["nextEarnings"]["tradingDays"] <= BRIEFING_EARNINGS_TRIGGER]
+        for row in sorted(soon, key=lambda row: (row["nextEarnings"]["days"], row["ticker"])):
+            upcoming = row["nextEarnings"]
+            when = TIMING_WORDS.get(upcoming.get("timing") or "", "time not known")
+            sessions = upcoming["tradingDays"]
+            lines.append(fmt.text(f"• Earnings: {row['ticker']} ~{day_label(upcoming['date'])}, {when} "
+                                  f"({sessions} trading day{'s' if sessions != 1 else ''}) · {earnings_size(row)}"))
+            seen["earnings"].add(row["ticker"])
+    # T5: headline tone shifts, tradable assets only. Never a "no shifts" line.
+    tradable = {asset["ticker"] for asset in snapshot.get("assets", []) if isinstance(asset, dict) and asset.get("assetClass") != "index"}
+    for shift in [shift for shift in (shifts or []) if shift["ticker"] in tradable][:BRIEFING_MAX_TONE]:
+        lines.append(fmt.text(f"• Tone: {shift['ticker']} {shift['from']} → {shift['to']} ({signed(shift['before'])} → {signed(shift['after'])})"))
+        if shift.get("headline"):
+            headline = shift["headline"] if len(shift["headline"]) <= 70 else shift["headline"][:67].rstrip() + "..."
+            lines.append("   " + fmt.italic(headline))
+    return lines, seen
+
+
+def tally_text(rows: list[dict[str, Any]]) -> str:
+    counts = {verdict: sum(1 for row in rows if row.get("verdict") == verdict) for verdict in ("BUY", "HOLD", "SELL")}
+    return f"{counts['BUY']} BUY · {counts['HOLD']} HOLD · {counts['SELL']} SELL"
+
+
+def bucket_sections(signals: list[dict[str, Any]], previous: dict[str, Any] | None, moved: set, fmt: BriefingFormat) -> list[str]:
+    """US / Global, SGX and Crypto: top verdicts, notable movers and 3-month leaders, indices excluded."""
+    before = previous_dates(previous)
+    lines: list[str] = []
+    for key, title, versus in BRIEFING_BUCKETS:
+        rows = [row for row in signals if row.get("bucket") == key and row.get("tradable")]
+        if not rows:
+            continue
+        lines += ["", fmt.bold(title) + fmt.text(f" · {tally_text(rows)}")]
+        buys = sorted((row for row in rows if row["verdict"] == "BUY" and row["composite"] is not None), key=lambda row: (-row["composite"], row["ticker"]))
+        sells = sorted((row for row in rows if row["verdict"] == "SELL" and row["composite"] is not None), key=lambda row: (row["composite"], row["ticker"]))
+        if buys:
+            lines.append(fmt.text("BUY: " + " · ".join(f"{row['ticker']} {row['composite']:.0f}" for row in buys[:BRIEFING_BUCKET_SIGNALS])))
+        if sells:
+            lines.append(fmt.text("SELL: " + " · ".join(f"{row['ticker']} {row['composite']:.0f}" for row in sells[:BRIEFING_BUCKET_SIGNALS])))
+        movers = [row for row in rows if row["ticker"] not in moved and row.get("zScore") is not None and row.get("dailyReturn") is not None
+                  and abs(row["zScore"]) >= BRIEFING_MOVER_SIGMA and new_session(row, before)]
+        movers.sort(key=lambda row: (-abs(row["zScore"]), row["ticker"]))
+        if movers:
+            lines.append(fmt.text("Movers: " + " · ".join(move_text(row) for row in movers[:BRIEFING_BUCKET_MOVERS])))
+        leaders = sorted((row for row in rows if row.get("relativeStrength3m") is not None and row["relativeStrength3m"] > 0),
+                         key=lambda row: (-row["relativeStrength3m"], row["ticker"]))
+        if leaders:
+            shown = " · ".join(f"{row['ticker']} {percent(row['relativeStrength3m'])}" for row in leaders[:BRIEFING_BUCKET_LEADERS])
+            lines.append(fmt.text(f"3M RS leaders: {shown} vs {versus}"))
+    return lines
+
+
+def macro_summary(events: list[dict[str, Any]]) -> str:
+    return " · ".join(f"{macro_label(event)} {day_label(event['date'])}" for event in events)
+
+
+def outlook_lines(snapshot: dict[str, Any], signals: list[dict[str, Any]], now: datetime, seen: dict[str, set],
+                  days: int, after_days: int, fmt: BriefingFormat) -> list[str]:
+    """Macro, earnings and ex-dividend lines for a window of days (empty lines left out)."""
+    lines: list[str] = []
+    window = upcoming_calendar(calendar_events(snapshot), now, days, after_days)
+    macro = [event for event in window if event["type"] in {"fomc-decision", "cpi", "fomc-minutes", "fomc-meeting"}
+             and (event["type"], event["date"]) not in seen["events"]]
+    if macro:
+        lines.append(fmt.text("Macro: " + macro_summary(macro)))
+    today = now.astimezone(timezone.utc).date().isoformat()
+    earnings = sorted((row for row in signals if row.get("tradable") and row.get("nextEarnings") and row["ticker"] not in seen["earnings"]
+                       and after_days < row["nextEarnings"]["days"] <= days and row["nextEarnings"]["date"] >= today),
+                      key=lambda row: (row["nextEarnings"]["days"], row["ticker"]))
+    if earnings:
+        lines.append(fmt.text("Earnings: " + " · ".join(f"{row['ticker']} ~{short_date(row['nextEarnings']['date'])} {earnings_size(row)}"
+                                                       for row in earnings[:BRIEFING_MAX_EARNINGS])))
+    dividends = sorted((row for row in signals if row.get("tradable") and row.get("nextExDividend")
+                        and after_days < row["nextExDividend"]["days"] <= days and row["nextExDividend"]["date"] >= today),
+                       key=lambda row: (row["nextExDividend"]["date"], row["ticker"]))
+    if dividends:
+        lines.append(fmt.text("Ex-dividend: " + " · ".join(
+            f"{row['ticker']} {'~' if row['nextExDividend']['estimated'] else ''}{short_date(row['nextExDividend']['date'])}"
+            for row in dividends[:BRIEFING_MAX_EX_DIVIDENDS])))
+    return lines
+
+
+def closure_text(event: dict[str, Any], date_first: bool = False) -> str:
+    """'US closed Thu 26 Nov (Thanksgiving Day)', or with the date first for a dated list:
+    'Thu 26 Nov: US closed (Thanksgiving Day)'. Early closes: 'US closes 1:00 PM ET'."""
+    market = "US" if event["market"] == "US" else "SGX"
+    what = f"{market} closes 1:00 PM ET" if event["type"] == "market-early-close" else f"{market} closed"
+    detail = "" if event["type"] == "market-early-close" else f" ({event['name']})"
+    return f"{day_label(event['date'])}: {what}{detail}" if date_first else f"{what} {day_label(event['date'])}{detail}"
+
+
+def closure_lines(snapshot: dict[str, Any], now: datetime, fmt: BriefingFormat) -> list[str]:
+    closures = [event for event in upcoming_calendar(calendar_events(snapshot), now, BRIEFING_WEEK_DAYS)
+                if event["type"] in {"market-holiday", "market-early-close"}]
+    return [fmt.text("Closures: " + " · ".join(closure_text(event) for event in closures))] if closures else []
+
+
+def week_ahead_sections(snapshot: dict[str, Any], signals: list[dict[str, Any]], now: datetime, seen: dict[str, set],
+                        fmt: BriefingFormat) -> list[str]:
+    """The weekend edition: the next 7 days, the next 30, and the 24/7 market."""
+    lines = ["", fmt.bold("Next 7 days")]
+    events = calendar_events(snapshot)
+    week = upcoming_calendar(events, now, BRIEFING_WEEK_DAYS)
+    today = now.astimezone(timezone.utc).date().isoformat()
+    dated: list[tuple[str, int, str]] = []   # (date, order within the day, text): one list in date order
+    for event in week:
+        if (event["type"], event["date"]) in seen["events"]:
+            continue
+        if event["type"] in {"market-holiday", "market-early-close"}:
+            dated.append((event["date"], 0, f"• {closure_text(event, date_first=True)}"))
+            continue
+        clock = ""
+        if event.get("at"):
+            et, sgt = event_clocks(event["at"])
+            clock = f", {et} · {sgt}"
+        dated.append((event["date"], 1, f"• {day_label(event['date'])}: {macro_label(event)}{clock}"))
+    earnings = [row for row in signals if row.get("tradable") and row.get("nextEarnings")
+                and row["nextEarnings"]["days"] <= BRIEFING_WEEK_DAYS and row["nextEarnings"]["date"] >= today]
+    for row in earnings:
+        when = TIMING_WORDS.get(row["nextEarnings"].get("timing") or "", "time not known")
+        dated.append((row["nextEarnings"]["date"], 2, f"• {day_label(row['nextEarnings']['date'])}: {row['ticker']} earnings, {when} · {earnings_size(row)}"))
+    by_date: dict[str, list[str]] = {}
+    for row in signals:
+        dividend = row.get("nextExDividend")
+        if row.get("tradable") and dividend and dividend["days"] <= BRIEFING_WEEK_DAYS and dividend["date"] >= today:
+            by_date.setdefault(dividend["date"], []).append(("~" if dividend["estimated"] else "") + row["ticker"])
+    for day, tickers in by_date.items():
+        dated.append((day, 3, f"• {day_label(day)}: ex-dividend {', '.join(sorted(tickers))}"))
+    lines += [fmt.text(text) for _, _, text in sorted(dated)]
+    if not any(event["type"] in MARKET_MOVING for event in week) and not earnings:
+        later = [event for event in upcoming_calendar(events, now, 400) if event["type"] in MARKET_MOVING]
+        hint = f" Next: {macro_label(later[0])} {day_label(later[0]['date'])}" if later else ""
+        lines.append(fmt.text(f"• No FOMC, CPI or watchlist earnings.{hint}"))
+    watch = outlook_lines(snapshot, signals, now, seen, BRIEFING_EARNINGS_DAYS, BRIEFING_WEEK_DAYS, fmt)
+    if watch:
+        lines += ["", fmt.bold("Next 30 days watch")] + watch
+    crypto = [row for row in signals if row.get("bucket") == "crypto" and row.get("tradable")]
+    if crypto:
+        cutoff = max((row["quoteAsOf"] for row in crypto if row.get("quoteAsOf")), default=None)
+        lines += ["", fmt.bold("Weekend crypto check") + (fmt.text(f" (UTC day to {short_date(cutoff)})") if cutoff else "")]
+        for row in crypto:
+            parts = [row["ticker"]]
+            if row.get("dailyReturn") is not None and row.get("zScore") is not None:
+                parts.append(f"{percent(row['dailyReturn'])} ({sigma(row['zScore'])})")
+            if row.get("verdict") and row.get("composite") is not None:
+                parts.append(f"{row['verdict']} {row['composite']:.0f}")
+            if row.get("relativeStrength3m") is not None and row.get("benchmark") == "BTC-USD":
+                parts.append(f"3M vs BTC {percent(row['relativeStrength3m'])}")
+            lines.append(fmt.text(" · ".join(parts[:1]) + " " + " · ".join(parts[1:])))
+    return lines
+
+
+def failure_status(snapshot: dict[str, Any] | None, outcome: str, failed_step: str | None) -> str | None:
+    """A failed run says so at the top: it is the most important thing that day."""
+    if outcome != "failed":
+        return None
+    generated = short_date(snapshot.get("generatedAt")) if isinstance(snapshot, dict) else "?"
+    if failed_step == "data refresh":
+        return (f"❌ The data refresh failed, so nothing was committed. The site keeps the snapshot of "
+                f"{generated}, and the signals below are from it.")
+    if failed_step == "commit":
+        return "⚠️ The data passed every check but could not be committed. The site keeps the previous snapshot."
+    return (f"❌ {failed_step[0].upper()}{failed_step[1:]} failed, so today's data was NOT published "
+            f"and its signals are held back. The site keeps the previous snapshot.")
+
+
+def footer_lines(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]] | None, outcome: str, failed_step: str | None,
+                 weekend: bool, links: list[tuple[str, str]], fmt: BriefingFormat) -> list[str]:
+    lines = [""]
+    if signals:
+        rows = [row for row in signals if row.get("tradable") and (row.get("bucket") == "crypto" or not weekend)]
+        if rows:
+            lines.append(fmt.text(f"{'Crypto' if weekend else 'Tradable'}: {tally_text(rows)}"))
     assets = snapshot.get("assets", []) if isinstance(snapshot, dict) else []
     stale = [asset["ticker"] for asset in assets if asset.get("status") != "fresh"]
-    counts = f"{len(assets)} assets, {len(assets) - len(stale)} fresh"
+    fresh = f"{len(assets) - len(stale)}/{len(assets)} fresh"
     if stale:
-        shown = ", ".join(stale[:4]) + (f" and {len(stale) - 4} more" if len(stale) > 4 else "")
-        counts += f", {len(stale)} carried over ({shown})"
-    generated = short_date(snapshot.get("generatedAt")) if isinstance(snapshot, dict) else "?"
-
+        fresh += f" ({', '.join(stale[:3])}{f' and {len(stale) - 3} more' if len(stale) > 3 else ''} carried over)"
+    if not isinstance(snapshot, dict):
+        fresh = "the snapshot could not be read"
     if outcome == "passed":
-        status = f"✅ Every check passed. {counts}. The site redeploys with this data."
+        status = f"✅ {fresh}" if isinstance(snapshot, dict) else f"✅ Every check passed, but {fresh}"
     elif outcome == "unknown":
-        status = f"ℹ️ Manual run: no pipeline results were supplied. Snapshot of {generated}: {counts}."
+        status = f"ℹ️ Manual run · {fresh}"
     elif failed_step == "data refresh":
-        status = (f"❌ The data refresh failed, so nothing was committed. The site keeps the snapshot of "
-                  f"{generated}, and the signals below are from it.")
+        status = "❌ Data refresh failed · last good snapshot"
     elif failed_step == "commit":
-        status = f"⚠️ The data passed every check but could not be committed. {counts}. The site keeps the previous snapshot."
+        status = f"⚠️ Not committed · {fresh}"
     else:
-        status = (f"❌ {failed_step[0].upper()}{failed_step[1:]} failed, so today's data was NOT published "
-                  f"and its signals are held back. The site keeps the previous snapshot.")
-    lines += ["", fmt.text(status)]
-
-    if signals:
-        def ranked(verdict: str, best_first: bool) -> list[dict[str, Any]]:
-            chosen = [row for row in signals if row["verdict"] == verdict and row["composite"] is not None]
-            return sorted(chosen, key=lambda row: (-row["composite"] if best_first else row["composite"], row["ticker"]))
-
-        for verdict, title, best_first in (("BUY", "Top BUY signals", True), ("SELL", "Top SELL signals", False)):
-            rows = ranked(verdict, best_first)
-            lines += ["", fmt.bold(title)]
-            if not rows:
-                lines.append(fmt.text(f"No {verdict} signals today."))
-            for position, row in enumerate(rows[:BRIEFING_TOP_SIGNALS], start=1):
-                confidence = f" · {row['confidence']} confidence" if row["confidence"] else ""
-                lines.append(fmt.text(f"{position}. ") + fmt.code(row["ticker"])
-                             + fmt.text(f" {row['name'][:32]} · {row['composite']:.0f}/100{confidence}"))
-        upcoming = sorted((row for row in signals if row.get("nextEarnings") and row["nextEarnings"]["days"] <= BRIEFING_EARNINGS_DAYS),
-                          key=lambda row: (row["nextEarnings"]["days"], row["ticker"]))
-        if upcoming:
-            lines += ["", fmt.bold(f"Earnings in the next {BRIEFING_EARNINGS_DAYS} days")]
-            for row in upcoming[:BRIEFING_MAX_EARNINGS]:
-                when = f" ~{short_date(row['nextEarnings']['date'])} (in {row['nextEarnings']['days']} days)"
-                if row.get("typicalMove") is not None and row.get("worstMove") is not None:
-                    size = f" \u00b7 typical move \u00b1{row['typicalMove'] * 100:.1f}%, worst {signed(row['worstMove'] * 100, 1)}%"
-                else:
-                    size = " \u00b7 too few past releases to size the move"
-                lines.append(fmt.text("\u26a0 ") + fmt.code(row["ticker"]) + fmt.text(when + size))
-        tally = {verdict: sum(1 for row in signals if row["verdict"] == verdict) for verdict in ("BUY", "HOLD", "SELL")}
-        lines += ["", fmt.text(f"All verdicts: {tally['BUY']} BUY · {tally['HOLD']} HOLD · {tally['SELL']} SELL")]
-    elif outcome != "failed" or failed_step in {"data refresh", "commit"}:
-        lines += ["", fmt.text("Signals are unavailable in this run (the engines could not be run).")]
-
-    if shifts is not None:
-        lines += ["", fmt.bold("Headline tone shifts")]
-        if not shifts:
-            lines.append(fmt.text("No notable shifts since the previous snapshot."))
-        for shift in shifts:
-            lines.append(fmt.text("• ") + fmt.code(shift["ticker"])
-                         + fmt.text(f" {shift['from']} → {shift['to']} ({signed(shift['before'])} → {signed(shift['after'])})"))
-            if shift["headline"]:
-                headline = shift["headline"] if len(shift["headline"]) <= 90 else shift["headline"][:87].rstrip() + "..."
-                lines.append("   " + fmt.italic(headline))
-
+        status = f"❌ {failed_step} failed · held back"
+    status_line = fmt.text(status)
     if links:
-        lines += ["", fmt.text(" · ").join(fmt.link(label, url) for label, url in links)]
+        status_line += fmt.text(" · ") + fmt.text(" · ").join(fmt.link(label, url) for label, url in links)
+    lines.append(status_line)
+    macro = snapshot.get("macro") if isinstance(snapshot, dict) else None
+    calendar = macro.get("calendar") if isinstance(macro, dict) else None
+    if isinstance(calendar, dict) and calendar.get("note") and calendar.get("status") == "fresh":
+        lines.append(fmt.text(f"⚠ {calendar['note']}"))
     lines.append(fmt.italic("Rule-based signals for learning, not financial advice."))
+    return lines
 
-    text = "\n".join(lines)
-    if len(text) > TELEGRAM_MAX_CHARS:  # cannot happen with the caps above, but never risk a rejected message
-        text = text[:TELEGRAM_MAX_CHARS].rsplit("\n", 1)[0]
-    return text
+
+def build_briefing(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]] | None,
+                   shifts: list[dict[str, Any]] | None, outcome: str, failed_step: str | None,
+                   now: datetime, links: list[tuple[str, str]], fmt: BriefingFormat,
+                   previous: dict[str, Any] | None = None) -> str:
+    """The message: risk first, bucketed, signal only.
+
+    Weekday: the regime, a ⚡ block that appears only when something happened, three
+    buckets of tradable assets, the next 30 days, and a compact footer. Saturday and Sunday
+    (UTC): the week-ahead edition, with no stale equity verdicts or movers. `previous` is the
+    snapshot before this run; it keeps a weekend from repeating Friday's triggers.
+    """
+    weekend = is_weekend_run(now)
+    title = "QuantLens · week ahead" if weekend else "QuantLens daily briefing"
+    lines = [fmt.bold(title) + fmt.text(" · " + now.strftime("%a %d %b %Y").replace(" 0", " "))]
+    # Data that failed a check is not reported: the regime and the signals follow the same rule.
+    held_back = outcome == "failed" and failed_step not in {"data refresh", "commit"}
+    has_data = isinstance(snapshot, dict) and not held_back
+    if has_data:
+        macro = snapshot.get("macro")
+        line = regime_line(macro.get("regime") if isinstance(macro, dict) else None, close_label=weekend)
+        if line:
+            lines.append(fmt.text(line))
+    status = failure_status(snapshot, outcome, failed_step)
+    if status:
+        lines += ["", fmt.text(status)]
+    if has_data:
+        rows = signals or []
+        triggers, seen = briefing_triggers(snapshot, rows, shifts, previous, now, weekend, fmt)
+        if triggers:
+            lines += ["", fmt.bold("⚡ Triggers today")] + triggers
+        if not signals:
+            lines += ["", fmt.text("Signals are unavailable in this run (the engines could not be run).")]
+        if weekend:
+            lines += week_ahead_sections(snapshot, rows, now, seen, fmt)
+        else:
+            lines += bucket_sections(rows, previous, seen["moves"], fmt)
+            outlook = closure_lines(snapshot, now, fmt) + outlook_lines(snapshot, rows, now, seen, BRIEFING_EARNINGS_DAYS, -1, fmt)
+            if outlook:
+                lines += ["", fmt.bold("Next 30 days")] + outlook
+    footer = footer_lines(snapshot, signals, outcome, failed_step, weekend, links, fmt)
+    # Never risk a rejected message: shorten the body from the bottom, never the footer.
+    while len("\n".join(lines + footer)) > TELEGRAM_MAX_CHARS and len(lines) > 2:
+        lines.pop()
+    return "\n".join(lines + footer)
 
 
 def send_telegram(text: str, token: str, chat_id: str, parse_mode: str | None,
@@ -2877,13 +3250,14 @@ def deliver_briefing(snapshot_path: Path, previous_path: Path | None, env: dict[
         held_back = outcome == "failed" and failed_step not in {"data refresh", "commit"}
         signals = signals_source(snapshot_path) if snapshot and not held_back else None
         shifts = None
-        if snapshot and not held_back and failed_step != "data refresh" and previous_path is not None:
-            previous = load_previous(previous_path)
-            shifts = sentiment_shifts(previous, snapshot) if previous else None
+        previous = load_previous(previous_path) if previous_path is not None else None
+        if snapshot and not held_back and failed_step != "data refresh" and previous:
+            shifts = sentiment_shifts(previous, snapshot)
         moment = now or datetime.now(timezone.utc)
         links = briefing_links(env)
         # Build both versions once: every recipient gets the same message.
-        texts = {markdown: build_briefing(snapshot, signals, shifts, outcome, failed_step, moment, links, BriefingFormat(markdown))
+        texts = {markdown: build_briefing(snapshot, signals, shifts, outcome, failed_step, moment, links, BriefingFormat(markdown),
+                                          previous=previous)
                  for markdown in (True, False)}
 
         results = []
