@@ -275,6 +275,11 @@ BRIEFING_MAX_EARNINGS = 5
 SENTIMENT_SHIFT_MIN = 0.25       # a move in headline tone at least this large is notable
 # V3.2 briefing: risk first, bucketed, signal only.
 BRIEFING_MOVE_SIGMA = 2.5        # a session move beyond this many EWMA σ is a trigger
+# ...or a session move at least this large, whatever σ says (V3.4). Calibrated on five years of the
+# watchlist: about the 99.3rd percentile of daily stock moves and the 99.5th of crypto; ETFs never
+# move 10%, so they get their own level. It catches crashes that a sell-off's inflated EWMA σ mutes.
+BRIEFING_MOVE_ABSOLUTE = {"equity": 0.10, "crypto": 0.15, "etf": 0.05}
+BRIEFING_MAX_FLIPS = 4           # trend flips listed in the ⚡ block
 BRIEFING_MOVER_SIGMA = 1.5       # ...and beyond this, a notable mover in its bucket
 BRIEFING_EARNINGS_TRIGGER = 5    # earnings within this many trading days are a trigger
 BRIEFING_MACRO_HOURS = 48        # FOMC decisions and CPI releases within this many hours are a trigger
@@ -2658,8 +2663,14 @@ def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
         if isinstance(dividend, dict) and is_iso_date(dividend.get("date")) and whole(dividend.get("days")):
             next_dividend = {"date": dividend["date"], "days": dividend["days"], "estimated": dividend.get("estimated") is True}
         market = row.get("market") if row.get("market") in MARKETS else None
+        history = row.get("trendHistory")
+        trend_history = [
+            {"date": state["date"], "label": state.get("label") if state.get("label") in TREND_REGIMES else None,
+             "above": state.get("above") if isinstance(state.get("above"), bool) else None,
+             "emaUp": state.get("emaUp") if isinstance(state.get("emaUp"), bool) else None}
+            for state in (history if isinstance(history, list) else []) if isinstance(state, dict) and is_iso_date(state.get("date"))]
         signals.append({
-            "ticker": row["ticker"], "name": name, "trend": trend,
+            "ticker": row["ticker"], "name": name, "trend": trend, "trendHistory": trend_history,
             "technical": finite_or_none(row.get("technical")), "fundamental": finite_or_none(row.get("fundamental")),
             "assetClass": row.get("assetClass") if row.get("assetClass") in ASSET_CLASSES else None,
             "market": market,
@@ -2875,8 +2886,77 @@ def sigma(z: float) -> str:
     return f"{signed(z, 1)}σ"
 
 
+def move_threshold(row: dict[str, Any]) -> float | None:
+    """The absolute daily move that is a trigger on its own: 10% stocks, 15% crypto, 5% ETFs."""
+    return BRIEFING_MOVE_ABSOLUTE.get(row.get("assetClass"))
+
+
+def beyond_sigma(row: dict[str, Any]) -> bool:
+    return row.get("zScore") is not None and abs(row["zScore"]) > BRIEFING_MOVE_SIGMA
+
+
+def beyond_size(row: dict[str, Any]) -> bool:
+    threshold = move_threshold(row)
+    return threshold is not None and row.get("dailyReturn") is not None and abs(row["dailyReturn"]) >= threshold - 1e-12
+
+
+def move_severity(row: dict[str, Any]) -> float:
+    """How far past its trigger a move is: |z| ÷ 2.5 or |return| ÷ its threshold, whichever is larger."""
+    by_sigma = abs(row["zScore"]) / BRIEFING_MOVE_SIGMA if row.get("zScore") is not None else 0.0
+    threshold = move_threshold(row)
+    by_size = abs(row["dailyReturn"]) / threshold if threshold and row.get("dailyReturn") is not None else 0.0
+    return max(by_sigma, by_size)
+
+
+def big_moves(signals: list[dict[str, Any]], before: dict[str, str], weekend: bool) -> list[dict[str, Any]]:
+    """T1: tradable assets whose latest new session moved beyond 2.5σ, or by at least 10% (15% crypto,
+    5% ETFs), largest first. Once per session; crypto only at weekends."""
+    rows = [row for row in signals if row.get("tradable") and row.get("dailyReturn") is not None
+            and (beyond_sigma(row) or beyond_size(row)) and new_session(row, before) and (not weekend or row.get("bucket") == "crypto")]
+    return sorted(rows, key=lambda row: (-move_severity(row), row["ticker"]))
+
+
 def move_text(row: dict[str, Any]) -> str:
-    return f"{row['ticker']} {percent(row['dailyReturn'])} ({sigma(row['zScore'])})"
+    """'MU −13.9% (−2.6σ)', and for a move only its size made a trigger: 'AMD −13.2% (−2.1σ, beyond 10%)'."""
+    z = f"{sigma(row['zScore'])}" if row.get("zScore") is not None else "σ not known"
+    size = f", beyond {move_threshold(row) * 100:.0f}%" if beyond_size(row) and not beyond_sigma(row) else ""
+    return f"{row['ticker']} {percent(row['dailyReturn'])} ({z}{size})"
+
+
+def trend_base(state: dict[str, Any]) -> tuple[Any, Any]:
+    """The part of a trend state a flip is about: the side of the 200-day average and the EMA cross."""
+    return (state.get("above"), state.get("emaUp"))
+
+
+def trend_flip(row: dict[str, Any]) -> dict[str, Any] | None:
+    """A flip across the 200-day average or the 20/50-day EMA cross that has now held for a second
+    close: the last two sessions agree and differ from the one before. RSI alone (Uptrend and
+    Extended) is never a flip. Fires on the confirming session only, so it is reported once."""
+    states = [state for state in row.get("trendHistory") or [] if state.get("label") and None not in trend_base(state)]
+    if len(states) < 3:
+        return None
+    before, held, latest = states[-3:]
+    if trend_base(latest) != trend_base(held) or trend_base(held) == trend_base(before):
+        return None
+    return {"ticker": row["ticker"], "from": before["label"], "to": latest["label"], "date": latest["date"],
+            "crossed200": before["above"] != latest["above"], "crossedEma": before["emaUp"] != latest["emaUp"]}
+
+
+def trend_flips(signals: list[dict[str, Any]], before: dict[str, str], weekend: bool) -> list[dict[str, Any]]:
+    """Confirmed flips of tradable assets with a new session (crypto only at weekends): 200-day
+    crossings first, then the EMA crosses, each in ticker order."""
+    flips = []
+    for row in signals:
+        if not row.get("tradable") or not new_session(row, before) or (weekend and row.get("bucket") != "crypto"):
+            continue
+        flip = trend_flip(row)
+        if flip is not None:
+            flips.append(flip)
+    return sorted(flips, key=lambda flip: (not flip["crossed200"], flip["ticker"]))
+
+
+def flip_text(flip: dict[str, Any]) -> str:
+    return f"{flip['ticker']} {flip['from']} → {flip['to']}"
 
 
 def earnings_size(row: dict[str, Any]) -> str:
@@ -2893,7 +2973,7 @@ def briefing_triggers(snapshot: dict[str, Any], signals: list[dict[str, Any]], s
     """The ⚡ block: only what happened or is about to. Returns its lines (none on a quiet day)
     and what it already mentioned, so the rest of the message does not repeat it."""
     lines: list[str] = []
-    seen: dict[str, set] = {"moves": set(), "earnings": set(), "events": set()}
+    seen: dict[str, set] = {"moves": set(), "flips": set(), "earnings": set(), "events": set()}
     # T4: an FOMC decision or CPI release within 48 hours, with the time in New York and Singapore.
     for event in calendar_events(snapshot):
         hours = event_hours(event, now)
@@ -2915,16 +2995,22 @@ def briefing_triggers(snapshot: dict[str, Any], signals: list[dict[str, Any]], s
         elif change["uninverted"]:
             run = f"{change['priorStreak']} inverted session{'s' if change['priorStreak'] != 1 else ''}"
             lines.append(fmt.text(f"• VIX curve no longer inverted: {regime['state']} after {run} (VIX {vix:.1f}, VIX3M {vix3m:.1f})"))
-    # T1: a session move beyond 2.5σ of the EWMA volatility, once per new session (crypto only at weekends).
+    # T1: a session move beyond 2.5σ of the EWMA volatility, or a 10% day (15% crypto, 5% ETFs),
+    # once per new session (crypto only at weekends).
     before = previous_dates(previous)
-    moves = [row for row in signals if row.get("tradable") and row.get("zScore") is not None and row.get("dailyReturn") is not None
-             and abs(row["zScore"]) > BRIEFING_MOVE_SIGMA and new_session(row, before) and (not weekend or row.get("bucket") == "crypto")]
-    moves.sort(key=lambda row: (-abs(row["zScore"]), row["ticker"]))
+    moves = big_moves(signals, before, weekend)
     if moves:
         shown = " · ".join(move_text(row) for row in moves[:BRIEFING_MAX_MOVES])
         extra = f" · +{len(moves) - BRIEFING_MAX_MOVES} more" if len(moves) > BRIEFING_MAX_MOVES else ""
-        lines.append(fmt.text(f"• Moves beyond {BRIEFING_MOVE_SIGMA}σ: {shown}{extra}"))
+        lines.append(fmt.text(f"• Big moves: {shown}{extra}"))
         seen["moves"] = {row["ticker"] for row in moves}
+    # T6: a trend flip across the 200-day average or the 20/50-day EMA cross, held for two closes (V3.4).
+    flips = trend_flips(signals, before, weekend)
+    if flips:
+        shown = " · ".join(flip_text(flip) for flip in flips[:BRIEFING_MAX_FLIPS])
+        extra = f" · +{len(flips) - BRIEFING_MAX_FLIPS} more" if len(flips) > BRIEFING_MAX_FLIPS else ""
+        lines.append(fmt.text(f"• Trend flips (held two closes): {shown}{extra}"))
+        seen["flips"] = {flip["ticker"] for flip in flips}
     # T3: earnings within 5 trading days (weekdays; the weekend edition lists the week ahead).
     if not weekend:
         soon = [row for row in signals if row.get("tradable") and row.get("nextEarnings")

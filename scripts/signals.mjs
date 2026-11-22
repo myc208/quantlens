@@ -13,6 +13,10 @@
  * the next earnings release. Macro events and the regime come straight from the
  * snapshot, which Python already reads.
  *
+ * V3.4: each asset's trend state over its last three sessions (trendHistory), so the briefing
+ * can report a flip across the 200-day average or the 20/50-day EMA cross once it has held for
+ * a second close.
+ *
  * V3.3: the trend regime (Uptrend, Extended, Pullback, Recovering, Downtrend) replaces
  * the BUY / HOLD / SELL verdict, and the Composite and Confidence are gone; the Technical
  * and Fundamental scores are reported separately.
@@ -33,6 +37,7 @@ import { analyzeEvents } from '../src/engines/eventEngine.js';
 import { holidaysFor } from '../src/engines/macroCalendarEngine.js';
 import { latestShock } from '../src/engines/riskEngine.js';
 import { analyzeFactors, benchmarkFor } from '../src/engines/factorEngine.js';
+import { recentTrendStates } from '../src/engines/backtestEngine.js';
 
 /** US / Global (US and London listings), SGX, or Crypto (24/7). */
 function bucketOf(asset) {
@@ -70,6 +75,7 @@ async function main() {
       tradable: asset.assetClass !== 'index',
       quoteAsOf: asset.quote.asOf,
       trend: regime && regime.status === 'ok' ? regime.value : null,
+      trendHistory: recentTrendStates(asset, 3),
       technical: valueOf(technical.metrics.technicalScore),
       fundamental: valueOf(fundamental.metrics.fundamentalScore),
       nextEarnings: next.status === 'ok'

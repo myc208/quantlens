@@ -1567,15 +1567,100 @@ class RiskFirstBriefing(unittest.TestCase):
     def test_moves_fire_beyond_two_and_a_half_sigma_only(self):
         rows = [self.row("EDGE", dailyReturn=-0.03, zScore=-2.50), self.row("OVER", dailyReturn=-0.03, zScore=-2.51)]
         text = self.text(signals=rows)
-        self.assertIn("Moves beyond 2.5σ: OVER −3.0% (−2.5σ)", text)
+        self.assertIn("Big moves: OVER −3.0% (−2.5σ)", text)
         self.assertNotIn("EDGE −3.0%", text.split("US / Global")[0])
 
     def test_a_move_is_reported_once_per_session(self):
         repeat = self.text(previous=self.previous(as_of="2026-11-20"))      # the previous run already had this session
-        self.assertNotIn("Moves beyond", repeat)
+        self.assertNotIn("Big moves", repeat)
         self.assertNotIn("Movers:", repeat)
         first = self.text(previous=None)                                     # nothing to compare with: report it
-        self.assertIn("Moves beyond 2.5σ: MU −13.9% (−2.6σ) · VOO −3.4% (−2.6σ)", first)
+        self.assertIn("Big moves: MU −13.9% (−2.6σ) · VOO −3.4% (−2.6σ)", first)
+
+    # --- T1 absolute-move guardrail (V3.4) ----------------------------------------
+
+    @staticmethod
+    def previous_for(rows, as_of):
+        """A previous snapshot whose assets are these rows, last traded on `as_of`."""
+        return {"assets": [{"ticker": row["ticker"], "assetClass": row["assetClass"], "status": "fresh", "quote": {"asOf": as_of}} for row in rows],
+                "macro": {"regime": {"asOf": as_of}}}
+
+    def test_a_ten_percent_day_fires_even_when_sigma_is_muted(self):
+        rows = [self.row("AMD", dailyReturn=-0.132, zScore=-2.09), self.row("NEAR", dailyReturn=-0.0999, zScore=-1.2),
+                self.row("EXACT", dailyReturn=0.10, zScore=1.1)]
+        text = self.text(signals=rows)
+        self.assertIn("• Big moves: AMD −13.2% (−2.1σ, beyond 10%) · EXACT +10.0% (+1.1σ, beyond 10%)", text)
+        self.assertNotIn("NEAR −10.0%", text.split("US / Global")[0])      # 9.99% stays a mover at most
+
+    def test_each_asset_class_has_its_own_size(self):
+        rows = [self.row("COIN", "crypto", dailyReturn=-0.15, zScore=-1.9), self.row("COIN2", "crypto", dailyReturn=-0.149, zScore=-1.9),
+                self.row("FUND", dailyReturn=-0.05, zScore=-2.0, assetClass="etf"), self.row("FUND2", dailyReturn=-0.049, zScore=-2.0, assetClass="etf")]
+        moved = [row["ticker"] for row in ff.big_moves(rows, {}, weekend=False)]
+        self.assertEqual(moved, ["COIN", "FUND"])
+        self.assertEqual(ff.move_text(rows[2]), "FUND −5.0% (−2.0σ, beyond 5%)")
+        self.assertEqual(ff.move_threshold(self.row("IDX", assetClass="index")), None)   # indices are never tradable anyway
+
+    def test_moves_are_ranked_by_how_far_past_their_trigger_they_are(self):
+        rows = [self.row("SIGMA", dailyReturn=-0.03, zScore=-2.6), self.row("SIZE", dailyReturn=-0.14, zScore=-2.0),
+                self.row("BOTH", dailyReturn=-0.12, zScore=-3.5)]
+        self.assertEqual([row["ticker"] for row in ff.big_moves(rows, {}, weekend=False)], ["SIZE", "BOTH", "SIGMA"])   # 1.40, 1.40 (3.5/2.5), 1.04
+        unknown = self.row("NEW", dailyReturn=-0.11, zScore=None)
+        self.assertEqual(ff.move_text(unknown), "NEW −11.0% (σ not known, beyond 10%)")
+
+    def test_a_size_trigger_is_also_reported_once_per_session_and_crypto_only_at_weekends(self):
+        rows = [self.row("BIG", dailyReturn=-0.12, zScore=-1.5)]
+        self.assertNotIn("Big moves", self.text(signals=rows, previous=self.previous_for(rows, "2026-11-20")))
+        self.assertIn("Big moves", self.text(signals=rows, previous=self.previous_for(rows, "2026-11-19")))
+        self.assertNotIn("Big moves", self.text(signals=rows, now=self.SUNDAY, previous=self.previous_for(rows, "2026-11-19")))
+
+    # --- T6 trend flips (V3.4) ------------------------------------------------------
+
+    @staticmethod
+    def states(*specs):
+        """('Uptrend', True, True) per session, oldest first, on consecutive dates."""
+        days = ["2026-11-18", "2026-11-19", "2026-11-20"][-len(specs):]
+        return [{"date": day, "label": label, "above": above, "emaUp": up} for day, (label, above, up) in zip(days, specs)]
+
+    def test_a_flip_needs_a_second_close(self):
+        up, recovering, pullback = ("Uptrend", True, True), ("Recovering", False, True), ("Pullback", True, False)
+        confirmed = self.row("TSLA", trendHistory=self.states(up, recovering, recovering))
+        self.assertEqual(ff.trend_flip(confirmed), {"ticker": "TSLA", "from": "Uptrend", "to": "Recovering", "date": "2026-11-20",
+                                                   "crossed200": True, "crossedEma": False})
+        self.assertIsNone(ff.trend_flip(self.row("NEW", trendHistory=self.states(up, up, recovering))))           # one close only
+        self.assertIsNone(ff.trend_flip(self.row("BACK", trendHistory=self.states(up, recovering, up))))         # reversed
+        self.assertIsNone(ff.trend_flip(self.row("OLD", trendHistory=self.states(recovering, recovering, recovering))))
+        ema = ff.trend_flip(self.row("EMA", trendHistory=self.states(up, pullback, pullback)))
+        self.assertEqual((ema["crossed200"], ema["crossedEma"]), (False, True))
+        self.assertIsNone(ff.trend_flip(self.row("SHORT", trendHistory=self.states(up, recovering))))
+
+    def test_rsi_alone_is_never_a_flip(self):
+        up, extended = ("Uptrend", True, True), ("Extended", True, True)
+        self.assertIsNone(ff.trend_flip(self.row("HOT", trendHistory=self.states(up, extended, extended))))
+        stretched_pullback = ("Extended", True, False)                       # EMAs already crossed down, RSI above 70
+        self.assertIsNone(ff.trend_flip(self.row("COOL", trendHistory=self.states(stretched_pullback, ("Pullback", True, False), ("Pullback", True, False)))))
+
+    def test_flips_are_listed_200_day_first_capped_and_never_repeated(self):
+        up, recovering, down, pullback = ("Uptrend", True, True), ("Recovering", False, True), ("Downtrend", False, False), ("Pullback", True, False)
+        rows = [self.row("EMA1", trendHistory=self.states(up, pullback, pullback)),
+                self.row("VOO", trendHistory=self.states(pullback, down, down)),
+                self.row("TSLA", trendHistory=self.states(up, recovering, recovering)),
+                self.row("J69U.SI", "sgx", trendHistory=self.states(up, recovering, recovering)),
+                self.row("EMA2", trendHistory=self.states(down, recovering, recovering))]
+        flips = ff.trend_flips(rows, {}, weekend=False)
+        self.assertEqual([flip["ticker"] for flip in flips], ["J69U.SI", "TSLA", "VOO", "EMA1", "EMA2"])
+        text = self.text(signals=rows)
+        self.assertIn("• Trend flips (held two closes): J69U.SI Uptrend → Recovering · TSLA Uptrend → Recovering · "
+                      "VOO Pullback → Downtrend · EMA1 Uptrend → Pullback · +1 more", text)
+        self.assertNotIn("Trend flips", self.text(signals=rows, previous=self.previous_for(rows, "2026-11-20")))   # same session again
+        everything = rows + [self.row("ETH-USD", "crypto", trendHistory=self.states(up, recovering, recovering))]
+        weekend = self.text(signals=everything, now=self.SUNDAY, previous=self.previous_for(everything, "2026-11-19"))
+        self.assertIn("• Trend flips (held two closes): ETH-USD Uptrend → Recovering", weekend)              # crypto only
+
+    def test_flips_sit_after_moves_and_before_tone(self):
+        rows = [self.row("MU", dailyReturn=-0.139, zScore=-2.63, trendHistory=self.states(("Uptrend", True, True), ("Recovering", False, True), ("Recovering", False, True)))]
+        shifts = [{"ticker": "MU", "from": "positive", "to": "negative", "before": 0.5, "after": -0.5, "delta": -1.0, "headline": "H"}]
+        block = self.text(signals=rows, shifts=shifts).split("⚡ Triggers today\n")[1].split("\n\n")[0].split("\n")
+        self.assertEqual([line.split(":")[0] for line in block if line.startswith("•")], ["• Big moves", "• Trend flips (held two closes)", "• Tone"])
 
     def test_triggered_moves_are_not_repeated_as_bucket_movers(self):
         text = self.text()
@@ -1673,7 +1758,7 @@ class RiskFirstBriefing(unittest.TestCase):
         rows = self.signals()
         rows[-1] = dict(rows[-1], quoteAsOf="2026-11-21", zScore=-3.1, dailyReturn=-0.09)   # a new UTC day for ETH
         text = self.text(signals=rows, now=self.SUNDAY, previous=self.previous(as_of="2026-11-20", regime_as_of="2026-11-20"))
-        self.assertIn("• Moves beyond 2.5σ: ETH-USD −9.0% (−3.1σ)", text)
+        self.assertIn("• Big moves: ETH-USD −9.0% (−3.1σ)", text)
         self.assertNotIn("MU −13.9%", text)
 
     # --- failures, markdown, size ---------------------------------------------------
@@ -1739,6 +1824,10 @@ class RiskFirstBriefing(unittest.TestCase):
             self.assertIsNotNone(row["nextEarnings"]["tradingDays"])
         self.assertTrue(any(row["nextExDividend"] for row in signals))
         self.assertTrue(any(row["relativeStrength3m"] is not None for row in signals))
+        for row in signals:                                                  # V3.4: the last three trend states
+            self.assertEqual(len(row["trendHistory"]), 3, row["ticker"])
+            self.assertEqual(row["trendHistory"][-1]["label"], row["trend"], row["ticker"])
+            self.assertEqual(row["trendHistory"][-1]["date"], row["quoteAsOf"], row["ticker"])
         tradable = [row for row in signals if row["tradable"]]
         tally = ff.tally_text(tradable)                                      # every tradable is counted exactly once
         self.assertEqual(sum(int(part.split(" ")[0]) for part in tally.split(" · ")), len(tradable))

@@ -4685,6 +4685,31 @@
     });
 
     /* ================================================================== */
+    /* 35. V3.4 recent trend states, for the briefing's trend flips         */
+    /* ================================================================== */
+
+    suite('recent trend states: the last three sessions, as the live engine saw them', () => {
+      test('real snapshot: the last state is today\'s label, and every state agrees with its own crossings', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const fromCrossings = (state) => (state.above ? (state.emaUp ? ['Uptrend', 'Extended'] : ['Pullback', 'Extended']) : [state.emaUp ? 'Recovering' : 'Downtrend']);
+        for (const asset of snapshot.assets) {
+          const states = backtest.recentTrendStates(asset, 3);
+          expect(states.length).toBe(3);
+          expect(states.map((state) => state.date)).toEqual(asset.longSeries.dates.slice(-3));
+          expect(states[2].label).toBe(technical.analyzeTechnicals(asset).metrics.trendRegime.value);
+          for (const state of states) expect(fromCrossings(state)).toContain(state.label);
+        }
+      });
+      test('a short history gives as many states as it can, never a guess', () => {
+        const asset = makeAsset({ ticker: 'NEW', closes: Array.from({ length: 260 }, (_, i) => 100 + i * 0.1) });
+        const states = backtest.recentTrendStates(asset, 3);
+        expect(states.length).toBe(1);                                       // only the live window itself
+        expect(states[0].label).toBe(technical.analyzeTechnicals(asset).metrics.trendRegime.value);
+      });
+    });
+
+    /* ================================================================== */
     /* Runner and report                                                   */
     /* ================================================================== */
 
