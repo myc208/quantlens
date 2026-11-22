@@ -1,0 +1,10 @@
+{
+  "name": "quantlens-bot",
+  "private": true,
+  "description": "The QuantLens Telegram agent: a Cloudflare Worker that answers from data/bot_context.json.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "deploy": "npx wrangler deploy"
+  }
+}

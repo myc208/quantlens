@@ -1,0 +1,43 @@
+name: Worker tests
+
+# The Telegram agent in worker/ (a Cloudflare Worker, deployed by hand with wrangler).
+# Its tests need only Node: Telegram, GitHub Pages and Gemini are all faked, and no secret
+# is used. They run against a frozen copy of bot_context.json and against the committed
+# data/bot_context.json, so a change to the export that would break a reply shows up here.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - "data/bot_context.json"
+      - ".github/workflows/worker.yml"
+  pull_request:
+    paths:
+      - "worker/**"
+      - "data/bot_context.json"
+      - ".github/workflows/worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Worker tests
+        run: node --test "worker/test/*.test.mjs"

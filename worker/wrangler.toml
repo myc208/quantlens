@@ -1,0 +1,23 @@
+# QuantLens Telegram agent (V4.0): a Cloudflare Worker on the free plan.
+# Setup, secrets and the webhook: see worker/README.md.
+name = "quantlens-bot"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true
+
+[vars]
+# The agent-ready summary the daily pipeline publishes. Read-only; cached at the edge.
+CONTEXT_URL = "https://myc208.github.io/quantlens/data/bot_context.json"
+SITE_URL = "https://myc208.github.io/quantlens/"
+CONTEXT_CACHE_SECONDS = "300"
+# Plain-English questions. Changing the model is this one line.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+# Secrets are never written here. Set each one with: npx wrangler secret put <NAME>
+#   TELEGRAM_BOT_TOKEN       the bot's token from @BotFather
+#   TELEGRAM_WEBHOOK_SECRET  a random 32+ character string (A-Z a-z 0-9 _ -), also given to setWebhook
+#   TELEGRAM_CHAT_ID         the chats allowed to talk to the bot: ids or @channel names, comma-separated
+#   GEMINI_API_KEY           from Google AI Studio (optional: without it, only the slash commands answer)
+
+[observability]
+enabled = true
