@@ -51,8 +51,8 @@ export async function respond(message, env, deps = {}) {
       return outcome;
     }
     await sendTyping(env, chatId, { fetchImpl });
-    const outcome = await answerQuestion(message, env, { ...deps, fetchImpl, now });
-    log('question', { outcome });
+    const { outcome, answer, flagged } = await answerQuestion(message, env, { ...deps, fetchImpl, now });
+    log('question', { followUp: Boolean(message.replyTo), answer, flagged, outcome });
     return outcome;
   } catch (error) {
     log('error', { kind: error && error.name ? error.name : 'Error' });

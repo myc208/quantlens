@@ -164,8 +164,8 @@ test('/upcoming: the next 30 days by date, macro times in both clocks', () => {
     'Wed 9 Dec: FOMC rate decision (+ projections) at 2:00 PM ET (Thu 3:00 AM SGT)',
     'Thu 10 Dec: US CPI (November) at 8:30 AM ET (Thu 9:30 PM SGT)',
     'Fri 11 Dec: ex-dividend WMT',
-    'Mon 14 Dec: earnings ORCL (after the close)',
-    'Thu 17 Dec: earnings MU (after the close)',
+    'Mon 14 Dec: earnings ORCL (after the close; typical move ±9.8%, worst −13.5%)',
+    'Thu 17 Dec: earnings MU (after the close; typical move ±5.8%, worst −16.2%)',
     'Counted from the snapshot date. Earnings dates come from company calendars and can move.',
     'Snapshot 22 Nov 2026 · not financial advice',
   ]);

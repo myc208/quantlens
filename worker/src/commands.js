@@ -30,17 +30,17 @@ export function parseCommand(text) {
 }
 
 /** The last line of every reply: the snapshot's date, and that this is not advice. */
-function footer(context) {
+export function footer(context) {
   return `Snapshot ${longDate(context.asOf)} · not financial advice`;
 }
 
-function staleLine(loaded) {
+export function staleLine(loaded) {
   if (!loaded.stale) return [];
   const days = Math.floor(loaded.ageHours / 24);
   return [`⚠ This snapshot is ${days} day${days === 1 ? '' : 's'} old: the daily refresh may have failed.`];
 }
 
-function unavailable(loaded) {
+export function unavailable(loaded) {
   return [`QuantLens data is unreachable right now: ${loaded.problem}. Try again in a few minutes; the commands answer only from the published snapshot.`];
 }
 
@@ -154,7 +154,7 @@ function curveLine(regime) {
   return `VIX ${fixed(vix, 1)} and VIX3M ${fixed(vix3m, 1)} (ratio ${ratio}): ${shape}`;
 }
 
-function regimeLines(context) {
+export function regimeLines(context) {
   const regime = context.regime;
   const lines = [];
   if (!regime || regime.status === 'unavailable' || !regime.levels) {
@@ -219,7 +219,7 @@ export function triggerLines(context) {
 /* /rotation                                                           */
 /* ------------------------------------------------------------------ */
 
-function rotationLines(context) {
+export function rotationLines(context) {
   const { groups = [] } = context.rotation;
   const lines = [[bold('Rotation vs the S&P 500 in USD')], 'Group medians of relative strength over 3 months · 1 month.'];
   for (const quadrant of QUADRANTS) {
@@ -239,8 +239,11 @@ function rotationLines(context) {
 
 function eventText(event) {
   switch (event.kind) {
-    case 'earnings':
-      return `earnings ${event.ticker} (${TIMING[event.timing] ?? 'time not known'})`;
+    case 'earnings': {
+      const size = typeof event.typicalMove === 'number' && typeof event.worstMove === 'number'
+        ? `; typical move ±${pct(event.typicalMove, 1)}, worst ${pct(event.worstMove, 1, { signed: true })}` : '';
+      return `earnings ${event.ticker} (${TIMING[event.timing] ?? 'time not known'}${size})`;
+    }
     case 'ex-dividend':
       return `ex-dividend ${event.ticker}${event.estimated ? ' (estimated)' : ''}`;
     case 'fomc-decision':
@@ -255,7 +258,7 @@ function eventText(event) {
   }
 }
 
-function upcomingLines(context) {
+export function upcomingLines(context) {
   const lines = [[bold('The next 30 days')]];
   if (!context.events.length) {
     lines.push('Nothing scheduled: no FOMC, CPI, market closures, watchlist earnings or ex-dividend dates.');
