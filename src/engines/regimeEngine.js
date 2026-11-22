@@ -17,7 +17,7 @@
  * same rules to the same stored levels for the Telegram briefing, and a test checks
  * that the two agree on the committed snapshot.
  *
- * Context only: the regime is not an input to any score, verdict or position size.
+ * Context only: the regime is not an input to any score, trend regime or position size.
  */
 
 import { isNum, safeDiv } from '../core/precisionMath.js';
@@ -47,7 +47,7 @@ const FORMULAS = Object.freeze({
   vixTermRatio: 'VIX ÷ VIX3M: below 1 the curve slopes up (contango), at or above 1 it is inverted',
   vixFrontRatio: 'VIX9D ÷ VIX: above 1, the next nine days are priced as riskier than the next month',
 });
-const CONTEXT = 'Context only: the regime is not an input to any score, verdict or position size.';
+const CONTEXT = 'Context only: the regime is not an input to any score, trend regime or position size.';
 
 /**
  * The regime's state from the VIX and VIX3M levels, or null if they are unusable.

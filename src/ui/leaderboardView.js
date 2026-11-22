@@ -1,14 +1,15 @@
 /**
  * leaderboardView.js: the whole watchlist in one sortable table.
  *
- * Default order: Composite score, best first. Every column header sorts; the
+ * Default order: trend regime (Uptrend first, Downtrend last), then 3-month relative
+ * strength, strongest first. Every column header sorts; the
  * current order is exposed through aria-sort. Assets with no value for the
  * sorted column always sink to the bottom, whichever direction is chosen, so
  * "N/A" never masquerades as the best or the worst.
  *
  * The table respects the screener filters, so "banks in Singapore, ranked by
  * fundamentals" is two clicks. The period columns (return, volatility,
- * drawdown) follow the time range; the scores and the verdict never do.
+ * drawdown) follow the time range; the trend regime and the scores never do.
  *
  * Every value is a button that opens its derivation, exactly as in the
  * comparison matrix. The table shows as many columns as its own width allows
@@ -22,19 +23,20 @@ import { MAX_SELECTED, filterAssets, hasActiveFilters } from '../core/store.js';
 import { isNum } from '../core/precisionMath.js';
 import { valueOf } from '../core/derivationTracer.js';
 
-const VERDICT_RANK = Object.freeze({ BUY: 3, HOLD: 2, SELL: 1 });
-const VERDICT_TONES = Object.freeze({ BUY: 'healthy', HOLD: 'neutral', SELL: 'risky' });
+// Sort order of the trend regimes, strongest trend first. Extended sits below Uptrend:
+// stretched, not stronger.
+export const TREND_RANK = Object.freeze({ Uptrend: 5, Extended: 4, Pullback: 3, Recovering: 2, Downtrend: 1 });
 
 /**
  * Column definitions. `first` is the direction of the first click: the one a
  * reader most often wants (highest score first, lowest volatility first).
  * `tier` decides when the column is shown: a = always, b = from a medium
- * table width, c = only on a wide table.
+ * table width, c = only on a wide table. `then` breaks ties, strongest first.
  */
 export const BOARD_COLUMNS = Object.freeze([
   { id: 'ticker', label: 'Asset', tier: 'a', first: 'ascending' },
-  { id: 'verdict', label: 'Verdict', metric: 'verdict', tier: 'a', first: 'descending' },
-  { id: 'compositeScore', label: 'Composite', metric: 'compositeScore', tier: 'a', first: 'descending' },
+  { id: 'trendRegime', label: 'Trend', metric: 'trendRegime', tier: 'a', first: 'descending', then: 'relativeStrength3m' },
+  { id: 'relativeStrength3m', label: 'RS 3M', metric: 'relativeStrength3m', tier: 'a', first: 'descending' },
   { id: 'technicalScore', label: 'Technical', metric: 'technicalScore', tier: 'b', first: 'descending' },
   { id: 'fundamentalScore', label: 'Fundamental', metric: 'fundamentalScore', tier: 'b', first: 'descending' },
   { id: 'price', label: 'Price', metric: 'price', tier: 'b', first: 'descending' },
@@ -42,13 +44,12 @@ export const BOARD_COLUMNS = Object.freeze([
   { id: 'periodVolatility', label: 'Volatility', metric: 'periodVolatility', tier: 'b', first: 'ascending', ranged: true },
   { id: 'maxDrawdown', label: 'Drawdown', metric: 'maxDrawdown', tier: 'c', first: 'descending', ranged: true },
   { id: 'beta', label: 'Beta', metric: 'beta', tier: 'c', first: 'descending', ranged: true },
-  { id: 'relativeStrength3m', label: 'RS 3M', metric: 'relativeStrength3m', tier: 'c', first: 'descending' },
   { id: 'dollarVolume', label: 'Traded value', metric: 'dollarVolume', tier: 'c', first: 'descending' },
   { id: 'headlineTone', label: 'News tone', metric: 'headlineTone', tier: 'c', first: 'descending' },
   { id: 'forecast30d', label: '30d projection', metric: 'forecast30d', tier: 'c', first: 'descending' },
 ].map((column) => Object.freeze(column)));
 
-export const DEFAULT_SORT = Object.freeze({ key: 'compositeScore', direction: 'descending' });
+export const DEFAULT_SORT = Object.freeze({ key: 'trendRegime', direction: 'descending' });
 
 /**
  * Order rows by one column.
@@ -56,25 +57,27 @@ export const DEFAULT_SORT = Object.freeze({ key: 'compositeScore', direction: 'd
  * @param {{ ticker:string, values:Record<string, number|string|null> }[]} rows
  * @param {string} key a column id
  * @param {'ascending'|'descending'} direction
- * @returns {object[]} a new array: missing values last, ties broken by ticker A–Z
+ * @param {string|null} [then] a second column that breaks ties, highest first, missing last
+ * @returns {object[]} a new array: missing values last, ties broken by `then`, then by ticker A–Z
  */
-export function sortRows(rows, key, direction = 'descending') {
+export function sortRows(rows, key, direction = 'descending', then = null) {
   const sign = direction === 'ascending' ? 1 : -1;
   const missing = (value) => value === null || value === undefined || (typeof value === 'number' && !Number.isFinite(value));
-  return [...rows].sort((a, b) => {
-    const left = a.values[key];
-    const right = b.values[key];
+  const compare = (a, b, column, columnSign) => {
+    const left = a.values[column];
+    const right = b.values[column];
     const leftMissing = missing(left);
     const rightMissing = missing(right);
     if (leftMissing !== rightMissing) return leftMissing ? 1 : -1; // regardless of direction
-    if (!leftMissing) {
-      const order = typeof left === 'string' || typeof right === 'string'
-        ? String(left).localeCompare(String(right))
-        : left - right;
-      if (order !== 0) return order * sign;
-    }
-    return a.ticker.localeCompare(b.ticker);
-  });
+    if (leftMissing) return 0;
+    const order = typeof left === 'string' || typeof right === 'string'
+      ? String(left).localeCompare(String(right))
+      : left - right;
+    return order * columnSign;
+  };
+  return [...rows].sort((a, b) => compare(a, b, key, sign)
+    || (then && then !== key ? compare(a, b, then, -1) : 0)
+    || a.ticker.localeCompare(b.ticker));
 }
 
 export function mountLeaderboardView(root, app) {
@@ -95,7 +98,7 @@ export function mountLeaderboardView(root, app) {
       if (!column.metric) continue;
       const metric = app.trace(asset.ticker, column.metric);
       metrics[column.id] = metric;
-      if (column.id === 'verdict') values.verdict = metric && metric.status === 'ok' ? VERDICT_RANK[metric.value] ?? null : null;
+      if (column.id === 'trendRegime') values.trendRegime = metric && metric.status === 'ok' ? TREND_RANK[metric.value] ?? null : null;
       // Prices are compared in the display currency, so SGD and USD assets sort on one scale.
       else if (column.id === 'price') values.price = metric && metric.status === 'ok' ? h.money(metric.value, asset.currency).value : null;
       // Traded value is compared in one currency too.
@@ -109,9 +112,8 @@ export function mountLeaderboardView(root, app) {
 
   function valueMarkup(column, metric) {
     if (!metric || metric.status !== 'ok') return '<span class="badge badge--na">N/A</span>';
-    if (column.id === 'verdict') {
-      const tone = VERDICT_TONES[metric.value] ?? 'neutral';
-      return `<span class="badge badge--verdict badge--${tone}">${h.toneMark(tone)}${esc(metric.value)}</span>`;
+    if (column.id === 'trendRegime') {
+      return `<span class="badge badge--trend badge--${metric.tone}">${h.toneMark(metric.tone)}${esc(metric.value)}</span>`;
     }
     if (column.id === 'headlineTone') {
       const word = String(metric.meta.label ?? '');
@@ -223,14 +225,19 @@ export function mountLeaderboardView(root, app) {
     for (const cell of root.querySelectorAll(selector)) cell.setAttribute('aria-current', 'true');
   }
 
-  /** One line on how the verdict has done across the whole watchlist, once the worker has replayed it. */
+  /** One line on what followed each trend regime across the whole watchlist, once the worker has replayed it. */
   function backtestLine() {
     const job = app.backtest();
-    if (!job.result) return job.status === 'running' ? '<p class="matrix__sub">Replaying the verdict over five years in the background…</p>' : '';
+    if (!job.result) return job.status === 'running' ? '<p class="matrix__sub">Replaying the trend regimes over five years in the background…</p>' : '';
     const s = job.result.summary;
     if (!s.assets) return '';
     const pct = (value) => esc(h.signedPercent(value, 2));
-    return `<p class="matrix__sub"><strong>Verdict track record</strong> (price-based half, ${s.horizon} sessions ahead, ${s.assets} assets): BUY days ${pct(s.buy.mean)}, HOLD ${pct(s.hold.mean)}, SELL ${pct(s.sell.mean)}, against ${pct(s.all.mean)} on all days. Mean rank IC ${esc(h.formatNumber(s.meanIc, 2))}; positive for ${s.positiveIc} of ${s.assets}.</p>`;
+    const labels = Object.keys(TREND_RANK).filter((label) => s.labels[label] && s.labels[label].count)
+      .map((label) => `${label} ${pct(s.labels[label].mean)}`).join(', ');
+    const month = (iso) => new Date(`${iso}T00:00:00Z`).toLocaleString('en-GB', { month: 'short', year: 'numeric', timeZone: 'UTC' });
+    const span = s.span ? `, ${esc(month(s.span.from))} to ${esc(month(s.span.to))}` : '';
+    const ic = String(h.formatNumber(s.meanIc, 2)).replace('-', '−');
+    return `<p class="matrix__sub"><strong>Regime track record</strong> (average return over the next ${s.horizon} sessions${span}, ${s.assets} assets): ${labels}, against ${pct(s.all.mean)} on all days. The Technical score's mean rank IC was ${esc(ic)} (positive for ${s.positiveIc} of ${s.assets}): no label or score predicted the next month.</p>`;
   }
 
   function render() {
@@ -242,15 +249,17 @@ export function mountLeaderboardView(root, app) {
     dirty = false;
     const range = h.rangeInfo(state.range);
     const total = state.snapshot.assets.length;
-    const visible = filterAssets(state.snapshot.assets, state.filters, app.verdicts());
-    const rows = sortRows(visible.map(rowFor), sort.key, sort.direction);
-    const sortedBy = BOARD_COLUMNS.find((column) => column.id === sort.key) ?? BOARD_COLUMNS[2];
+    const visible = filterAssets(state.snapshot.assets, state.filters, app.trends());
+    const sortedBy = BOARD_COLUMNS.find((column) => column.id === sort.key) ?? BOARD_COLUMNS[1];
+    const rows = sortRows(visible.map(rowFor), sort.key, sort.direction, sortedBy.then ?? null);
+    const thenBy = sortedBy.then ? BOARD_COLUMNS.find((column) => column.id === sortedBy.then) : null;
+    const sortedText = `${sortedBy.label}${thenBy ? `, then ${thenBy.label}` : ''}`;
     const span = BOARD_COLUMNS.length + 3;
     const filtered = hasActiveFilters(state.filters);
 
     const table = rows.length ? `
       <table class="board">
-        <caption class="sr-only">Watchlist ranked by ${esc(sortedBy.label)}, ${sort.direction}. Column headers sort the table; each value opens its derivation.</caption>
+        <caption class="sr-only">Watchlist ranked by ${esc(sortedText)}, ${sort.direction}. Column headers sort the table; each value opens its derivation.</caption>
         <thead>
           <tr>
             <th scope="col" class="col-b"><span class="board__heading" title="Position in the current order">#</span></th>
@@ -274,18 +283,18 @@ export function mountLeaderboardView(root, app) {
         <header class="view-toolbar">
           <div>
             <h1 class="matrix__title" id="leaderboard-title">Leaderboard</h1>
-            <p class="matrix__sub">${rows.length} of ${total} assets${filtered ? ' (filtered)' : ''} · sorted by ${esc(sortedBy.label)} · amounts in ${esc(state.currency)} · period columns cover the last ${esc(range.label)}</p>
+            <p class="matrix__sub">${rows.length} of ${total} assets${filtered ? ' (filtered)' : ''} · sorted by ${esc(sortedText)} · amounts in ${esc(state.currency)} · period columns cover the last ${esc(range.label)}</p>
             ${backtestLine()}
           </div>
           <div class="toolbar-actions">
-            ${sort.key !== DEFAULT_SORT.key || sort.direction !== DEFAULT_SORT.direction ? '<button type="button" class="btn btn--sm" data-action="reset-sort" data-key="board|reset-sort">Sort by Composite</button>' : ''}
+            ${sort.key !== DEFAULT_SORT.key || sort.direction !== DEFAULT_SORT.direction ? '<button type="button" class="btn btn--sm" data-action="reset-sort" data-key="board|reset-sort">Default order</button>' : ''}
             <span class="pill-note">${state.selected.length} of ${MAX_SELECTED} in the comparison</span>
           </div>
         </header>
         ${state.mode === 'guided' ? `
           <div class="guide-note guided-only">
             <span class="guide-note__badge">Guided</span>
-            <span>Composite blends the Technical and Fundamental scores into one number out of 100, and the verdict is read from it. Select a column heading to rank by it, and any value to see its working. Return, volatility and drawdown follow the time range; scores and verdicts always use the full year. News tone and the 30-day projection are context only and never move a score.</span>
+            <span>The trend regime says where each price stands against its own averages: a description, not a forecast, and the header above shows what followed each one. The Technical and Fundamental scores are separate readouts, never blended into one rating. Select a column heading to rank by it, and any value to see its working. Return, volatility and drawdown follow the time range; regimes and scores always use the full year. News tone and the 30-day projection are context only.</span>
           </div>` : ''}
         ${table}`;
     });

@@ -24,7 +24,7 @@ import sys
 import time
 import unittest
 import urllib.error
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -730,11 +730,11 @@ class TelegramBriefing(unittest.TestCase):
     PASSED = {"QUANTLENS_FETCH": "success", "QUANTLENS_VALIDATE": "success", "QUANTLENS_GATE1": "success",
               "QUANTLENS_GATE2": "success", "QUANTLENS_COMMIT": "success"}
     SIGNALS = [
-        {"ticker": "MU", "name": "Micron Technology", "verdict": "BUY", "composite": 81.4, "confidence": "High"},
-        {"ticker": "D05.SI", "name": "DBS Group", "verdict": "BUY", "composite": 70.0, "confidence": "Medium"},
-        {"ticker": "^GSPC", "name": "S&P 500", "verdict": "HOLD", "composite": 55.0, "confidence": "Low"},
-        {"ticker": "BRK-B", "name": "Berkshire Hathaway", "verdict": "SELL", "composite": 40.2, "confidence": "Low"},
-        {"ticker": "ETH-USD", "name": "Ethereum", "verdict": "SELL", "composite": 12.0, "confidence": "Low"},
+        {"ticker": "MU", "name": "Micron Technology", "trend": "Uptrend", "technical": 81.4, "fundamental": 70.0},
+        {"ticker": "D05.SI", "name": "DBS Group", "trend": "Pullback", "technical": 55.0, "fundamental": 62.0},
+        {"ticker": "^GSPC", "name": "S&P 500", "trend": "Recovering", "technical": 50.0, "fundamental": None},
+        {"ticker": "BRK-B", "name": "Berkshire Hathaway", "trend": "Uptrend", "technical": 60.2, "fundamental": 58.0},
+        {"ticker": "ETH-USD", "name": "Ethereum", "trend": "Downtrend", "technical": 12.0, "fundamental": None},
     ]
 
     @classmethod
@@ -1310,7 +1310,7 @@ class MarketRegime(unittest.TestCase):
 
     def test_the_regime_heads_the_briefing_and_is_escaped_for_markdown(self):
         snapshot = {"generatedAt": "2026-11-21T11:18:28Z", "assets": [], "macro": {"regime": self.block()}}
-        signals = [{"ticker": "MU", "name": "Micron", "verdict": "BUY", "composite": 70.0, "confidence": "High"}]
+        signals = [{"ticker": "MU", "name": "Micron", "trend": "Uptrend", "technical": 70.0, "fundamental": 60.0}]
         plain = ff.build_briefing(snapshot, signals, None, "passed", None, NOW, [], ff.BriefingFormat(False)).split("\n")
         self.assertTrue(plain[1].startswith("🔴 Market regime: stressed"))   # title and date, then the regime
         markdown = ff.build_briefing(snapshot, signals, None, "passed", None, NOW, [], ff.BriefingFormat(True)).split("\n")
@@ -1458,8 +1458,8 @@ class RiskFirstBriefing(unittest.TestCase):
     SUNDAY = datetime(2026, 11, 22, 22, 30, tzinfo=timezone.utc)
 
     @staticmethod
-    def row(ticker, bucket="global", verdict="HOLD", composite=50.0, **extra):
-        base = {"ticker": ticker, "name": ticker, "verdict": verdict, "composite": composite, "confidence": "Low",
+    def row(ticker, bucket="global", trend="Pullback", technical=50.0, **extra):
+        base = {"ticker": ticker, "name": ticker, "trend": trend, "technical": technical, "fundamental": None,
                 "assetClass": "crypto" if bucket == "crypto" else "equity", "market": {"global": "US", "sgx": "SG", "crypto": "CRYPTO"}[bucket],
                 "bucket": bucket, "tradable": True, "quoteAsOf": "2026-11-20", "nextEarnings": None, "nextExDividend": None,
                 "typicalMove": None, "worstMove": None, "dailyReturn": 0.001, "zScore": 0.1, "relativeStrength3m": None, "benchmark": None}
@@ -1468,20 +1468,20 @@ class RiskFirstBriefing(unittest.TestCase):
 
     def signals(self):
         return [
-            self.row("XOM", verdict="BUY", composite=66.0, relativeStrength3m=0.05),
-            self.row("MU", composite=57.0, dailyReturn=-0.139, zScore=-2.63, relativeStrength3m=-0.31,
+            self.row("XOM", trend="Uptrend", technical=66.0, relativeStrength3m=0.05),
+            self.row("MU", trend="Downtrend", technical=57.0, dailyReturn=-0.139, zScore=-2.63, relativeStrength3m=-0.31,
                      nextEarnings={"date": "2026-12-17", "dateTo": "2026-12-18", "timing": "after-close", "days": 27, "tradingDays": 18},
                      typicalMove=0.058, worstMove=-0.162),
-            self.row("TSLA", verdict="SELL", composite=23.0, dailyReturn=-0.076, zScore=-2.45),
-            self.row("WMT", composite=60.0, relativeStrength3m=0.37, nextExDividend={"date": "2026-12-11", "days": 21, "estimated": False}),
-            self.row("VOO", verdict="SELL", composite=14.0, dailyReturn=-0.034, zScore=-2.60, assetClass="etf"),
-            self.row("^GSPC", verdict="SELL", composite=13.0, assetClass="index", tradable=False, dailyReturn=-0.037, zScore=-2.85),
-            self.row("C6L.SI", "sgx", verdict="BUY", composite=70.0, relativeStrength3m=0.15,
+            self.row("TSLA", trend="Downtrend", technical=23.0, dailyReturn=-0.076, zScore=-2.45),
+            self.row("WMT", trend="Uptrend", technical=60.0, relativeStrength3m=0.37, nextExDividend={"date": "2026-12-11", "days": 21, "estimated": False}),
+            self.row("VOO", trend="Recovering", technical=14.0, dailyReturn=-0.034, zScore=-2.60, assetClass="etf"),
+            self.row("^GSPC", trend="Downtrend", technical=13.0, assetClass="index", tradable=False, dailyReturn=-0.037, zScore=-2.85),
+            self.row("C6L.SI", "sgx", trend="Uptrend", technical=70.0, relativeStrength3m=0.15,
                      nextExDividend={"date": "2026-11-25", "days": 5, "estimated": False}),
-            self.row("A17U.SI", "sgx", verdict="SELL", composite=44.0, dailyReturn=-0.023, zScore=-2.0,
+            self.row("A17U.SI", "sgx", trend="Downtrend", technical=44.0, dailyReturn=-0.023, zScore=-2.0,
                      nextExDividend={"date": "2027-01-18", "days": 59, "estimated": True}),
-            self.row("BTC-USD", "crypto", verdict="SELL", composite=8.0, dailyReturn=-0.05, zScore=-2.0),
-            self.row("ETH-USD", "crypto", verdict="SELL", composite=13.0, dailyReturn=-0.077, zScore=-2.46, relativeStrength3m=-0.14, benchmark="BTC-USD"),
+            self.row("BTC-USD", "crypto", trend="Downtrend", technical=8.0, dailyReturn=-0.05, zScore=-2.0),
+            self.row("ETH-USD", "crypto", trend="Downtrend", technical=13.0, dailyReturn=-0.077, zScore=-2.46, relativeStrength3m=-0.14, benchmark="BTC-USD"),
         ]
 
     @staticmethod
@@ -1514,29 +1514,51 @@ class RiskFirstBriefing(unittest.TestCase):
         lines = text.split("\n")
         self.assertEqual(lines[0], "QuantLens daily briefing · Fri 20 Nov 2026")
         self.assertTrue(lines[1].startswith("🔴 Market regime: stressed"))
-        order = ["⚡ Triggers today", "US / Global · 1 BUY · 2 HOLD · 2 SELL", "SGX · 1 BUY · 0 HOLD · 1 SELL",
-                 "Crypto (24/7) · 0 BUY · 0 HOLD · 2 SELL", "Next 30 days", "Tradable: 2 BUY · 2 HOLD · 5 SELL", "✅ 10/10 fresh"]
+        order = ["⚡ Triggers today", "US / Global · 2 Uptrend · 1 Recovering · 2 Downtrend", "SGX · 1 Uptrend · 1 Downtrend",
+                 "Crypto (24/7) · 2 Downtrend", "Next 30 days", "Tradable: 3 Uptrend · 1 Recovering · 5 Downtrend", "✅ 10/10 fresh"]
         positions = [text.index(marker) for marker in order]
         self.assertEqual(positions, sorted(positions))
-        self.assertTrue(text.endswith("Rule-based signals for learning, not financial advice."))
+        self.assertTrue(text.endswith("Trend regimes describe the past; they do not predict returns. Not financial advice."))
+
+    def test_no_buy_hold_or_sell_remains_in_any_edition(self):
+        for now in (self.WEEKDAY, self.SUNDAY):
+            for markdown in (False, True):
+                text = self.text(now=now, markdown=markdown)
+                for word in ("BUY", "HOLD", "SELL", "Composite", "Confidence", "verdict"):
+                    self.assertNotIn(word, text)
 
     def test_indices_never_appear_in_the_lists_or_the_tally(self):
         text = self.text()
-        self.assertNotIn("^GSPC", text)                                      # its −2.85σ move and its SELL are both left out
-        self.assertIn("SELL: VOO 14 · TSLA 23", text)
+        self.assertNotIn("^GSPC", text)                                      # its −2.85σ move and its Downtrend are both left out
+        self.assertIn("Uptrend (3M vs S&P 500): WMT +37.0% · XOM +5.0%", text)
+        self.assertIn("Downtrend (3M vs S&P 500): MU −31.0% · TSLA", text)   # weakest first, no RS last
+
+    def test_trend_lines_rank_by_relative_strength_and_count_the_rest(self):
+        rows = [self.row(name, trend="Uptrend", relativeStrength3m=rs) for name, rs in (("A", 0.10), ("B", 0.30), ("C", None), ("D", 0.20), ("E", -0.05))]
+        self.assertEqual(ff.trend_line("Uptrend", rows, True, "S&P 500"), "Uptrend (3M vs S&P 500): B +30.0% · D +20.0% · A +10.0% · 2 more")
+        self.assertEqual(ff.trend_line("Uptrend", rows, False, "S&P 500"), "Uptrend (3M vs S&P 500): E −5.0% · A +10.0% · D +20.0% · 2 more")
+        bare = [self.row("X", trend="Downtrend"), self.row("Y", trend="Downtrend")]
+        self.assertEqual(ff.trend_line("Downtrend", bare, False, "STI"), "Downtrend: X · Y")   # no RS: no benchmark in the label
+        self.assertIsNone(ff.trend_line("Extended", rows, True, "S&P 500"))
+
+    def test_the_tally_counts_every_regime_and_leaves_out_empty_ones(self):
+        rows = [self.row("A", trend="Uptrend"), self.row("B", trend="Extended"), self.row("C", trend="Downtrend"),
+                self.row("D", trend="Downtrend"), self.row("E", trend=None)]
+        self.assertEqual(ff.tally_text(rows), "1 Uptrend · 1 Extended · 2 Downtrend")
+        self.assertEqual(ff.tally_text([self.row("E", trend=None)]), "")
 
     def test_a_quiet_day_has_no_trigger_block_and_never_says_nothing_happened(self):
         calm = [dict(row, zScore=0.2, dailyReturn=0.001) for row in self.signals()]
         text = self.text(signals=calm, snapshot=self.snapshot(regime_rows=[["2026-11-20", 13.1, 14.2, 17.1]]))
         self.assertNotIn("Triggers", text)
-        for banned in ("No notable", "No BUY", "No SELL", "No shifts", "Movers:"):
+        for banned in ("No notable", "No Uptrend", "No Downtrend", "No shifts", "Movers:"):
             self.assertNotIn(banned, text)
 
     def test_empty_lines_are_left_out_within_a_bucket(self):
         text = self.text()
         crypto = text[text.index("Crypto (24/7)"):text.index("Next 30 days")]
-        self.assertNotIn("BUY:", crypto)                                     # no BUY in the bucket: no line at all
-        self.assertIn("SELL: BTC-USD 8 · ETH-USD 13", crypto)
+        self.assertNotIn("Uptrend", crypto)                                  # no Uptrend in the bucket: no line, no count
+        self.assertIn("Downtrend (3M vs BTC): ETH-USD −14.0% · BTC-USD", crypto)
 
     # --- T1 moves ---------------------------------------------------------------
 
@@ -1635,15 +1657,15 @@ class RiskFirstBriefing(unittest.TestCase):
         self.assertFalse(ff.is_weekend_run(self.WEEKDAY))                    # Friday 22:30 UTC carries Friday's close
         text = self.text(now=self.SUNDAY, previous=self.previous(as_of="2026-11-20", regime_as_of="2026-11-20"))
         self.assertTrue(text.startswith("QuantLens · week ahead · Sun 22 Nov 2026\n🔴 Market regime (Friday close): stressed"))
-        for absent in ("US / Global", "SGX ·", "BUY:", "Movers:", "Tradable:"):
+        for absent in ("US / Global", "SGX ·", "Uptrend", "Movers:", "Tradable:"):
             self.assertNotIn(absent, text)
         week = text.split("Next 7 days\n")[1].split("\n\n")[0].split("\n")
         self.assertEqual(week, ["• Wed 25 Nov: ex-dividend C6L.SI", "• Thu 26 Nov: US closed (Thanksgiving Day)",
                                 "• Fri 27 Nov: US closes 1:00 PM ET",
                                 "• No FOMC, CPI or watchlist earnings. Next: FOMC rate decision (+ projections) Wed 9 Dec"])
         self.assertIn("Next 30 days watch\nMacro: FOMC rate decision (+ projections) Wed 9 Dec · US CPI (November) Thu 10 Dec", text)
-        self.assertIn("Weekend crypto check (UTC day to 20 Nov)\nBTC-USD −5.0% (−2.0σ) · SELL 8\nETH-USD −7.7% (−2.5σ) · SELL 13 · 3M vs BTC −14.0%", text)
-        self.assertIn("Crypto: 0 BUY · 0 HOLD · 2 SELL", text)
+        self.assertIn("Weekend crypto check (UTC day to 20 Nov)\nBTC-USD −5.0% (−2.0σ) · Downtrend\nETH-USD −7.7% (−2.5σ) · Downtrend · 3M vs BTC −14.0%", text)
+        self.assertIn("Crypto: 2 Downtrend", text)
 
     def test_weekend_triggers_are_crypto_moves_only_among_moves(self):
         rows = self.signals()
@@ -1675,7 +1697,7 @@ class RiskFirstBriefing(unittest.TestCase):
         self.assertIn(r"A17U\.SI \~1 Dec", estimated)
 
     def test_the_message_stays_inside_telegrams_limit_and_keeps_its_footer(self):
-        many = [self.row(f"T{i}", ("global", "sgx", "crypto")[i % 3], verdict=("BUY", "SELL")[i % 2], composite=float(i % 90),
+        many = [self.row(f"T{i}", ("global", "sgx", "crypto")[i % 3], trend=("Uptrend", "Downtrend")[i % 2], technical=float(i % 90),
                          dailyReturn=-0.1, zScore=-4.0, relativeStrength3m=0.1,
                          nextEarnings={"date": "2026-11-23", "dateTo": None, "timing": None, "days": 3, "tradingDays": 1},
                          nextExDividend={"date": "2026-11-24", "days": 4, "estimated": False}) for i in range(300)]
@@ -1697,15 +1719,17 @@ class RiskFirstBriefing(unittest.TestCase):
         self.assertEqual([row["ticker"] for row in signals], [asset["ticker"] for asset in snapshot["assets"]])
         by_class = {asset["ticker"]: asset["assetClass"] for asset in snapshot["assets"]}
         for row in signals:
-            self.assertIn(row["verdict"], {"BUY", "HOLD", "SELL"}, row["ticker"])
-            self.assertTrue(0 <= row["composite"] <= 100, row["ticker"])
+            self.assertIn(row["trend"], ff.TREND_REGIMES, row["ticker"])
+            self.assertTrue(0 <= row["technical"] <= 100, row["ticker"])
+            self.assertNotIn("verdict", row)
+            self.assertNotIn("composite", row)
             self.assertEqual(row["tradable"], by_class[row["ticker"]] != "index", row["ticker"])
             self.assertIn(row["bucket"], {"global", "sgx", "crypto"}, row["ticker"])
             self.assertEqual(row["bucket"] == "crypto", by_class[row["ticker"]] == "crypto", row["ticker"])
             self.assertTrue(is_iso := ff.is_iso_date(row["quoteAsOf"]), row["ticker"])
             self.assertIsNotNone(row["zScore"], row["ticker"])
             if by_class[row["ticker"]] in {"etf", "index", "crypto"}:
-                self.assertEqual(row["confidence"], "Low", row["ticker"])   # technical only, by construction
+                self.assertIsNone(row["fundamental"], row["ticker"])         # no accounts to score
         upcoming = [row for row in signals if row["nextEarnings"]]
         self.assertTrue(upcoming)                                            # the event layer reaches the briefing
         for row in upcoming:
@@ -1713,6 +1737,47 @@ class RiskFirstBriefing(unittest.TestCase):
             self.assertIsNotNone(row["nextEarnings"]["tradingDays"])
         self.assertTrue(any(row["nextExDividend"] for row in signals))
         self.assertTrue(any(row["relativeStrength3m"] is not None for row in signals))
+        tradable = [row for row in signals if row["tradable"]]
+        tally = ff.tally_text(tradable)                                      # every tradable is counted exactly once
+        self.assertEqual(sum(int(part.split(" ")[0]) for part in tally.split(" · ")), len(tradable))
+        self.assertEqual(len(tradable), sum(1 for asset in snapshot["assets"] if asset["assetClass"] != "index"))
+
+
+class EarlyCloses(unittest.TestCase):
+    """US half days from the macro calendar end the session at 1:00 p.m. New York (V3.3)."""
+
+    @staticmethod
+    def us_frame(last_day: str):
+        index = pd.DatetimeIndex([pd.Timestamp("2026-11-25", tz="America/New_York"), pd.Timestamp(last_day, tz="America/New_York")])
+        return pd.DataFrame({"Open": [10.0, 11.0], "High": [10.5, 11.5], "Low": [9.5, 10.5], "Close": [10.2, 11.2], "Volume": [100, 100]}, index=index)
+
+    def test_session_close_on_a_half_day(self):
+        half = frozenset({"2026-11-27"})
+        self.assertEqual(ff.session_close("US", "2026-11-27", half), dtime(13, 0))
+        self.assertEqual(ff.session_close("US", "2026-11-25", half), dtime(16, 0))
+        self.assertEqual(ff.session_close("SG", "2026-11-27", half), dtime(17, 0))   # SGX is not a US half day
+
+    def test_half_days_come_from_the_calendar(self):
+        block = ff.build_calendar(ff.DEFAULT_CALENDAR, datetime(2026, 11, 22, tzinfo=timezone.utc))
+        self.assertEqual(ff.early_close_dates(block), frozenset({"2026-11-27", "2026-12-24", "2027-11-26"}))
+        self.assertEqual(ff.early_close_dates(ff.empty_calendar("down")), frozenset())
+        self.assertEqual(ff.early_close_dates(None), frozenset())
+
+    def test_a_half_day_candle_is_kept_after_1_20_pm_not_before(self):
+        half = frozenset({"2026-11-27"})
+        frame = self.us_frame("2026-11-27")
+        before = datetime(2026, 11, 27, 18, 15, tzinfo=timezone.utc)   # 1:15 p.m. in New York (EST)
+        after = datetime(2026, 11, 27, 18, 25, tzinfo=timezone.utc)    # 1:25 p.m.: closed at 1:00, past the buffer
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "US", before, half)], ["2026-11-25"])
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "US", after, half)], ["2026-11-25", "2026-11-27"])
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "US", after)], ["2026-11-25"])   # a normal day closes at 4:00
+
+    def test_the_vix_close_follows_the_same_rule(self):
+        index = pd.DatetimeIndex([pd.Timestamp("2026-11-25", tz="America/Chicago"), pd.Timestamp("2026-11-27", tz="America/Chicago")])
+        frame = pd.DataFrame({"Close": [24.5, 26.0]}, index=index)
+        after = datetime(2026, 11, 27, 18, 25, tzinfo=timezone.utc)
+        self.assertEqual(ff.regime_closes(frame, after, frozenset({"2026-11-27"})), {"2026-11-25": 24.5, "2026-11-27": 26.0})
+        self.assertEqual(ff.regime_closes(frame, after), {"2026-11-25": 24.5})
 
 
 if __name__ == "__main__":

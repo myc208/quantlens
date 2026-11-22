@@ -10,7 +10,7 @@
  *   Headline tone = mean of the stories' VADER compound scores   (−1 .. +1)
  *   positive at +0.05 or more · negative at −0.05 or less · otherwise neutral
  *
- * Headline tone is context. It is not part of the composite score or the verdict:
+ * Headline tone is context. It is not part of any score or the trend regime:
  * VADER is a general-purpose word list that does not know financial vocabulary,
  * and three headlines are a very small sample.
  */
@@ -82,7 +82,7 @@ export function analyzeSentiment(asset, { now = new Date() } = {}) {
   const stale = news.status === 'stale';
   const duplicates = stories.reduce((total, story) => total + story.duplicates, 0);
 
-  let caveat = 'VADER is a general-purpose word list. It does not know that "beats estimates" is good or that "cuts guidance" is bad, and many financial headlines score exactly zero. Tone is context only and is not part of the verdict.';
+  let caveat = 'VADER is a general-purpose word list. It does not know that "beats estimates" is good or that "cuts guidance" is bad, and many financial headlines score exactly zero. Tone is context only and is not part of any score.';
   if (stale) caveat = `These headlines are old (the newest is from ${ageText(newestAge)}), so they say little about today. ${caveat}`;
   if (!agrees) caveat = `The average stored in the snapshot (${fmtN(stored, 4)}) differs from the one recomputed here; the recomputed value is shown. ${caveat}`;
 

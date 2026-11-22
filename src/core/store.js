@@ -4,7 +4,7 @@
  * Stateless by design: nothing is written to localStorage, sessionStorage,
  * cookies or IndexedDB. Every visit starts from defaults plus whatever the URL
  * says. The URL carries only the shareable view (tickers, filters, currency,
- * mode, tab, time range and portfolio weights as percentages). Account size and
+ * mode, tab, time range, rotation benchmark and portfolio weights as percentages). Account size and
  * risk settings stay in memory so a shared link can never leak them.
  *
  * Heavy calculations run in a Web Worker. Their state lives in the `compute`
@@ -20,7 +20,10 @@ export const DEFAULT_SELECTED = Object.freeze(['AMD', 'D05.SI', 'BTC-USD']);
 
 export const CURRENCIES = Object.freeze(['USD', 'SGD']);
 export const MODES = Object.freeze(['guided', 'pro']);
-export const VIEWS = Object.freeze(['compare', 'leaderboard', 'portfolio']);
+export const VIEWS = Object.freeze(['compare', 'leaderboard', 'portfolio', 'rotation']);
+// V3.3 Rotation tab: relative strength against the S&P 500 in USD (default) or each asset's own market.
+export const ROTATION_BENCHMARKS = Object.freeze(['spx', 'own']);
+export const DEFAULT_ROTATION = 'spx';
 export const RANGES = Object.freeze(['1m', '3m', '6m', '1y', '5y']);
 export const DEFAULT_VIEW = 'compare';
 export const DEFAULT_RANGE = '1y';
@@ -29,10 +32,11 @@ export const COMPUTE_JOBS = Object.freeze(['monteCarlo', 'portfolio', 'backtest'
 export const FILTER_OPTIONS = Object.freeze({
   assetClass: Object.freeze(['all', 'equity', 'etf', 'index', 'crypto']),
   market: Object.freeze(['all', 'US', 'SG', 'UK', 'CRYPTO']),
-  verdict: Object.freeze(['all', 'buy', 'hold', 'sell']),
+  // V3.3: the trend regime replaces the old verdict filter; a shared `verdict=` link is ignored.
+  trend: Object.freeze(['all', 'uptrend', 'extended', 'pullback', 'recovering', 'downtrend']),
 });
 
-export const DEFAULT_FILTERS = Object.freeze({ assetClass: 'all', market: 'all', sector: 'all', verdict: 'all' });
+export const DEFAULT_FILTERS = Object.freeze({ assetClass: 'all', market: 'all', sector: 'all', trend: 'all' });
 export const DEFAULT_ACCOUNT = Object.freeze({ equity: 10000, riskPct: 1, atrMultiple: 2, maxPositionPct: 25 });
 
 /** Bounds for the personal risk inputs. Guided mode keeps risk per trade conservative. */
@@ -45,8 +49,8 @@ export const ACCOUNT_LIMITS = Object.freeze({
 
 const URL_KEYS = Object.freeze({
   selected: 't', currency: 'ccy', mode: 'mode',
-  assetClass: 'class', market: 'mkt', sector: 'sector', verdict: 'verdict',
-  view: 'view', range: 'range', portfolio: 'p',
+  assetClass: 'class', market: 'mkt', sector: 'sector', trend: 'trend',
+  view: 'view', range: 'range', portfolio: 'p', rotation: 'rs',
 });
 // Yahoo symbols: AMD, BRK-B, D05.SI, CSPX.L, BTC-USD, and indices with a leading caret (^GSPC).
 const TICKER_PATTERN = /^\^?[A-Z0-9][A-Z0-9.\-=]{0,14}$/;
@@ -119,12 +123,13 @@ export function parseUrlState(search = '') {
     mode: matchOption(MODES, params.get(URL_KEYS.mode)) ?? 'guided',
     view: matchOption(VIEWS, params.get(URL_KEYS.view)) ?? DEFAULT_VIEW,
     range: matchOption(RANGES, params.get(URL_KEYS.range)) ?? DEFAULT_RANGE,
+    rotation: matchOption(ROTATION_BENCHMARKS, params.get(URL_KEYS.rotation)) ?? DEFAULT_ROTATION,
     portfolio: { weights: parsePortfolio(params.get(URL_KEYS.portfolio)) },
     filters: {
       assetClass: matchOption(FILTER_OPTIONS.assetClass, params.get(URL_KEYS.assetClass)) ?? 'all',
       market: matchOption(FILTER_OPTIONS.market, params.get(URL_KEYS.market)) ?? 'all',
       sector: rawSector && rawSector.trim() && rawSector.trim().length <= 60 ? rawSector.trim() : 'all',
-      verdict: matchOption(FILTER_OPTIONS.verdict, params.get(URL_KEYS.verdict)) ?? 'all',
+      trend: matchOption(FILTER_OPTIONS.trend, params.get(URL_KEYS.trend)) ?? 'all',
     },
   };
 }
@@ -149,9 +154,10 @@ export function serializeUrlState(state) {
   if (filters.assetClass !== 'all') add(URL_KEYS.assetClass, filters.assetClass);
   if (filters.market !== 'all') add(URL_KEYS.market, filters.market);
   if (filters.sector !== 'all') add(URL_KEYS.sector, encodeURIComponent(filters.sector).replace(/%20/g, '+'));
-  if (filters.verdict !== 'all') add(URL_KEYS.verdict, filters.verdict);
+  if (filters.trend !== 'all') add(URL_KEYS.trend, filters.trend);
   if (state.view && state.view !== DEFAULT_VIEW) add(URL_KEYS.view, state.view);
   if (state.range && state.range !== DEFAULT_RANGE) add(URL_KEYS.range, state.range);
+  if (state.rotation && state.rotation !== DEFAULT_ROTATION) add(URL_KEYS.rotation, state.rotation);
   // Weights are percentages only, so a shared portfolio never reveals an amount of money.
   const weights = state.portfolio ? state.portfolio.weights : null;
   if (Array.isArray(weights) && weights.length) {
@@ -197,6 +203,7 @@ export function createInitialState(search) {
     mode: view.mode,
     view: view.view,
     range: view.range,
+    rotation: view.rotation,
     // weights: null means "follow the compared assets, equally weighted".
     portfolio: view.portfolio,
     account: { ...DEFAULT_ACCOUNT },
@@ -266,6 +273,7 @@ export const actions = Object.freeze({
   setAccount: (key, value) => ({ type: 'SET_ACCOUNT', key, value }),
   setView: (view) => ({ type: 'SET_VIEW', view }),
   setRange: (range) => ({ type: 'SET_RANGE', range }),
+  setRotationBenchmark: (benchmark) => ({ type: 'SET_ROTATION', benchmark }),
   setPortfolioWeight: (ticker, weight) => ({ type: 'SET_PORTFOLIO_WEIGHT', ticker, weight }),
   setPortfolioWeights: (weights) => ({ type: 'SET_PORTFOLIO_WEIGHTS', weights }),
   addPortfolioAsset: (ticker) => ({ type: 'ADD_PORTFOLIO_ASSET', ticker }),
@@ -386,6 +394,10 @@ export function reduce(state, action) {
     case 'SET_RANGE': {
       const range = matchOption(RANGES, String(action.range));
       return !range || range === state.range ? state : { ...state, range };
+    }
+    case 'SET_ROTATION': {
+      const rotation = matchOption(ROTATION_BENCHMARKS, String(action.benchmark));
+      return !rotation || rotation === state.rotation ? state : { ...state, rotation };
     }
 
     case 'SET_PORTFOLIO_WEIGHT': {
@@ -549,7 +561,8 @@ export function createStore(initialState = createInitialState(), { syncUrl = tru
     state = next;
     const viewChanged = next.selected !== previous.selected || next.filters !== previous.filters
       || next.currency !== previous.currency || next.mode !== previous.mode
-      || next.view !== previous.view || next.range !== previous.range || next.portfolio !== previous.portfolio;
+      || next.view !== previous.view || next.range !== previous.range || next.portfolio !== previous.portfolio
+      || next.rotation !== previous.rotation;
     if (syncUrl && viewChanged) writeUrlState(next);
     for (const listener of [...listeners]) {
       try {
@@ -627,16 +640,16 @@ export function selectSelectedAssets(state) {
  * Apply the screener filters.
  * @param {object[]} assets normalised assets
  * @param {object} filters state.filters
- * @param {Record<string, string|null>} [verdictByTicker] e.g. { AAPL: 'BUY' }
+ * @param {Record<string, string|null>} [trendByTicker] e.g. { AAPL: 'Uptrend' }
  */
-export function filterAssets(assets, filters, verdictByTicker = {}) {
+export function filterAssets(assets, filters, trendByTicker = {}) {
   return assets.filter((asset) => {
     if (filters.assetClass !== 'all' && asset.assetClass !== filters.assetClass) return false;
     if (filters.market !== 'all' && asset.market !== filters.market) return false;
     if (filters.sector !== 'all' && asset.sector !== filters.sector) return false;
-    if (filters.verdict !== 'all') {
-      const verdict = verdictByTicker[asset.ticker];
-      if (typeof verdict !== 'string' || verdict.toLowerCase() !== filters.verdict) return false;
+    if (filters.trend !== 'all') {
+      const trend = trendByTicker[asset.ticker];
+      if (typeof trend !== 'string' || trend.toLowerCase() !== filters.trend) return false;
     }
     return true;
   });

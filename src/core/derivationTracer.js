@@ -5,7 +5,7 @@
  *
  *   {
  *     id, label,
- *     value,            // number | string (labels such as a verdict) | null
+ *     value,            // number | string (labels such as a trend regime) | null
  *     unit,             // index | ratio | pct | currency | score | shares | label | days
  *     status,           // "ok" | "na"
  *     naReason,         // why the value is unavailable (null when ok)
@@ -158,7 +158,7 @@ export function valueOf(metric) {
   return isTraced(metric) && metric.status === 'ok' && isNum(metric.value) ? metric.value : null;
 }
 
-/** The label value of a metric (e.g. "BUY"), or null. */
+/** The label value of a metric (e.g. "Uptrend"), or null. */
 export function labelOf(metric) {
   return isTraced(metric) && metric.status === 'ok' && typeof metric.value === 'string' ? metric.value : null;
 }

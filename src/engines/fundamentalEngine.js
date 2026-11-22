@@ -88,7 +88,7 @@ export const PROFILES = Object.freeze({
     notApplicable: Object.freeze({}),
     allNotApplicable: ETF_REASON,
     contextOnly: Object.freeze(['dividendYield']),
-    noScoreReason: 'An ETF is a basket of companies with no accounts of its own to score. The verdict uses price behaviour only.',
+    noScoreReason: 'An ETF is a basket of companies with no accounts of its own to score. Its trend regime and Technical score use price behaviour only.',
   }),
   INDEX: Object.freeze({
     label: 'Index',
@@ -96,7 +96,7 @@ export const PROFILES = Object.freeze({
     notApplicable: Object.freeze({}),
     allNotApplicable: INDEX_REASON,
     contextOnly: Object.freeze([]),
-    noScoreReason: 'An index is a calculated level with no accounts to score. The verdict uses price behaviour only.',
+    noScoreReason: 'An index is a calculated level with no accounts to score. Its trend regime and Technical score use price behaviour only.',
   }),
   CRYPTO: Object.freeze({
     label: 'Crypto',
@@ -104,7 +104,7 @@ export const PROFILES = Object.freeze({
     notApplicable: Object.freeze({}),
     allNotApplicable: CRYPTO_REASON,
     contextOnly: Object.freeze(['marketCap']),
-    noScoreReason: 'Crypto assets have no earnings, balance sheet or cash flow to score. The verdict uses price behaviour only.',
+    noScoreReason: 'Crypto assets have no earnings, balance sheet or cash flow to score. Its trend regime and Technical score use price behaviour only.',
   }),
 });
 
@@ -516,7 +516,7 @@ function buildFundamentalScore(ctx, metrics) {
     return notAvailable({
       id, label, unit: 'score', meta: { profile: ctx.profile, coverage: 0 },
       formula: 'No fundamental score for this asset class',
-      reason: profile.noScoreReason ?? 'There are no accounts to score for this asset. The verdict uses price behaviour only.',
+      reason: profile.noScoreReason ?? 'There are no accounts to score for this asset. Its trend regime and Technical score use price behaviour only.',
     });
   }
   const components = profile.scoring.map((rule) => ({

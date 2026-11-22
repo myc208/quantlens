@@ -188,8 +188,8 @@ code,
   background: var(--status-critical-wash);
 }
 
-.badge--verdict {
-  letter-spacing: 0.05em;
+.badge--trend {
+  letter-spacing: 0.01em;
 }
 
 .badge--na {
@@ -3289,7 +3289,7 @@ th[aria-sort="ascending"] .board__sort::after {
 /* ---------------- Leaderboard column tiers ----------------
  * The table shows as many columns as its own width allows, not the viewport's:
  * with the screener beside it, a 1280px window leaves it about 940px.
- *   tier A  always          asset, verdict, composite, return
+ *   tier A  always          asset, trend regime, RS 3M, return
  *   tier B  >= 920px wide   rank, technical, fundamental, price, volatility, compare
  *   tier C  >= 1200px wide  drawdown, news tone, projection
  * Columns that do not fit are listed in the row's details, opened with "+".
@@ -3385,7 +3385,7 @@ th[aria-sort="ascending"] .board__sort::after {
     display: none;
   }
 
-  .board .badge--verdict {
+  .board .badge--trend {
     padding-inline: 6px;
   }
 
@@ -3414,4 +3414,269 @@ th[aria-sort="ascending"] .board__sort::after {
   border-color: var(--status-warning);
   color: var(--text-primary);
   background: var(--status-warning-wash);
+}
+
+/* ---------------- Crash replays (V3.3) ---------------- */
+.replay-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: var(--space-2);
+}
+
+.replay {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.replay:hover {
+  border-color: var(--border-strong);
+}
+
+.replay:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.replay[aria-current="true"] {
+  border-color: var(--accent);
+  background: var(--accent-wash);
+}
+
+.replay__name {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.replay__dates,
+.replay__meta,
+.replay__vs {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.replay__figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin-top: 2px;
+}
+
+.replay__figure {
+  display: flex;
+  flex-direction: column;
+}
+
+.replay__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.replay__value {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+
+.replay__key {
+  display: inline-block;
+  width: 12px;
+  height: 0;
+  border-top: 2px solid var(--series-1);
+}
+
+.replay__key--bench {
+  border-top: 2px dashed var(--text-muted);
+}
+
+.legend__key.replay__key--mix {
+  height: 0;
+  border-top: 2px solid var(--series-1);
+  background: none;
+}
+
+.legend__key.replay__key--bench {
+  height: 0;
+  border-top: 2px dashed var(--text-muted);
+  background: none;
+}
+
+.replay__spark {
+  display: block;
+  width: 100%;
+  height: 40px;
+  margin: 2px 0;
+  overflow: visible;
+}
+
+.replay__line {
+  fill: none;
+  stroke: var(--series-1);
+  stroke-width: 1.75;
+  vector-effect: non-scaling-stroke;
+}
+
+.replay__bench {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-width: 1.25;
+  stroke-dasharray: 3 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.replay__zero {
+  stroke: var(--border-strong);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.replay__note {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+/* ---------------- Rotation tab (V3.3) ---------------- */
+#rotation {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+#rotation[hidden] {
+  display: none;
+}
+
+.rot-controls {
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.rot-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-4);
+  overflow-x: auto;
+}
+
+@media (max-width: 767px) {
+  .rot-card {
+    padding: var(--space-3);
+  }
+}
+
+.rot-plot {
+  width: 100%;
+  min-height: 260px;
+}
+
+.rot-field {
+  fill-opacity: 0.55;
+}
+
+.rot-field--leading {
+  fill: var(--status-good-wash);
+}
+
+.rot-field--weakening {
+  fill: var(--status-warning-wash);
+}
+
+.rot-field--lagging {
+  fill: var(--status-critical-wash);
+}
+
+.rot-field--improving {
+  fill: var(--status-neutral-wash);
+}
+
+.rot-qlabel {
+  fill: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.rot-axis-title {
+  fill: var(--text-muted);
+}
+
+.rot-point {
+  cursor: pointer;
+}
+
+.rot-point circle {
+  stroke: var(--surface-1);
+  stroke-width: 1.5;
+}
+
+.rot-point--leading circle {
+  fill: var(--status-good);
+}
+
+.rot-point--weakening circle {
+  fill: var(--status-warning);
+}
+
+.rot-point--lagging circle {
+  fill: var(--status-critical);
+}
+
+.rot-point--improving circle {
+  fill: var(--status-neutral);
+}
+
+.rot-point:hover circle {
+  stroke: var(--text-primary);
+}
+
+.rot-label {
+  fill: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  paint-order: stroke;
+  stroke: var(--surface-1);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.rot-table {
+  width: 100%;
+}
+
+.rot-table .num {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.rot-table .cell {
+  min-height: 32px;
+  padding: 2px 4px;
+}
+
+.rot-members {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.rot-member--hidden {
+  opacity: 0.5;
 }

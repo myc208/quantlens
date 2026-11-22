@@ -778,7 +778,7 @@ function normaliseAsset(asset, forecastsUsable) {
     series,
     candleCount: asset.candles.length,
     // Up to five years of closes: the older history followed by the candles' closes.
-    // Indicators and the verdict keep using `series` (the last year, with highs and lows).
+    // Indicators and the trend regime keep using `series` (the last year, with highs and lows).
     longSeries: { dates: [...history.dates, ...series.dates], close: [...history.close, ...series.close] },
     historyCount: history.dates.length,
     dividends,
@@ -879,7 +879,7 @@ export const RANGE_DAYS = Object.freeze({ '1m': 30, '3m': 91, '6m': 182, '1y': n
  *
  * Used for charts, period return, volatility, correlation, simulations and
  * portfolio statistics. Indicators that need a warm-up (moving averages, MACD,
- * RSI, ATR) and the verdict are always computed on the full history: a 1-month
+ * RSI, ATR) and the trend regime are always computed on the full history: a 1-month
  * slice has about 21 candles, which is not enough to form them at all.
  *
  * @param {{dates:string[]} & Record<string, any[]>} series parallel arrays, as produced by normaliseSnapshot

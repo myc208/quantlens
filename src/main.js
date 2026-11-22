@@ -3,12 +3,12 @@
  *
  * Responsibilities
  *   1. Create the store from the URL
- *      (?t=&ccy=&mode=&class=&mkt=&sector=&verdict=&view=&range=&p=) and keep the
+ *      (?t=&ccy=&mode=&class=&mkt=&sector=&trend=&view=&range=&p=&rs=) and keep the
  *      URL and the store in sync in both directions.
  *   2. Load the daily snapshot, run every engine once per asset, and cache the result.
  *   3. Slice each asset to the selected time range (1M / 3M / 6M / 1Y) and derive
- *      the windowed statistics. The verdict and its indicators always use the
- *      full year: the time range never changes them.
+ *      the windowed statistics. The trend regime, the scores and their indicators
+ *      always use the full year: the time range never changes them.
  *   4. Derive the comparison (correlation, position sizes, total risk) for the
  *      selected assets, memoised on exactly the inputs it depends on.
  *   5. Send the heavy maths (Monte Carlo, portfolio statistics and the frontier
@@ -44,18 +44,20 @@ import { analyzeLiquidity } from './engines/liquidityEngine.js';
 import { analyzeMacro, describeMacro, holidaysFor } from './engines/macroCalendarEngine.js';
 import { analyzeFundamentals } from './engines/fundamentalEngine.js';
 import { analyzeCorrelation, CORR_CONFIG } from './engines/correlationEngine.js';
-import { advise } from './engines/advisorEngine.js';
 import { sizePosition, portfolioHeat } from './engines/positionSizerEngine.js';
 import { analyzeSentiment } from './engines/sentimentEngine.js';
 import { analyzeForecast } from './engines/forecastEngine.js';
 import { seedFromString } from './engines/monteCarloEngine.js';
 import { PORTFOLIO_CONFIG } from './engines/portfolioEngine.js';
+import { analyzeCrashReplays, REPLAY_PREFIX } from './engines/crashReplayEngine.js';
+import { analyzeRotation } from './engines/rotationEngine.js';
 import { mountTelemetryBar } from './ui/telemetryBar.js';
 import { mountAppTabs } from './ui/appTabs.js';
 import { mountScreenerPanel } from './ui/screenerPanel.js';
 import { mountComparisonMatrix } from './ui/comparisonMatrix.js';
 import { mountLeaderboardView } from './ui/leaderboardView.js';
 import { mountPortfolioSandbox } from './ui/portfolioSandbox.js';
+import { mountRotationView } from './ui/rotationView.js';
 import { mountDerivationDrawer } from './ui/derivationDrawer.js';
 import { mountRiskSandboxModal } from './ui/riskSandboxModal.js';
 import { mountCommandPalette } from './ui/commandPalette.js';
@@ -80,6 +82,7 @@ function hydrateFromUrl() {
   store.dispatch(actions.setMode(view.mode));
   store.dispatch(actions.setView(view.view));
   store.dispatch(actions.setRange(view.range));
+  store.dispatch(actions.setRotationBenchmark(view.rotation));
   if (Array.isArray(view.portfolio.weights) && view.portfolio.weights.length) {
     store.dispatch(actions.setPortfolioWeights(view.portfolio.weights));
   } else {
@@ -99,7 +102,7 @@ const TONE_WORDS = { healthy: 'healthy', neutral: 'neutral', caution: 'caution',
 const MULTIPLE_IDS = new Set(['evEbitda', 'trailingPE', 'forwardPE', 'priceToBook', 'debtToEquity']);
 const FINE_PERCENT_IDS = new Set(['spreadEstimate', 'rangeSpread', 'volumeShare']);
 // Changes read better with an explicit sign: "+4.2%" cannot be mistaken for a level.
-const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown', 'relativeStrength1m', 'relativeStrength3m']);
+const SIGNED_IDS = new Set(['periodReturn', 'forecast30d', 'portfolioReturn', 'maxDrawdown', 'relativeStrength1m', 'relativeStrength3m', 'regimeRecord']);
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 /**
@@ -185,7 +188,7 @@ function formatMetric(metric, { withCurrency = false, native = false } = {}) {
     case 'score': return formatNumber(value, 0);
     case 'index': return formatNumber(value, 1);
     case 'pct':
-      if (SIGNED_IDS.has(metric.id)) return signedPercent(value, 1);
+      if (SIGNED_IDS.has(metric.id) || metric.id.startsWith(REPLAY_PREFIX)) return signedPercent(value, 1);
       // Spreads and shares of daily volume are often far below 0.1%.
       if (FINE_PERCENT_IDS.has(metric.id)) return formatPercent(value, value === 0 || value >= 0.001 ? 2 : value >= 0.0001 ? 3 : 4);
       return formatPercent(value, 1);
@@ -253,7 +256,7 @@ const h = Object.freeze({
 /* Analysis cache: every engine, once per asset, per snapshot           */
 /* ------------------------------------------------------------------ */
 
-// ticker -> { asset, technical, fundamental, advisor, sentiment, forecast }
+// ticker -> { asset, technical, fundamental, sentiment, forecast, events, liquidity }
 const analyses = new Map();
 // The market regime: one reading per snapshot, shared by every view.
 let regimeAnalysis = analyzeRegime(null);
@@ -263,20 +266,23 @@ let macroAnalysis = analyzeMacro(null);
 function analyseAsset(asset, fxRate, now, holidays = null) {
   const technical = analyzeTechnicals(asset);
   const fundamental = analyzeFundamentals(asset, { fxRate });
-  const advisor = advise({ asset, technical, fundamental });
-  // Context only: neither of these ever reaches the verdict.
+  // Context only: neither of these ever reaches the trend regime or a score.
   const sentiment = analyzeSentiment(asset, { now });
   const forecast = analyzeForecast(asset);
   // Scheduled events: earnings and ex-dividend dates, and the typical earnings-day move.
   const events = analyzeEvents(asset, { now, holidays });
   // Liquidity from the last 20 sessions: volume, traded value, Amihud and the tick-floor spread.
   const liquidity = analyzeLiquidity(asset, { fxRate });
-  return { asset, technical, fundamental, advisor, sentiment, forecast, events, liquidity };
+  return { asset, technical, fundamental, sentiment, forecast, events, liquidity };
 }
 
-function verdicts() {
+/** ticker -> trend regime label (Uptrend, Extended, Pullback, Recovering, Downtrend) or null. */
+function trends() {
   const result = {};
-  for (const [ticker, analysis] of analyses) result[ticker] = analysis.advisor.verdict;
+  for (const [ticker, analysis] of analyses) {
+    const regime = analysis.technical.metrics.trendRegime;
+    result[ticker] = regime && regime.status === 'ok' ? regime.value : null;
+  }
   return result;
 }
 
@@ -290,7 +296,7 @@ const windows = new Map(); // `${ticker}|${range}` -> window
  * One asset cut down to a time range, with the statistics of that window.
  * Used by the charts, the Period rows, correlation, the simulation's
  * volatility and the portfolio maths. RSI, MACD, the moving averages and the
- * verdict are never computed from a window: they need their full warm-up.
+ * trend regime are never computed from a window: they need their full warm-up.
  *
  * @returns {{ range:string, info:object, series:object, asset:object, metrics:object, from:string, to:string, observations:number }|null}
  */
@@ -436,7 +442,6 @@ function comparison() {
       entryPrice: quote.price,
       entrySource: quote.live ? 'live Binance price' : `last daily close (${asset.quote.asOf})`,
       atr: valueOf(analysis.technical.metrics.atr14),
-      verdict: analysis.advisor.verdict,
       account: state.account,
       accountCurrency: state.currency,
       fxRate,
@@ -563,6 +568,50 @@ function portfolioRequest(state) {
   };
 }
 
+// Crash replays: the allocation bought at four S&P 500 highs and held to the lows (V3.3).
+// Small enough for the main thread; cached on exactly what it depends on (not the range).
+let replayMemo = { key: null, value: null };
+
+function crashReplays() {
+  const state = store.getState();
+  if (!state.snapshot) return null;
+  const weights = selectPortfolioWeights(state).filter((entry) => state.snapshot.byTicker[entry.ticker]);
+  const fx = selectFx(state);
+  const key = jobKey('replay', state.snapshot.generatedAt, state.currency, weights.map((entry) => `${entry.ticker}:${entry.weight}`).join(','),
+    state.snapshot.fx.series && state.snapshot.fx.series.dates.length ? 'history' : fx ? fx.rate : null);
+  if (replayMemo.key !== key) {
+    replayMemo = {
+      key,
+      value: analyzeCrashReplays({
+        weights, byTicker: state.snapshot.byTicker, baseCurrency: state.currency,
+        fx: { series: state.snapshot.fx.series ?? null, rate: fx ? fx.rate : null },
+      }),
+    };
+  }
+  return replayMemo.value;
+}
+
+// Rotation (V3.3): every tradable's 1- and 3-month relative strength, one analysis per
+// snapshot and benchmark choice. It does not depend on the time range.
+let rotationMemo = { key: null, value: null };
+
+function rotation() {
+  const state = store.getState();
+  if (!state.snapshot) return null;
+  const key = `${state.snapshot.generatedAt}|${state.rotation}`;
+  if (rotationMemo.key !== key) {
+    const fx = selectFx(state);
+    rotationMemo = {
+      key,
+      value: analyzeRotation({
+        assets: state.snapshot.assets, byTicker: state.snapshot.byTicker, mode: state.rotation,
+        fx: { series: state.snapshot.fx.series ?? null, rate: fx ? fx.rate : null },
+      }),
+    };
+  }
+  return rotationMemo.value;
+}
+
 /** The portfolio slot plus the allocation it belongs to. */
 function portfolio() {
   const state = store.getState();
@@ -590,7 +639,7 @@ function schedulePortfolio(delay = 140) {
   }, delay);
 }
 
-// The verdict backtest replays about 1,000 days for every asset: it runs once per snapshot,
+// The backtest replays about 1,000 days for every asset: it runs once per snapshot,
 // in the worker, so the page is usable while it computes.
 function submitBacktest(snapshot) {
   const assets = snapshot.assets.map((asset) => ({
@@ -599,7 +648,10 @@ function submitBacktest(snapshot) {
     series: { dates: asset.series.dates, high: asset.series.high, low: asset.series.low, close: asset.series.close },
     longSeries: asset.longSeries,
   }));
-  jobs.submit('backtest', jobKey('backtest', snapshot.generatedAt, assets.length), 'backtest', { assets });
+  // The VIX history splits the track record by regime (normal, elevated, stressed).
+  const regime = snapshot.macro && snapshot.macro.regime && snapshot.macro.regime.status !== 'unavailable'
+    ? { history: snapshot.macro.regime.history, rules: snapshot.macro.regime.rules } : null;
+  jobs.submit('backtest', jobKey('backtest', snapshot.generatedAt, assets.length), 'backtest', { assets, regime });
 }
 
 store.subscribe((next, previous) => {
@@ -633,7 +685,7 @@ const indexCache = new Map(); // ticker|'' -> { parts, index }
 
 /**
  * Every traced metric that is in scope for an asset: its indicators,
- * fundamentals, verdict, headline tone, projection and time-range statistics,
+ * fundamentals, trend regime, headline tone, projection and time-range statistics,
  * its position sizing, the latest simulation, plus the selection-wide
  * correlation pairs and total risk. Pass null for the metrics that belong to
  * no single asset: correlation, total risk and the portfolio statistics.
@@ -649,13 +701,16 @@ function traceIndex(ticker) {
   const run = ticker && simulated && simulated.ticker === ticker ? simulated : null;
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
+  const replays = !ticker && state.view === 'portfolio' ? crashReplays() : null;
+  const rotated = state.view === 'rotation' ? rotation() : null;
+  const rotationPart = rotated ? (ticker ? (rotated.byTicker[ticker] ? rotated.byTicker[ticker].metrics : null) : rotated.metrics) : null;
   const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
-  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis];
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis, replays, rotationPart];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
   const index = buildTraceIndex(
-    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.advisor.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics, analysis.liquidity.metrics] : null,
+    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics, analysis.liquidity.metrics] : null,
     view ? view.metrics : null,
     view ? view.risk.metrics : null,
     view ? view.factors.metrics : null,
@@ -667,6 +722,8 @@ function traceIndex(ticker) {
     current.correlation.pairs,
     current.heat,
     held ? held.metrics : null,
+    replays ? replays.metrics : null,
+    rotationPart,
     regimeAnalysis.metrics,
     macroAnalysis.metrics,
   );
@@ -690,12 +747,14 @@ const app = {
   h,
   analysis: (ticker) => analyses.get(ticker) ?? null,
   window: (ticker, range) => windowFor(ticker, range),
-  verdicts,
+  trends,
   comparison,
   priceMetric,
   requestSimulation,
   simulation,
   portfolio,
+  crashReplays,
+  rotation,
   backtest,
   regime: () => regimeAnalysis,
   describeRegime: () => describeRegime(regimeAnalysis),
@@ -732,6 +791,7 @@ const elements = {
   matrix: document.getElementById('comparison-matrix'),
   leaderboard: document.getElementById('leaderboard'),
   portfolio: document.getElementById('portfolio'),
+  rotation: document.getElementById('rotation'),
   drawer: document.getElementById('derivation-drawer'),
   scrim: document.getElementById('drawer-scrim'),
   sandbox: document.getElementById('risk-sandbox'),
@@ -743,8 +803,9 @@ const viewPanels = Object.freeze({
   compare: elements.matrix,
   leaderboard: elements.leaderboard,
   portfolio: elements.portfolio,
+  rotation: elements.rotation,
 });
-const VIEW_TITLES = Object.freeze({ leaderboard: 'Leaderboard', portfolio: 'Portfolio' });
+const VIEW_TITLES = Object.freeze({ leaderboard: 'Leaderboard', portfolio: 'Portfolio', rotation: 'Rotation' });
 
 let lastError = null;
 
@@ -828,6 +889,7 @@ mountScreenerPanel(elements.screener, app);
 mountComparisonMatrix(elements.matrix, app);
 mountLeaderboardView(elements.leaderboard, app);
 mountPortfolioSandbox(elements.portfolio, app);
+mountRotationView(elements.rotation, app);
 mountDerivationDrawer(elements.drawer, app, elements.scrim);
 mountRiskSandboxModal(elements.sandbox, app);
 const palette = mountCommandPalette(elements.palette, app);

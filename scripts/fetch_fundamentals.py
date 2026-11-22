@@ -141,6 +141,8 @@ EARNINGS_TIMINGS = {"before-open", "during-session", "after-close", "unknown"}
 
 ASSET_CLASSES = {"equity", "crypto", "etf", "index"}
 MARKETS = {"US", "SG", "UK", "CRYPTO"}
+# V3.3: the trend regimes of trendRegimeEngine.js, in the order the briefing counts them.
+TREND_REGIMES = ("Uptrend", "Extended", "Pullback", "Recovering", "Downtrend")
 PROFILES = {"CORPORATE", "FINANCIAL", "REIT", "CRYPTO", "ETF", "INDEX"}
 EQUITY_PROFILES = {"CORPORATE", "FINANCIAL", "REIT"}
 # Asset classes with no company accounts of their own. Each has a fixed profile with
@@ -155,6 +157,8 @@ SENTIMENT_LABELS = {"positive", "neutral", "negative"}
 # session has closed (plus a buffer for Yahoo's delayed quotes).
 SESSION_CLOSE = {"US": dtime(16, 0), "SG": dtime(17, 0), "UK": dtime(16, 30)}
 SESSION_OPEN = {"US": dtime(9, 30), "SG": dtime(9, 0), "UK": dtime(8, 0)}
+# US half days (from the macro calendar's market-early-close entries) close at 1:00 p.m. New York.
+EARLY_CLOSE = {"US": dtime(13, 0)}
 MARKET_TIMEZONES = {"US": "America/New_York", "SG": "Asia/Singapore", "UK": "Europe/London"}
 CLOSE_BUFFER_MINUTES = 20
 
@@ -262,7 +266,6 @@ USER_AGENT = "Mozilla/5.0 (compatible; quantlens-data-pipeline)"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_TIMEOUT = 10.0
 TELEGRAM_MAX_CHARS = 3800        # Telegram's hard limit is 4096 characters
-BRIEFING_TOP_SIGNALS = 5         # BUY and SELL signals listed in the briefing
 BRIEFING_MAX_SHIFTS = 5
 BRIEFING_EARNINGS_DAYS = 30      # list earnings releases this many calendar days ahead
 BRIEFING_MAX_EARNINGS = 5
@@ -274,9 +277,8 @@ BRIEFING_EARNINGS_TRIGGER = 5    # earnings within this many trading days are a 
 BRIEFING_MACRO_HOURS = 48        # FOMC decisions and CPI releases within this many hours are a trigger
 BRIEFING_MAX_MOVES = 5
 BRIEFING_MAX_TONE = 3
-BRIEFING_BUCKET_SIGNALS = 3      # BUYs and SELLs listed per bucket
+BRIEFING_BUCKET_SIGNALS = 3      # tickers on each bucket's Uptrend and Downtrend lines
 BRIEFING_BUCKET_MOVERS = 2
-BRIEFING_BUCKET_LEADERS = 2
 BRIEFING_WEEK_DAYS = 7
 BRIEFING_MAX_EX_DIVIDENDS = 6
 BRIEFING_BUCKETS = (("global", "US / Global", "S&P 500"), ("sgx", "SGX", "STI"), ("crypto", "Crypto (24/7)", "BTC"))
@@ -474,7 +476,22 @@ def fetch_history(symbol: str, period: str, interval: str, timeout: float = 10) 
     return frame
 
 
-def build_candles(history: pd.DataFrame, market: str, now_utc: datetime) -> list[list[Any]]:
+def session_close(market: str, day: str, early_closes: frozenset[str] = frozenset()) -> dtime:
+    """When the market's session ends on a local date: 1:00 p.m. on a US half day, the usual close otherwise."""
+    if day in early_closes and market in EARLY_CLOSE:
+        return EARLY_CLOSE[market]
+    return SESSION_CLOSE.get(market, dtime(23, 59))
+
+
+def early_close_dates(calendar: Any, market: str = "US") -> frozenset[str]:
+    """The half days of a market listed in the macro calendar block (empty if it is unavailable)."""
+    if not isinstance(calendar, dict) or calendar.get("status") != "fresh":
+        return frozenset()
+    return frozenset(event["date"] for event in calendar.get("events", [])
+                     if isinstance(event, dict) and event.get("type") == "market-early-close" and event.get("market") == market)
+
+
+def build_candles(history: pd.DataFrame, market: str, now_utc: datetime, early_closes: frozenset[str] = frozenset()) -> list[list[Any]]:
     """Convert a yfinance history frame to ``[date, o, h, l, c, v]`` rows.
 
     Drops rows with missing or non-positive prices, repairs high/low so that
@@ -514,7 +531,7 @@ def build_candles(history: pd.DataFrame, market: str, now_utc: datetime) -> list
         today_utc = now_utc.strftime("%Y-%m-%d")
         candles = [c for c in candles if c[0] < today_utc]
     elif candles[-1][0] == today_local:
-        close_at = SESSION_CLOSE.get(market, dtime(23, 59))
+        close_at = session_close(market, today_local, early_closes)
         cutoff_minutes = close_at.hour * 60 + close_at.minute + CLOSE_BUFFER_MINUTES
         now_minutes = local_now.hour * 60 + local_now.minute
         if now_minutes < cutoff_minutes:
@@ -802,7 +819,7 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
         f"{symbol} price history",
         lambda: fetch_history(symbol, history_cfg["period"], history_cfg["interval"], settings.request_timeout),
         settings.max_retries, settings.retry_delay, deadline)
-    candles, older = split_history(build_candles(history, entry["market"], now_utc))
+    candles, older = split_history(build_candles(history, entry["market"], now_utc, getattr(settings, "early_closes", frozenset())))
     if len(candles) < MIN_CANDLES:
         raise FetchError(f"{symbol} has only {len(candles)} completed candles (minimum {MIN_CANDLES})")
     dividends = dividend_rows(history, candles[-1][0]) if pays_out else []
@@ -1615,9 +1632,9 @@ def empty_regime(note: str) -> dict[str, Any]:
             "historyFields": list(REGIME_HISTORY_FIELDS), "history": [], "note": note}
 
 
-def regime_closes(frame: pd.DataFrame, now_utc: datetime) -> dict[str, float]:
+def regime_closes(frame: pd.DataFrame, now_utc: datetime, early_closes: frozenset[str] = frozenset()) -> dict[str, float]:
     """Completed daily closes of one VIX index by date. Today's value is dropped until the
-    US close plus the usual buffer: before then it is an intraday level, not a close."""
+    US close (1:00 p.m. on a half day) plus the usual buffer: before then it is an intraday level."""
     closes: dict[str, float] = {}
     for stamp, value in frame["Close"].items():
         level = clean_number(value, digits=2)
@@ -1625,7 +1642,7 @@ def regime_closes(frame: pd.DataFrame, now_utc: datetime) -> dict[str, float]:
             closes[stamp.strftime("%Y-%m-%d")] = level
     new_york = pd.Timestamp(now_utc).tz_convert(MARKET_TIMEZONES["US"])
     today = new_york.strftime("%Y-%m-%d")
-    close_at = SESSION_CLOSE["US"]
+    close_at = session_close("US", today, early_closes)
     if today in closes and new_york.hour * 60 + new_york.minute < close_at.hour * 60 + close_at.minute + CLOSE_BUFFER_MINUTES:
         del closes[today]
     return closes
@@ -1671,7 +1688,7 @@ def fetch_regime(settings: argparse.Namespace, now_utc: datetime) -> dict[str, A
             frame = with_retry(f"{symbol} level",
                                lambda symbol=symbol: fetch_history(symbol, REGIME_HISTORY_PERIOD, "1d", settings.request_timeout),
                                settings.max_retries, settings.retry_delay, deadline)
-            series[role] = regime_closes(frame, now_utc)
+            series[role] = regime_closes(frame, now_utc, getattr(settings, "early_closes", frozenset()))
         except Exception as exc:  # noqa: BLE001
             if role != "short":
                 raise FetchError(f"{symbol} unavailable: {str(exc)[:160]}") from exc
@@ -2571,9 +2588,9 @@ def finite_or_none(value: Any) -> float | None:
 
 
 def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
-    """Every asset's verdict, Composite score and the figures the briefing needs (bucket,
-    the latest move in σ, 3-month relative strength, the next earnings and ex-dividend
-    dates), from the site's own JavaScript engines.
+    """Every asset's trend regime, Technical and Fundamental scores and the figures the
+    briefing needs (bucket, the latest move in σ, 3-month relative strength, the next
+    earnings and ex-dividend dates), from the site's own JavaScript engines.
 
     Running the engines (rather than re-implementing them in Python) guarantees
     the briefing says exactly what the site shows. Returns None, with a warning,
@@ -2607,9 +2624,7 @@ def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("ticker"), str):
             continue
-        verdict = row.get("verdict") if row.get("verdict") in {"BUY", "HOLD", "SELL"} else None
-        composite = row.get("composite") if is_finite_number(row.get("composite")) else None
-        confidence = row.get("confidence") if row.get("confidence") in {"High", "Medium", "Low"} else None
+        trend = row.get("trend") if row.get("trend") in TREND_REGIMES else None
         name = row.get("name") if isinstance(row.get("name"), str) else row["ticker"]
         def whole(value: Any) -> bool:
             return isinstance(value, int) and not isinstance(value, bool) and value >= 0
@@ -2627,7 +2642,8 @@ def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
             next_dividend = {"date": dividend["date"], "days": dividend["days"], "estimated": dividend.get("estimated") is True}
         market = row.get("market") if row.get("market") in MARKETS else None
         signals.append({
-            "ticker": row["ticker"], "name": name, "verdict": verdict, "composite": composite, "confidence": confidence,
+            "ticker": row["ticker"], "name": name, "trend": trend,
+            "technical": finite_or_none(row.get("technical")), "fundamental": finite_or_none(row.get("fundamental")),
             "assetClass": row.get("assetClass") if row.get("assetClass") in ASSET_CLASSES else None,
             "market": market,
             "bucket": row.get("bucket") if row.get("bucket") in {"global", "sgx", "crypto"} else None,
@@ -2914,35 +2930,50 @@ def briefing_triggers(snapshot: dict[str, Any], signals: list[dict[str, Any]], s
 
 
 def tally_text(rows: list[dict[str, Any]]) -> str:
-    counts = {verdict: sum(1 for row in rows if row.get("verdict") == verdict) for verdict in ("BUY", "HOLD", "SELL")}
-    return f"{counts['BUY']} BUY · {counts['HOLD']} HOLD · {counts['SELL']} SELL"
+    """'6 Uptrend · 1 Pullback · 3 Recovering · 16 Downtrend': regimes with no asset are left out."""
+    counts = [(regime, sum(1 for row in rows if row.get("trend") == regime)) for regime in TREND_REGIMES]
+    return " · ".join(f"{count} {regime}" for regime, count in counts if count)
+
+
+def trend_line(label: str, rows: list[dict[str, Any]], strongest_first: bool, versus: str) -> str | None:
+    """'Uptrend (3M vs S&P 500): WMT +37.0% · BRK-B +27.7% · 3 more', by 3-month relative strength.
+
+    Uptrend lists the strongest first, Downtrend the weakest first; an asset without a
+    relative strength goes last. A description of where prices stand, not a ranking to act on.
+    """
+    members = [row for row in rows if row.get("trend") == label]
+    if not members:
+        return None
+    sign = -1 if strongest_first else 1
+    members.sort(key=lambda row: (row.get("relativeStrength3m") is None, sign * (row.get("relativeStrength3m") or 0.0), row["ticker"]))
+    shown = members[:BRIEFING_BUCKET_SIGNALS]
+    parts = [f"{row['ticker']} {percent(row['relativeStrength3m'])}" if row.get("relativeStrength3m") is not None else row["ticker"] for row in shown]
+    if len(members) > len(shown):
+        parts.append(f"{len(members) - len(shown)} more")
+    heading = f"{label} (3M vs {versus})" if any(row.get("relativeStrength3m") is not None for row in shown) else label
+    return f"{heading}: {' · '.join(parts)}"
 
 
 def bucket_sections(signals: list[dict[str, Any]], previous: dict[str, Any] | None, moved: set, fmt: BriefingFormat) -> list[str]:
-    """US / Global, SGX and Crypto: top verdicts, notable movers and 3-month leaders, indices excluded."""
+    """US / Global, SGX and Crypto: the trend-regime tally, the Uptrend and Downtrend lines
+    by 3-month relative strength, and notable movers. Indices are left out."""
     before = previous_dates(previous)
     lines: list[str] = []
     for key, title, versus in BRIEFING_BUCKETS:
         rows = [row for row in signals if row.get("bucket") == key and row.get("tradable")]
         if not rows:
             continue
-        lines += ["", fmt.bold(title) + fmt.text(f" · {tally_text(rows)}")]
-        buys = sorted((row for row in rows if row["verdict"] == "BUY" and row["composite"] is not None), key=lambda row: (-row["composite"], row["ticker"]))
-        sells = sorted((row for row in rows if row["verdict"] == "SELL" and row["composite"] is not None), key=lambda row: (row["composite"], row["ticker"]))
-        if buys:
-            lines.append(fmt.text("BUY: " + " · ".join(f"{row['ticker']} {row['composite']:.0f}" for row in buys[:BRIEFING_BUCKET_SIGNALS])))
-        if sells:
-            lines.append(fmt.text("SELL: " + " · ".join(f"{row['ticker']} {row['composite']:.0f}" for row in sells[:BRIEFING_BUCKET_SIGNALS])))
+        tally = tally_text(rows)
+        lines += ["", fmt.bold(title) + (fmt.text(f" · {tally}") if tally else "")]
+        for label, strongest_first in (("Uptrend", True), ("Downtrend", False)):
+            line = trend_line(label, rows, strongest_first, versus)
+            if line:
+                lines.append(fmt.text(line))
         movers = [row for row in rows if row["ticker"] not in moved and row.get("zScore") is not None and row.get("dailyReturn") is not None
                   and abs(row["zScore"]) >= BRIEFING_MOVER_SIGMA and new_session(row, before)]
         movers.sort(key=lambda row: (-abs(row["zScore"]), row["ticker"]))
         if movers:
             lines.append(fmt.text("Movers: " + " · ".join(move_text(row) for row in movers[:BRIEFING_BUCKET_MOVERS])))
-        leaders = sorted((row for row in rows if row.get("relativeStrength3m") is not None and row["relativeStrength3m"] > 0),
-                         key=lambda row: (-row["relativeStrength3m"], row["ticker"]))
-        if leaders:
-            shown = " · ".join(f"{row['ticker']} {percent(row['relativeStrength3m'])}" for row in leaders[:BRIEFING_BUCKET_LEADERS])
-            lines.append(fmt.text(f"3M RS leaders: {shown} vs {versus}"))
     return lines
 
 
@@ -3038,8 +3069,8 @@ def week_ahead_sections(snapshot: dict[str, Any], signals: list[dict[str, Any]],
             parts = [row["ticker"]]
             if row.get("dailyReturn") is not None and row.get("zScore") is not None:
                 parts.append(f"{percent(row['dailyReturn'])} ({sigma(row['zScore'])})")
-            if row.get("verdict") and row.get("composite") is not None:
-                parts.append(f"{row['verdict']} {row['composite']:.0f}")
+            if row.get("trend"):
+                parts.append(row["trend"])
             if row.get("relativeStrength3m") is not None and row.get("benchmark") == "BTC-USD":
                 parts.append(f"3M vs BTC {percent(row['relativeStrength3m'])}")
             lines.append(fmt.text(" · ".join(parts[:1]) + " " + " · ".join(parts[1:])))
@@ -3065,8 +3096,9 @@ def footer_lines(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]] 
     lines = [""]
     if signals:
         rows = [row for row in signals if row.get("tradable") and (row.get("bucket") == "crypto" or not weekend)]
-        if rows:
-            lines.append(fmt.text(f"{'Crypto' if weekend else 'Tradable'}: {tally_text(rows)}"))
+        tally = tally_text(rows)
+        if tally:
+            lines.append(fmt.text(f"{'Crypto' if weekend else 'Tradable'}: {tally}"))
     assets = snapshot.get("assets", []) if isinstance(snapshot, dict) else []
     stale = [asset["ticker"] for asset in assets if asset.get("status") != "fresh"]
     fresh = f"{len(assets) - len(stale)}/{len(assets)} fresh"
@@ -3092,7 +3124,7 @@ def footer_lines(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]] 
     calendar = macro.get("calendar") if isinstance(macro, dict) else None
     if isinstance(calendar, dict) and calendar.get("note") and calendar.get("status") == "fresh":
         lines.append(fmt.text(f"⚠ {calendar['note']}"))
-    lines.append(fmt.italic("Rule-based signals for learning, not financial advice."))
+    lines.append(fmt.italic("Trend regimes describe the past; they do not predict returns. Not financial advice."))
     return lines
 
 
@@ -3104,7 +3136,7 @@ def build_briefing(snapshot: dict[str, Any] | None, signals: list[dict[str, Any]
 
     Weekday: the regime, a ⚡ block that appears only when something happened, three
     buckets of tradable assets, the next 30 days, and a compact footer. Saturday and Sunday
-    (UTC): the week-ahead edition, with no stale equity verdicts or movers. `previous` is the
+    (UTC): the week-ahead edition, with no stale equity regimes or movers. `previous` is the
     snapshot before this run; it keeps a weekend from repeating Friday's triggers.
     """
     weekend = is_weekend_run(now)
@@ -3408,10 +3440,13 @@ def main(argv: list[str] | None = None) -> int:
     for currency, entry in macro["riskFree"].items():
         shown = "unavailable" if entry["yield"] is None else f"{entry['yield'] * 100:.2f}%"
         LOG.info("risk-free %s: %s [%s] %s", currency, shown, entry["status"], entry["name"])
+    # The calendar is read first: its US half days decide when today's session counts as complete.
+    calendar = build_calendar(settings.calendar, now_utc)
+    settings.early_closes = early_close_dates(calendar, "US")
     macro["regime"] = build_regime(previous, settings, now_utc)
     LOG.info("market regime: %s, %d sessions of history", regime_summary(macro["regime"]), len(macro["regime"]["history"]))
-    macro["calendar"] = build_calendar(settings.calendar, now_utc)
-    LOG.info("macro calendar: %s, %d events", calendar_summary(macro["calendar"], now_utc), len(macro["calendar"]["events"]))
+    macro["calendar"] = calendar
+    LOG.info("macro calendar: %s, %d events, %d US half days", calendar_summary(calendar, now_utc), len(calendar["events"]), len(settings.early_closes))
 
     assets: list[dict[str, Any]] = []
     refreshed: list[dict[str, Any]] = []

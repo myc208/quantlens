@@ -1,7 +1,7 @@
 /**
  * appTabs.js: the bar under the telemetry strip.
  *
- *   [Compare] [Leaderboard] [Portfolio]            Range [1M|3M|6M|1Y]   [Search  Ctrl K]
+ *   [Compare] [Leaderboard] [Portfolio] [Rotation]     Range [1M|3M|6M|1Y|5Y]   [Search  Ctrl K]
  *
  * View tabs: a WAI-ARIA tablist with automatic activation. The arrow keys,
  * Home and End move between tabs; each tab controls one tab panel in the
@@ -10,7 +10,7 @@
  * Time range: one radio group. It dispatches setRange, and everything that
  * depends on the window (charts, period statistics, correlation, the
  * simulation's volatility, the portfolio maths) recomputes from the sliced
- * series. It never changes RSI, MACD, the moving averages or the verdict,
+ * series. It never changes RSI, MACD, the moving averages or the trend regime,
  * which need a full year to warm up. The range is part of the URL (?range=).
  *
  * The bar publishes its height as --tabs-h so sticky table headers and the
@@ -20,12 +20,13 @@
 
 import { VIEWS, RANGES } from '../core/store.js';
 
-const VIEW_LABELS = Object.freeze({ compare: 'Compare', leaderboard: 'Leaderboard', portfolio: 'Portfolio' });
-const VIEW_PANELS = Object.freeze({ compare: 'comparison-matrix', leaderboard: 'leaderboard', portfolio: 'portfolio' });
+const VIEW_LABELS = Object.freeze({ compare: 'Compare', leaderboard: 'Leaderboard', portfolio: 'Portfolio', rotation: 'Rotation' });
+const VIEW_PANELS = Object.freeze({ compare: 'comparison-matrix', leaderboard: 'leaderboard', portfolio: 'portfolio', rotation: 'rotation' });
 const VIEW_HINTS = Object.freeze({
   compare: 'Up to three assets side by side',
   leaderboard: 'The whole watchlist, ranked',
   portfolio: 'Allocation, return, risk and Sharpe ratio',
+  rotation: 'Who has led and lagged over 1 and 3 months',
 });
 
 export function mountAppTabs(root, app) {
@@ -43,7 +44,7 @@ export function mountAppTabs(root, app) {
     <div class="app-tabs__range">
       <span class="app-tabs__range-label" aria-hidden="true">Range</span>
       <fieldset class="segmented" data-control="range">
-        <legend class="sr-only">Time range for charts, period statistics, correlation and portfolio maths. The verdict always uses the full year.</legend>
+        <legend class="sr-only">Time range for charts, period statistics, correlation and portfolio maths. The trend regime and the scores always use the full year.</legend>
         ${RANGES.map((range) => {
     const info = h.rangeInfo(range);
     return `

@@ -313,7 +313,7 @@ export function analyzeFactors({ asset, series, benchmark = null, benchmarkSerie
       interpretation: interpretation(
         `Since ${rs.from}, ${ticker} ${verb(rs.assetReturn)} ${fmtPct(Math.abs(rs.assetReturn), 1)} while ${benchmarkName} ${verb(rs.benchmarkReturn)} ${fmtPct(Math.abs(rs.benchmarkReturn), 1)}: ${rs.value >= 0 ? 'ahead' : 'behind'} by ${fmtPct(Math.abs(rs.value), 1)}.`,
         [threshold('Above 0', 'Outperformed the benchmark', 'neutral'), threshold('Below 0', 'Underperformed it', 'neutral')],
-        `A description of the past ${days} days, not a signal: momentum like this is not tested here and is not part of the verdict.${dividendNote}${timingNote}`,
+        `A description of the past ${days} days, not a signal: momentum like this did not predict the next month on this watchlist over 2022–2026, and it is not part of any score.${dividendNote}${timingNote}`,
       ),
     });
   }
