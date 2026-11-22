@@ -4263,6 +4263,7 @@
         expect(macroEngine.eventTitle(minutes)).toBe('FOMC minutes (8–9 Dec meeting)');
         expect(macroEngine.eventTitle(holiday)).toBe('US markets closed: Thanksgiving Day');
         expect(macroEngine.eventTitle(early)).toMatch(/close at 1:00 p.m./);
+        expect(macroEngine.eventTitle({ ...early, market: 'SG', name: 'Christmas Eve' })).toBe('SGX closes at 12:00 noon (Christmas Eve)');
         expect(macroEngine.eventTitle(calendarAt().events[9])).toMatch(/no policy decision/);
       });
       test('holidays come off the trading-day count: Thanksgiving week has four US sessions', () => {

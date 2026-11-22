@@ -1348,8 +1348,10 @@ class MacroCalendar(unittest.TestCase):
 
     def test_the_committed_calendar_is_valid_and_spans_both_offsets(self):
         self.assertEqual(ff.validate_macro_calendar(self.calendar), [])
-        offsets = {event["at"][-6:] for event in self.calendar["events"] if "at" in event}
+        offsets = {event["at"][-6:] for event in self.calendar["events"] if "at" in event and event.get("market") != "SG"}
         self.assertEqual(offsets, {"-05:00", "-04:00"})                       # winter and summer time both present
+        singapore = {event["at"][-6:] for event in self.calendar["events"] if event.get("market") == "SG" and "at" in event}
+        self.assertEqual(singapore, {"+08:00"})                               # SGX half days are Singapore time (V3.4)
         kinds = {event["type"] for event in self.calendar["events"]}
         self.assertTrue({"fomc-decision", "fomc-minutes", "cpi", "market-holiday", "fomc-meeting"} <= kinds)
 
@@ -1744,7 +1746,8 @@ class RiskFirstBriefing(unittest.TestCase):
 
 
 class EarlyCloses(unittest.TestCase):
-    """US half days from the macro calendar end the session at 1:00 p.m. New York (V3.3)."""
+    """Half days from the macro calendar end the session early: 1:00 p.m. New York (V3.3) and
+    12:00 noon Singapore (V3.4). Each market is given its own half days."""
 
     @staticmethod
     def us_frame(last_day: str):
@@ -1755,11 +1758,14 @@ class EarlyCloses(unittest.TestCase):
         half = frozenset({"2026-11-27"})
         self.assertEqual(ff.session_close("US", "2026-11-27", half), dtime(13, 0))
         self.assertEqual(ff.session_close("US", "2026-11-25", half), dtime(16, 0))
-        self.assertEqual(ff.session_close("SG", "2026-11-27", half), dtime(17, 0))   # SGX is not a US half day
+        self.assertEqual(ff.session_close("SG", "2026-11-27", frozenset()), dtime(17, 0))   # SGX is not a US half day
+        self.assertEqual(ff.session_close("SG", "2026-12-24", frozenset({"2026-12-24"})), dtime(12, 0))
+        self.assertEqual(ff.session_close("UK", "2026-12-24", frozenset({"2026-12-24"})), dtime(16, 30))   # no London half days
 
     def test_half_days_come_from_the_calendar(self):
         block = ff.build_calendar(ff.DEFAULT_CALENDAR, datetime(2026, 11, 22, tzinfo=timezone.utc))
         self.assertEqual(ff.early_close_dates(block), frozenset({"2026-11-27", "2026-12-24", "2027-11-26"}))
+        self.assertEqual(ff.early_close_dates(block, "SG"), frozenset({"2026-12-24", "2026-12-31", "2027-02-05", "2027-12-24", "2027-12-31"}))
         self.assertEqual(ff.early_close_dates(ff.empty_calendar("down")), frozenset())
         self.assertEqual(ff.early_close_dates(None), frozenset())
 
@@ -1778,6 +1784,38 @@ class EarlyCloses(unittest.TestCase):
         after = datetime(2026, 11, 27, 18, 25, tzinfo=timezone.utc)
         self.assertEqual(ff.regime_closes(frame, after, frozenset({"2026-11-27"})), {"2026-11-25": 24.5, "2026-11-27": 26.0})
         self.assertEqual(ff.regime_closes(frame, after), {"2026-11-25": 24.5})
+
+
+    @staticmethod
+    def sg_frame(last_day: str):
+        index = pd.DatetimeIndex([pd.Timestamp("2026-12-23", tz="Asia/Singapore"), pd.Timestamp(last_day, tz="Asia/Singapore")])
+        return pd.DataFrame({"Open": [10.0, 11.0], "High": [10.5, 11.5], "Low": [9.5, 10.5], "Close": [10.2, 11.2], "Volume": [100, 100]}, index=index)
+
+    def test_an_sgx_half_day_candle_is_kept_after_12_20_pm_not_before(self):
+        half = frozenset({"2026-12-24"})
+        frame = self.sg_frame("2026-12-24")
+        before = datetime(2026, 12, 24, 4, 15, tzinfo=timezone.utc)    # 12:15 p.m. in Singapore
+        after = datetime(2026, 12, 24, 4, 25, tzinfo=timezone.utc)     # 12:25 p.m.: closed at 12:00, past the buffer
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "SG", before, half)], ["2026-12-23"])
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "SG", after, half)], ["2026-12-23", "2026-12-24"])
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "SG", after)], ["2026-12-23"])   # a normal day closes at 5:00
+
+    def test_each_market_must_close_at_its_own_half_day_time(self):
+        us = {"type": "market-early-close", "date": "2026-12-24", "at": "2026-12-24T13:00:00-05:00", "market": "US", "name": "Christmas Eve"}
+        sg = {"type": "market-early-close", "date": "2026-12-24", "at": "2026-12-24T12:00:00+08:00", "market": "SG", "name": "Christmas Eve"}
+        self.assertEqual(ff.validate_calendar_event(us, "e"), [])
+        self.assertEqual(ff.validate_calendar_event(sg, "e"), [])
+        self.assertTrue(ff.validate_calendar_event({**sg, "at": "2026-12-24T13:00:00-05:00"}, "e"))   # a US time on an SGX half day
+        self.assertTrue(ff.validate_calendar_event({**us, "at": "2026-12-24T12:00:00+08:00"}, "e"))
+        self.assertTrue(ff.validate_calendar_event({**sg, "at": "2026-12-24T12:30:00+08:00"}, "e"))
+        self.assertEqual(ff.early_close_at("US", "2027-07-02"), "2027-07-02T13:00:00-04:00")      # daylight saving in New York
+        self.assertEqual(ff.early_close_at("SG", "2027-02-05"), "2027-02-05T12:00:00+08:00")
+
+    def test_the_briefing_names_each_half_day_in_its_own_time(self):
+        sg = {"type": "market-early-close", "date": "2026-12-24", "market": "SG", "name": "Christmas Eve"}
+        self.assertEqual(ff.closure_text(sg, date_first=True), "Thu 24 Dec: SGX closes 12:00 PM SGT")
+        self.assertEqual(ff.closure_text({**sg, "market": "US"}), "US closes 1:00 PM ET Thu 24 Dec")
+        self.assertEqual(ff.macro_label(sg), "SGX closes 12:00 PM SGT (Christmas Eve)")
 
 
 if __name__ == "__main__":

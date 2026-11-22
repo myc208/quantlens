@@ -6,7 +6,7 @@
  *   fomc-meeting         a meeting without a policy decision (the October 2027 strategy meeting)
  *   cpi                  US Consumer Price Index release, 8:30 a.m. New York
  *   market-holiday       a weekday when the US market or SGX is closed
- *   market-early-close   a US half day (1:00 p.m. close)
+ *   market-early-close   a half day: 1:00 p.m. New York (US), 12:00 noon Singapore (SGX, V3.4)
  *
  * "Market-moving" means an FOMC decision or a CPI release: those are what the 48-hour
  * trigger and the next-event countdown look at. Times carry their own UTC offset, so no
@@ -56,7 +56,7 @@ export function eventTitle(event) {
     }
     case 'cpi': return `US CPI for ${MONTHS[Number(event.period.slice(5, 7)) - 1]}`;
     case 'market-holiday': return `${event.market === 'US' ? 'US markets' : 'SGX'} closed: ${event.name}`;
-    case 'market-early-close': return `US markets close at 1:00 p.m. (${event.name})`;
+    case 'market-early-close': return event.market === 'SG' ? `SGX closes at 12:00 noon (${event.name})` : `US markets close at 1:00 p.m. (${event.name})`;
     default: return event.type;
   }
 }

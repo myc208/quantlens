@@ -157,8 +157,10 @@ SENTIMENT_LABELS = {"positive", "neutral", "negative"}
 # session has closed (plus a buffer for Yahoo's delayed quotes).
 SESSION_CLOSE = {"US": dtime(16, 0), "SG": dtime(17, 0), "UK": dtime(16, 30)}
 SESSION_OPEN = {"US": dtime(9, 30), "SG": dtime(9, 0), "UK": dtime(8, 0)}
-# US half days (from the macro calendar's market-early-close entries) close at 1:00 p.m. New York.
-EARLY_CLOSE = {"US": dtime(13, 0)}
+# Half days (the macro calendar's market-early-close entries): 1:00 p.m. New York on US half
+# days; 12:00 noon Singapore on SGX half days, the eves of Chinese New Year, Christmas and New
+# Year when they fall on a trading day (V3.4). The usual buffer applies after either close.
+EARLY_CLOSE = {"US": dtime(13, 0), "SG": dtime(12, 0)}
 MARKET_TIMEZONES = {"US": "America/New_York", "SG": "Asia/Singapore", "UK": "Europe/London"}
 CLOSE_BUFFER_MINUTES = 20
 
@@ -247,7 +249,8 @@ CALENDAR_TYPES = {
     "fomc-minutes": ({"at", "meeting"}, {"derived"}, "14:00"),
     "cpi": ({"at", "period"}, set(), "08:30"),
     "market-holiday": ({"market", "name"}, set(), None),
-    "market-early-close": ({"at", "market", "name"}, set(), "13:00"),
+    # Its time depends on the market: see EARLY_CLOSE and early_close_at.
+    "market-early-close": ({"at", "market", "name"}, set(), None),
 }
 CALENDAR_MARKETS = {"US", "SG"}
 CALENDAR_FILE_KEYS = ["updated", "coverage", "sources", "notes", "events"]
@@ -477,10 +480,19 @@ def fetch_history(symbol: str, period: str, interval: str, timeout: float = 10) 
 
 
 def session_close(market: str, day: str, early_closes: frozenset[str] = frozenset()) -> dtime:
-    """When the market's session ends on a local date: 1:00 p.m. on a US half day, the usual close otherwise."""
+    """When the market's session ends on a local date: its half-day close (1:00 p.m. New York, 12:00
+    noon Singapore) when the date is one of that market's half days, the usual close otherwise.
+    `early_closes` holds the half days of this market only."""
     if day in early_closes and market in EARLY_CLOSE:
         return EARLY_CLOSE[market]
     return SESSION_CLOSE.get(market, dtime(23, 59))
+
+
+def early_close_at(market: str, day: str) -> str:
+    """The `at` stamp of a half day: 13:00 New York with its UTC offset, or 12:00 Singapore (+08:00)."""
+    clock = EARLY_CLOSE[market].strftime("%H:%M")
+    offset = new_york_offset(day, clock) if market == "US" else "+08:00"
+    return f"{day}T{clock}:00{offset}"
 
 
 def early_close_dates(calendar: Any, market: str = "US") -> frozenset[str]:
@@ -819,7 +831,8 @@ def fetch_asset(entry: dict[str, Any], previous: dict[str, Any] | None, settings
         f"{symbol} price history",
         lambda: fetch_history(symbol, history_cfg["period"], history_cfg["interval"], settings.request_timeout),
         settings.max_retries, settings.retry_delay, deadline)
-    candles, older = split_history(build_candles(history, entry["market"], now_utc, getattr(settings, "early_closes", frozenset())))
+    half_days = getattr(settings, "early_closes", {}).get(entry["market"], frozenset())
+    candles, older = split_history(build_candles(history, entry["market"], now_utc, half_days))
     if len(candles) < MIN_CANDLES:
         raise FetchError(f"{symbol} has only {len(candles)} completed candles (minimum {MIN_CANDLES})")
     dividends = dividend_rows(history, candles[-1][0]) if pays_out else []
@@ -1688,7 +1701,7 @@ def fetch_regime(settings: argparse.Namespace, now_utc: datetime) -> dict[str, A
             frame = with_retry(f"{symbol} level",
                                lambda symbol=symbol: fetch_history(symbol, REGIME_HISTORY_PERIOD, "1d", settings.request_timeout),
                                settings.max_retries, settings.retry_delay, deadline)
-            series[role] = regime_closes(frame, now_utc, getattr(settings, "early_closes", frozenset()))
+            series[role] = regime_closes(frame, now_utc, getattr(settings, "early_closes", {}).get("US", frozenset()))
         except Exception as exc:  # noqa: BLE001
             if role != "short":
                 raise FetchError(f"{symbol} unavailable: {str(exc)[:160]}") from exc
@@ -1760,6 +1773,10 @@ def validate_calendar_event(event: Any, where: str) -> list[str]:
         expected = f"{event['date']}T{local_time}:00{new_york_offset(event['date'], local_time)}"
         if event["at"] != expected:
             errors.append(f"{where}.at must be {expected} (New York time with its UTC offset)")
+    if event["type"] == "market-early-close" and event.get("market") in EARLY_CLOSE:
+        expected = early_close_at(event["market"], event["date"])
+        if event["at"] != expected:
+            errors.append(f"{where}.at must be {expected} (the market's half-day close with its UTC offset)")
     if "meeting" in event:
         days = meeting_days(event["meeting"])
         if days is None:
@@ -2790,7 +2807,7 @@ def macro_label(event: dict[str, Any]) -> str:
     if kind == "market-holiday":
         return f"{'US markets' if event['market'] == 'US' else 'SGX'} closed ({event['name']})"
     if kind == "market-early-close":
-        return f"US markets close 1:00 PM ET ({event['name']})"
+        return f"{early_close_words(event['market'])} ({event['name']})"
     return kind
 
 
@@ -3007,11 +3024,16 @@ def outlook_lines(snapshot: dict[str, Any], signals: list[dict[str, Any]], now: 
     return lines
 
 
+def early_close_words(market: str) -> str:
+    """'US closes 1:00 PM ET' or 'SGX closes 12:00 PM SGT'."""
+    return "US closes 1:00 PM ET" if market == "US" else "SGX closes 12:00 PM SGT"
+
+
 def closure_text(event: dict[str, Any], date_first: bool = False) -> str:
     """'US closed Thu 26 Nov (Thanksgiving Day)', or with the date first for a dated list:
-    'Thu 26 Nov: US closed (Thanksgiving Day)'. Early closes: 'US closes 1:00 PM ET'."""
+    'Thu 26 Nov: US closed (Thanksgiving Day)'. Early closes: 'US closes 1:00 PM ET', 'SGX closes 12:00 PM SGT'."""
     market = "US" if event["market"] == "US" else "SGX"
-    what = f"{market} closes 1:00 PM ET" if event["type"] == "market-early-close" else f"{market} closed"
+    what = early_close_words(event["market"]) if event["type"] == "market-early-close" else f"{market} closed"
     detail = "" if event["type"] == "market-early-close" else f" ({event['name']})"
     return f"{day_label(event['date'])}: {what}{detail}" if date_first else f"{what} {day_label(event['date'])}{detail}"
 
@@ -3440,13 +3462,14 @@ def main(argv: list[str] | None = None) -> int:
     for currency, entry in macro["riskFree"].items():
         shown = "unavailable" if entry["yield"] is None else f"{entry['yield'] * 100:.2f}%"
         LOG.info("risk-free %s: %s [%s] %s", currency, shown, entry["status"], entry["name"])
-    # The calendar is read first: its US half days decide when today's session counts as complete.
+    # The calendar is read first: its half days decide when today's session counts as complete.
     calendar = build_calendar(settings.calendar, now_utc)
-    settings.early_closes = early_close_dates(calendar, "US")
+    settings.early_closes = {market: early_close_dates(calendar, market) for market in EARLY_CLOSE}
     macro["regime"] = build_regime(previous, settings, now_utc)
     LOG.info("market regime: %s, %d sessions of history", regime_summary(macro["regime"]), len(macro["regime"]["history"]))
     macro["calendar"] = calendar
-    LOG.info("macro calendar: %s, %d events, %d US half days", calendar_summary(calendar, now_utc), len(calendar["events"]), len(settings.early_closes))
+    LOG.info("macro calendar: %s, %d events, %d US and %d SGX half days", calendar_summary(calendar, now_utc), len(calendar["events"]),
+             len(settings.early_closes["US"]), len(settings.early_closes["SG"]))
 
     assets: list[dict[str, Any]] = []
     refreshed: list[dict[str, Any]] = []
