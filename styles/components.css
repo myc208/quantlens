@@ -3548,3 +3548,135 @@ th[aria-sort="ascending"] .board__sort::after {
   color: var(--text-secondary);
   font-size: var(--text-xs);
 }
+
+/* ---------------- Rotation tab (V3.3) ---------------- */
+#rotation {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+#rotation[hidden] {
+  display: none;
+}
+
+.rot-controls {
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.rot-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+  padding: var(--space-4);
+  overflow-x: auto;
+}
+
+@media (max-width: 767px) {
+  .rot-card {
+    padding: var(--space-3);
+  }
+}
+
+.rot-plot {
+  width: 100%;
+  min-height: 260px;
+}
+
+.rot-field {
+  fill-opacity: 0.55;
+}
+
+.rot-field--leading {
+  fill: var(--status-good-wash);
+}
+
+.rot-field--weakening {
+  fill: var(--status-warning-wash);
+}
+
+.rot-field--lagging {
+  fill: var(--status-critical-wash);
+}
+
+.rot-field--improving {
+  fill: var(--status-neutral-wash);
+}
+
+.rot-qlabel {
+  fill: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.rot-axis-title {
+  fill: var(--text-muted);
+}
+
+.rot-point {
+  cursor: pointer;
+}
+
+.rot-point circle {
+  stroke: var(--surface-1);
+  stroke-width: 1.5;
+}
+
+.rot-point--leading circle {
+  fill: var(--status-good);
+}
+
+.rot-point--weakening circle {
+  fill: var(--status-warning);
+}
+
+.rot-point--lagging circle {
+  fill: var(--status-critical);
+}
+
+.rot-point--improving circle {
+  fill: var(--status-neutral);
+}
+
+.rot-point:hover circle {
+  stroke: var(--text-primary);
+}
+
+.rot-label {
+  fill: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  paint-order: stroke;
+  stroke: var(--surface-1);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.rot-table {
+  width: 100%;
+}
+
+.rot-table .num {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.rot-table .cell {
+  min-height: 32px;
+  padding: 2px 4px;
+}
+
+.rot-members {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.rot-member--hidden {
+  opacity: 0.5;
+}

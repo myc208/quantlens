@@ -1,6 +1,6 @@
 # QuantLens
 
-**A multi-asset comparison workstation that shows its working.** Compare US and Singapore stocks, REITs, ETFs, market indices and crypto side by side, rank a 30-asset watchlist, test a portfolio allocation, and see what the tail of each asset's returns, its next earnings release, its market and its liquidity could do to a position. Every indicator, score, ratio, risk figure, verdict and position size can be opened to reveal the formula, the raw inputs and the arithmetic, step by step.
+**A multi-asset comparison workstation that shows its working.** Compare US and Singapore stocks, REITs, ETFs, market indices and crypto side by side, rank a 30-asset watchlist, test a portfolio allocation, and see what the tail of each asset's returns, its next earnings release, its market, its liquidity and four past crashes could do to a position. Every indicator, score, ratio, risk figure, trend regime and position size can be opened to reveal the formula, the raw inputs and the arithmetic, step by step.
 
 [![Update market data and deploy](https://github.com/myc208/quantlens/actions/workflows/update-market-data.yml/badge.svg)](https://github.com/myc208/quantlens/actions/workflows/update-market-data.yml)
 
@@ -8,13 +8,15 @@
 - **Tests:** `https://myc208.github.io/quantlens/tests/engines.test.html`
 - **Cost to run:** zero. No server, no database, no API keys, no build step, no browser dependencies.
 
-> QuantLens is an educational tool. Its verdicts, position sizes, risk figures and portfolio statistics come from fixed, published rules so that they can be checked. They are not financial advice.
+> QuantLens is an educational tool. Its trend regimes, scores, position sizes, risk figures and portfolio statistics come from fixed, published rules so that they can be checked. They describe the past, do not predict returns, and are not financial advice.
 
-**What V3.2 adds:** a risk-first Telegram briefing (the regime first; a ⚡ block that appears only when something happened, with the Singapore time of any FOMC or CPI release within 48 hours; tradable assets in US / Global, SGX and Crypto buckets; the next 30 days; a one-line status) with a week-ahead edition at weekends; and a hand-kept macro calendar of FOMC decisions, CPI releases and NYSE and SGX holidays, shown on the site and used to make trading-day counts exact. No new requests.
+**What V3.3 adds:** the honest consequence of the backtest. A five-year test of the Technical score and three textbook price-only signals, split by VIX regime, found no predictive edge on this watchlist, so **BUY / HOLD / SELL, the Composite score and Confidence are gone.** Each asset now shows its **trend regime** (Uptrend, Extended, Pullback, Recovering or Downtrend) beside what followed each regime, overall and within normal, elevated and stressed markets, and position sizing is pure risk control. The Portfolio sandbox **replays your weights through four S&P 500 sell-offs** (2022, August 2024, the 2025 tariff shock and autumn 2026) against the index in your currency; a new **Rotation** tab plots 1-month against 3-month relative strength for the 26 tradable assets and 11 groups; and the daily candle cutoff knows the US half days. No new requests.
+
+**V3.2 added** a risk-first Telegram briefing (the regime first; a ⚡ block that appears only when something happened, with the Singapore time of any FOMC or CPI release within 48 hours; tradable assets in US / Global, SGX and Crypto buckets; the next 30 days; a one-line status) with a week-ahead edition at weekends; and a hand-kept macro calendar of FOMC decisions, CPI releases and NYSE and SGX holidays, shown on the site and used to make trading-day counts exact.
 
 **V3.1 added** a market regime read from the VIX term structure (normal, elevated or stressed when the curve inverts), shown as a pill, a banner and the first line of the Telegram briefing; beta, R², idiosyncratic volatility and relative strength against each asset's natural benchmark; the portfolio's beta to the S&P 500 and a crowding check that names holdings that are one bet in disguise; and liquidity from the stored candles (traded value, Amihud illiquidity, the tick-floor spread) with a volume cap and a spread cost in position sizing. Three extra requests a day; everything else comes from data already in the snapshot.
 
-**V3 added** a 30-asset watchlist with seven macro bellwethers; five years of history and a `5Y` range; a risk model built from the returns that actually happened (EWMA volatility, historical VaR and CVaR, a filtered block-bootstrap Monte Carlo, Ledoit-Wolf covariance shrinkage, weekly returns across time zones); an event layer with earnings dates, each stock's typical earnings-day move and the gap risk of a sized position; a five-year backtest of the verdict itself, shown in the interface with its result, which is not flattering; and a Telegram briefing that can go to several chats.
+**V3 added** a 30-asset watchlist with seven macro bellwethers; five years of history and a `5Y` range; a risk model built from the returns that actually happened (EWMA volatility, historical VaR and CVaR, a filtered block-bootstrap Monte Carlo, Ledoit-Wolf covariance shrinkage, weekly returns across time zones); an event layer with earnings dates, each stock's typical earnings-day move and the gap risk of a sized position; a five-year backtest of the then BUY / HOLD / SELL verdict, shown in the interface with its result, which was not flattering (V3.3 acted on it); and a Telegram briefing that can go to several chats.
 
 **V2 added** the Compare, Leaderboard and Portfolio views, the time-range slicer, the `Ctrl/Cmd + K` command palette, Modern Portfolio Theory in a Web Worker, de-duplicated news with headline tone, a Prophet projection shown beside its own track record, government yields as the risk-free rate, and a CI gate that runs the whole browser suite before anything is deployed.
 
@@ -34,21 +36,23 @@
 10. [The market regime](#the-market-regime)
 11. [Market sensitivity and crowding](#market-sensitivity-and-crowding)
 12. [Liquidity and tradability](#liquidity-and-tradability)
-13. [The verdict's own track record](#the-verdicts-own-track-record)
-14. [News de-duplication and headline tone](#news-de-duplication-and-headline-tone)
-15. [Prophet forecasting and its limits](#prophet-forecasting-and-its-limits)
-16. [CI/CD and the testing gates](#cicd-and-the-testing-gates)
-17. [Daily Telegram briefing](#daily-telegram-briefing)
-18. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
-19. [The Derivation Tracer](#the-derivation-tracer)
-20. [The mathematics](#the-mathematics)
-21. [Numerical safety](#numerical-safety)
-22. [Testing](#testing)
-23. [Accessibility and responsive design](#accessibility-and-responsive-design)
-24. [Deployment](#deployment)
-25. [Changing the watchlist](#changing-the-watchlist)
-26. [Design decisions and known limitations](#design-decisions-and-known-limitations)
-27. [Interview talking points](#interview-talking-points)
+13. [Trend regimes and their track record](#trend-regimes-and-their-track-record)
+14. [Crash replays](#crash-replays)
+15. [Sector rotation](#sector-rotation)
+16. [News de-duplication and headline tone](#news-de-duplication-and-headline-tone)
+17. [Prophet forecasting and its limits](#prophet-forecasting-and-its-limits)
+18. [CI/CD and the testing gates](#cicd-and-the-testing-gates)
+19. [Daily Telegram briefing](#daily-telegram-briefing)
+20. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
+21. [The Derivation Tracer](#the-derivation-tracer)
+22. [The mathematics](#the-mathematics)
+23. [Numerical safety](#numerical-safety)
+24. [Testing](#testing)
+25. [Accessibility and responsive design](#accessibility-and-responsive-design)
+26. [Deployment](#deployment)
+27. [Changing the watchlist](#changing-the-watchlist)
+28. [Design decisions and known limitations](#design-decisions-and-known-limitations)
+29. [Interview talking points](#interview-talking-points)
 
 ---
 
@@ -56,24 +60,25 @@
 
 | Feature | What the user sees |
 |---|---|
-| **Compare** | Up to three assets in columns: verdict and its five-year track record, live or last price, a price chart with a dotted 30-day projection, period statistics, tail risk, market sensitivity, liquidity, upcoming events, technical indicators, fundamentals, recent headlines, correlation and suggested position size. |
-| **Leaderboard** | The whole watchlist in one sortable table, ranked by Composite score by default, with Beta, 3-month relative strength and traded-value columns, an `Earnings 23d` chip on any stock reporting within 30 days and the watchlist-wide backtest result in its header. It respects the screener filters, and shows as many columns as its own width allows. |
-| **Portfolio sandbox** | Up to eight assets with weight sliders. Annualised return, volatility, Sharpe ratio and diversification ratio, beta to the S&P 500, concentration and the effective number of bets, who carries the risk, and where the mix sits among 2,000 alternative mixes. A banner names holdings that are one crowded bet. |
-| **Market regime** | Normal, elevated or stressed, read from the VIX term structure, in the top bar and, while the curve is inverted, as a banner over every view. Context only: it changes no score, verdict or position size. |
+| **Compare** | Up to three assets in columns: trend regime and what followed it over four years, live or last price, a price chart with a dotted 30-day projection, period statistics, tail risk, market sensitivity, liquidity, upcoming events, technical indicators, fundamentals, recent headlines, correlation and suggested position size. |
+| **Leaderboard** | The whole watchlist in one sortable table, ranked by trend regime and then 3-month relative strength by default, with the Technical and Fundamental scores as separate columns, Beta and traded value, an `Earnings 23d` chip on any stock reporting within 30 days and the watchlist-wide regime track record in its header. It respects the screener filters, and shows as many columns as its own width allows. |
+| **Portfolio sandbox** | Up to eight assets with weight sliders. Annualised return, volatility, Sharpe ratio and diversification ratio, beta to the S&P 500, concentration and the effective number of bets, who carries the risk, and where the mix sits among 2,000 alternative mixes. A banner names holdings that are one crowded bet. **Crash replays** buy the mix at four S&P 500 highs and hold it to the lows, in your currency, against the index. |
+| **Rotation** | The 26 tradable assets, or 11 groups at their median member, plotted by 3-month (across) and 1-month (up) relative strength: Leading, Weakening, Lagging or Improving. Against the S&P 500 in USD by default, or each asset's own market; a table twin lists every value. |
+| **Market regime** | Normal, elevated or stressed, read from the VIX term structure, in the top bar and, while the curve is inverted, as a banner over every view. Context only: it changes no score, trend regime or position size. |
 | **Market sensitivity** | Beta, R², idiosyncratic volatility, and 1- and 3-month relative strength against each asset's benchmark: `^GSPC` for US and London listings, `^STI` for Singapore, `BTC-USD` for other coins. |
 | **Liquidity** | 20-day average volume and traded value, Amihud illiquidity, and the spread floor set by the exchange's tick size. Position sizing caps a position at 5% of daily volume, flags anything above 1%, and shows the round-trip spread cost. |
-| **Time range** | `1M` `3M` `6M` `1Y` `5Y`. Slices the series behind the charts, period statistics, tail risk, correlation, the simulation and the portfolio maths. It never changes the verdict. |
+| **Time range** | `1M` `3M` `6M` `1Y` `5Y`. Slices the series behind the charts, period statistics, tail risk, correlation, the simulation and the portfolio maths. It never changes the trend regime or the scores. |
 | **Risk** | EWMA volatility next to the equal-weighted figure, and historical-simulation VaR and CVaR at 95% and 99%, one day and ten days, read straight from the asset's own worst days. |
 | **Events** | The next earnings date and how many trading days away it is, the stock's typical and worst earnings-day move, the next ex-dividend date, and the loss a sized position would take if the price gapped by that worst move. |
 | **Command palette** | `Ctrl/Cmd + K` finds any asset by ticker, name or sector and runs any command: switch view, change range, currency or mode, open the risk sandbox, copy the share link. |
-| **Screener** | Filter by asset class, market, sector and verdict; tick up to three assets. No market data is ever typed in. |
-| **Sector-aware scoring** | Corporates, financial companies and REITs are each scored on the measures that apply to them. A bank is never judged on EV/EBITDA. ETFs, indices and crypto have no accounts, so their verdict rests on price behaviour alone. |
+| **Screener** | Filter by asset class, market, sector and trend regime; tick up to three assets. No market data is ever typed in. |
+| **Sector-aware scoring** | Corporates, financial companies and REITs are each scored on the measures that apply to them. A bank is never judged on EV/EBITDA. ETFs, indices and crypto have no accounts, so they have a trend regime and a Technical score but no Fundamental score. |
 | **Derivation drawer** | Click any value to see its formula, raw inputs, numbered arithmetic and thresholds, then drill into the numbers it is built from. |
 | **Guided and Pro modes** | Guided explains every metric in plain language. Pro is the same data at higher density, with extra rows (99% CVaR, the ten-day tail, the risk budget). |
-| **News and forecast** | Three recent, de-duplicated headlines per asset with the tone of their wording, and a 30-day trend projection with its measured miss rate. Context only: neither is part of the verdict. |
+| **News and forecast** | Three recent, de-duplicated headlines per asset with the tone of their wording, and a 30-day trend projection with its measured miss rate. Context only: neither moves a score. |
 | **Risk sandbox** | Change account size, risk per trade, stop distance and position cap, and watch the position and a Monte Carlo fan respond. The fan resamples the asset's real days at today's volatility, and warns when an earnings release falls inside it. |
 | **Telemetry bar** | Live crypto ticks, the market regime, USD/SGD, the US and Singapore 10-year yields and the age of the daily data, each labelled with its source and fallback state. |
-| **Daily briefing** | Optional. After each scheduled refresh, a short Telegram message to one chat or several: the market regime, the top BUY and SELL signals, earnings in the next 30 days, notable shifts in headline tone, and whether the run passed its checks. |
+| **Daily briefing** | Optional. After each scheduled refresh, a short Telegram message to one chat or several: the market regime, a ⚡ block only when something happened, each bucket's trend-regime tally with its Uptrend and Downtrend names by 3-month relative strength, the next 30 days, and whether the run passed its checks. |
 
 The watchlist (30 assets):
 
@@ -152,12 +157,12 @@ flowchart LR
   subgraph WEB["Browser: static site on GitHub Pages"]
     direction TB
     SS["services/snapshotService"] --> MAIN["main.js"]
-    MAIN --> ENG["engines on the main thread: technical, fundamental, risk, event, regime, factor, liquidity, correlation, advisor, positionSizer, sentiment, forecast"]
+    MAIN --> ENG["engines on the main thread: technical, trendRegime, fundamental, risk, event, regime, factor, liquidity, correlation, positionSizer, crashReplay, rotation, sentiment, forecast"]
     MAIN -->|"postMessage"| WK["workers/mathWorker: monteCarlo, portfolio, backtest"]
     WK -->|"result, latest wins"| STORE["core/store"]
     ENG --> TM["TracedMetric objects"]
     LIVE["services/liveFeedService"] --> STORE
-    STORE --> UI["ui: tabs, palette, matrix, leaderboard, portfolio, drawer, sandbox"]
+    STORE --> UI["ui: tabs, palette, matrix, leaderboard, portfolio, rotation, drawer, sandbox"]
     TM --> UI
     UI -->|"dispatch(action)"| STORE
     STORE -->|"history.replaceState"| URL["URL query string"]
@@ -179,7 +184,7 @@ flowchart LR
 | **Heavy maths stays off the main thread** | Monte Carlo, the portfolio calculations and the five-year backtest run in a Web Worker. A slider drag never blocks a frame. |
 | **Every number is traceable** | Engines cannot return a bare number: every output is a `TracedMetric` with its derivation attached. |
 | **No silent failure** | Missing data becomes an `N/A` badge with a reason. A failed feed degrades to the next source and says so in the telemetry bar. |
-| **Models state their own record** | The projection is never shown without how far it missed in its last test, and the verdict is never shown without how it would have done over the last five years. Neither is coloured as good or bad. |
+| **Models state their own record** | The projection is never shown without how far it missed in its last test, and the trend regime is never shown without what followed it over the last four years. Neither is coloured as good or bad. |
 
 ### Folder structure
 
@@ -190,7 +195,7 @@ scripts/macro_calendar.json                FOMC decisions and minutes, US CPI re
 scripts/fetch_fundamentals.py              prices, history, dividends, events, statements, news, yields,
                                            forecasts -> validated JSON; --notify sends the Telegram briefing
 scripts/signals.mjs                        runs the site's engines in Node.js for the briefing's signals
-scripts/test_fetch_fundamentals.py         151 unit tests for the pipeline (Gate 1)
+scripts/test_fetch_fundamentals.py         158 unit tests for the pipeline (Gate 1)
 scripts/run_browser_tests.py               headless Chrome/Edge runner for the test page (Gate 2)
 scripts/requirements.txt                   yfinance, vaderSentiment, prophet (pipeline only)
 data/market_snapshot.json                  schema v3 snapshot (committed)
@@ -200,15 +205,15 @@ src/main.js                                composition root: URL sync, caches, w
 src/core/      store.js  precisionMath.js  derivationTracer.js
 src/services/  snapshotService.js  liveFeedService.js  glossaryService.js  workerService.js
 src/workers/   mathWorker.js
-src/engines/   technicalEngine.js  fundamentalEngine.js  correlationEngine.js  advisorEngine.js
-               positionSizerEngine.js  monteCarloEngine.js  portfolioEngine.js
-               riskEngine.js  eventEngine.js  backtestEngine.js
-               regimeEngine.js  factorEngine.js  liquidityEngine.js
+src/engines/   technicalEngine.js  trendRegimeEngine.js  fundamentalEngine.js  correlationEngine.js
+               positionSizerEngine.js  monteCarloEngine.js  portfolioEngine.js  crashReplayEngine.js
+               riskEngine.js  eventEngine.js  backtestEngine.js  macroCalendarEngine.js
+               regimeEngine.js  factorEngine.js  liquidityEngine.js  rotationEngine.js
                sentimentEngine.js  forecastEngine.js
 src/ui/        telemetryBar.js  appTabs.js  commandPalette.js  screenerPanel.js
-               comparisonMatrix.js  leaderboardView.js  portfolioSandbox.js
+               comparisonMatrix.js  leaderboardView.js  portfolioSandbox.js  rotationView.js
                derivationDrawer.js  riskSandboxModal.js  regimeBanner.js
-tests/engines.test.html                    358 browser-run tests in 48 suites, zero dependencies
+tests/engines.test.html                    369 browser-run tests in 52 suites, zero dependencies
 ```
 
 ---
@@ -221,14 +226,14 @@ The page keeps **no state between visits**. There is no account, no cookie, no b
 view = f(URL query string, data/market_snapshot.json)
 ```
 
-That one decision buys clean first loads, links that reproduce a view exactly, correct back/forward behaviour, nothing to migrate when the schema changes, and no privacy surface. It also shaped V3: the verdict's backtest is not stored in the snapshot or anywhere else. It is a deterministic function of the snapshot, so the worker recomputes it in about two seconds after each load.
+That one decision buys clean first loads, links that reproduce a view exactly, correct back/forward behaviour, nothing to migrate when the schema changes, and no privacy surface. It also shaped V3: the backtest is not stored in the snapshot or anywhere else. It is a deterministic function of the snapshot, so the worker recomputes it in about two seconds after each load.
 
 ### What lives where
 
 | State | Where it lives | Survives a reload? | In a shared link? |
 |---|---|---|---|
 | Compared tickers, filters, currency, mode | URL | yes | yes |
-| Active view and time range | URL | yes | yes |
+| Active view, time range and rotation benchmark | URL | yes | yes |
 | Portfolio weights (percentages) | URL | yes | yes |
 | Account size, risk per trade, stop distance, position cap | memory only | no | **never** |
 | Live prices, worker results (including the backtest), open drawer | memory only | no | no |
@@ -240,13 +245,16 @@ That one decision buys clean first loads, links that reproduce a view exactly, c
 | `t` | Compared tickers, comma-separated, at most 3 | any watchlist ticker (`^GSPC` may be written `%5EGSPC`) | `AMD,D05.SI,BTC-USD` |
 | `ccy` | Display, account and portfolio base currency | `USD` `SGD` | `USD` |
 | `mode` | Explanation level | `guided` `pro` | `guided` |
-| `view` | Active tab | `compare` `leaderboard` `portfolio` | `compare` |
+| `view` | Active tab | `compare` `leaderboard` `portfolio` `rotation` | `compare` |
 | `range` | Time range | `1m` `3m` `6m` `1y` `5y` | `1y` |
 | `p` | Portfolio allocation as `TICKER:percent` pairs, at most 8 | `AMD:40,D05.SI:35,BTC-USD:25` | the compared assets at equal weights |
 | `class` | Asset-class filter | `equity` `etf` `index` `crypto` | all |
 | `mkt` | Market filter | `US` `SG` `UK` `CRYPTO` | all |
 | `sector` | Sector filter | any sector in the snapshot | all |
-| `verdict` | Verdict filter | `buy` `hold` `sell` | all |
+| `trend` | Trend-regime filter | `uptrend` `extended` `pullback` `recovering` `downtrend` | all |
+| `rs` | Rotation benchmark | `spx` (the S&P 500 in USD) `own` (each asset's own market) | `spx` |
+
+A link from before V3.3 may carry `verdict=buy`: it is ignored, and the rest of the view loads as it was.
 
 Example: `?t=MU,AMD&ccy=SGD&mode=pro&view=portfolio&range=5y&p=MU:25,AMD:25,D05.SI:50`
 
@@ -270,7 +278,7 @@ Details worth noticing:
 
 ### Why a worker
 
-A 1,000-path Monte Carlo run and a covariance matrix plus 2,000 sampled portfolios are tens of milliseconds each: fast, but not free when a slider fires them many times a second. Replaying the verdict over five years for 30 assets is about two seconds of work. All three run in `src/workers/mathWorker.js`, a module worker that imports the very same engine files the tests import.
+A 1,000-path Monte Carlo run and a covariance matrix plus 2,000 sampled portfolios are tens of milliseconds each: fast, but not free when a slider fires them many times a second. Replaying the Technical score and the trend regime over five years for 30 assets is about two seconds of work. All three run in `src/workers/mathWorker.js`, a module worker that imports the very same engine files the tests import.
 
 ```mermaid
 sequenceDiagram
@@ -335,12 +343,12 @@ At least 15 overlapping returns are required; below that every statistic is `N/A
 |---|---|
 | Price chart and its projection overlay | RSI, MACD, SMA, EMA, ATR |
 | Period return, period volatility, maximum drawdown, position in the period range | 52-week range position |
-| EWMA volatility, VaR and CVaR, and the position's VaR | Technical, Fundamental and Composite scores |
-| Correlation between the compared assets, and the correlation haircut in position sizing | **The verdict** |
+| EWMA volatility, VaR and CVaR, and the position's VaR | Technical and Fundamental scores |
+| Correlation between the compared assets, and the correlation haircut in position sizing | **The trend regime** |
 | The volatility and the resampled days behind the Monte Carlo fan | Fundamentals |
-| Every portfolio statistic | Events (they are dated, not windowed) |
+| Every portfolio statistic | Events (they are dated, not windowed); crash replays and rotation (fixed windows) |
 
-The split is deliberate. A 200-day moving average cannot be computed from 30 days, and an RSI seeded on a short window is a different number from the one everybody else quotes. So indicators keep their full warm-up and the verdict is stable, while the things that are genuinely *about a period* move with it. And there is no OHLC data before the last year, so nothing that needs a high and a low (ATR, the stop) can use `5Y`.
+The split is deliberate. A 200-day moving average cannot be computed from 30 days, and an RSI seeded on a short window is a different number from the one everybody else quotes. So indicators keep their full warm-up and the trend regime is stable, while the things that are genuinely *about a period* move with it. And there is no OHLC data before the last year, so nothing that needs a high and a low (ATR, the stop) can use `5Y`.
 
 One consequence worth knowing: because correlation follows the range, so does the correlation haircut, and therefore the suggested position sizes. A recent-window correlation is a legitimately different view of overlap, in the same way a risk model's answer depends on its look-back.
 
@@ -391,7 +399,7 @@ A full run for the 30-asset watchlist takes about two minutes, most of it networ
 | Concern | Handling |
 |---|---|
 | **`NaN` and `Infinity`** | `clean_number` converts anything that is not a finite number to `null`. The JSON encoder runs with `allow_nan=False` as a backstop. |
-| **In-progress sessions** | A candle dated today is kept only after that market's close, in the exchange's own time zone (New York 16:00, Singapore 17:00, London 16:30, plus 20 minutes); the current UTC day is always dropped for crypto. |
+| **In-progress sessions** | A candle dated today is kept only after that market's close, in the exchange's own time zone (New York 16:00, or 13:00 on the US half days in the macro calendar; Singapore 17:00; London 16:30; plus 20 minutes). The VIX closes follow the same rule; the current UTC day is always dropped for crypto. |
 | **Assets without accounts** | ETFs, indices and crypto get no statements request at all (fewer calls, nothing to misread). Their fundamentals are `null`, except crypto's market cap and an ETF's trailing distribution yield, kept for context. |
 | **Implausible Price-to-Book** | If Yahoo's P/B differs from market cap ÷ book equity by more than a factor of two (same currency only), the computed value is used and logged. Yahoo has reported Berkshire Hathaway B at 0.001; the check corrects it to about 1.6. |
 | **Bad ticks** | High and low are repaired so that `high ≥ max(open, close)` and `low ≤ min(open, close)`; rows with missing prices are dropped. |
@@ -633,7 +641,8 @@ Company events are not the only scheduled gaps. `scripts/macro_calendar.json` ho
 - **It never fails a run.** An unreadable or invalid file gives an unavailable block and a warning. Coverage is checked against the file's own `updated` date, not today's, so the tests do not start failing as time passes; when the calendar is within 60 days of running out, the step summary and the explanation view say so.
 - **On the site:** a **Next macro** pill in the top bar (amber within 48 hours) opens the next FOMC decision or CPI release with its time in New York and Singapore, the US trading days until then and what else is due in the next 7 days. The Events section repeats it for each compared asset and says when it falls inside the 21-day sizing horizon, and the risk sandbox notes when the first simulated horizon contains it.
 - **Holidays make trading-day counts exact.** Thanksgiving week has four US sessions, not five, which matters for "earnings within 5 trading days".
-- Context only, like the regime: it changes no score, verdict or position size.
+- **Half days end the US session early.** The `market-early-close` entries (the day after Thanksgiving, Christmas Eve) move the US close to 13:00 New York, so a half-day candle is kept from 13:20 rather than thrown away until the next run.
+- Context only, like the regime: it changes no score, trend regime or position size.
 
 Where it appears: an **Events** section in the comparison, a **gap-risk** row in sizing, a warning on the projection when earnings fall inside its 30 days, a banner above the Monte Carlo fan when a release falls inside the simulated horizon, an `Earnings 23d` chip on the leaderboard, and an earnings section in the Telegram briefing.
 
@@ -659,7 +668,7 @@ Normally the curve slopes up (contango): more time, more uncertainty. When the 3
 
 - **One rule, two readers.** The pipeline classifies the regime for the Telegram briefing and stores the thresholds in the block. The browser applies the same rules to the same stored levels for its explanation views, and a test checks that the two agree on the committed snapshot.
 - **What it shows.** A pill in the top bar opens the derivation: the state, VIX with the daily move it implies (`VIX ÷ √252`) and where it ranks in the last year and in five years, `VIX ÷ VIX3M` with the run of inverted sessions, and `VIX9D ÷ VIX` for the front of the curve. While the curve is inverted a banner over every view says what that means, and can be hidden until the next visit.
-- **Context only.** The regime is not an input to any score, verdict or position size. The verdict's backtest already shows the score does not predict; gating it on a regime without testing that would be curve-fitting. The five years of history are stored so that the backtest can be split by regime in a later version, with no schema change.
+- **Context only.** The regime is not an input to any score, trend regime or position size. V3.3 uses the five years of stored history to split the backtest by regime (see [Trend regimes and their track record](#trend-regimes-and-their-track-record)): no regime turned the score into a forecast, so gating anything on it would be curve-fitting.
 - **On 21 November 2026** the regime was stressed: VIX 35.89 above VIX3M 30.94 (a ratio of 1.16), the 4th inverted session in a row, with VIX at its highest close of the year and VIX9D at 40.72.
 
 ## Market sensitivity and crowding
@@ -733,49 +742,123 @@ What it shows on 21 November 2026:
 - **At retail size, volume is not the constraint.** Even the least traded asset on the watchlist, `J69U.SI`, trades about US$14.5 million a day. 1% of its average volume is about 88,000 units, roughly S$186,000.
 - **Price impact differs a thousandfold.** Amihud illiquidity was 7.0 bp per US$1 million traded for `J69U.SI` against 0.02 bp for `MU`.
 
-**In position sizing**, a ninth step caps the position at 5% of the 20-day average volume, rounded down to a whole lot. A position above 1% is flagged as large enough to move the price, and the explanation gives the days needed to exit at a fifth of each day's volume. The sizing table also gets a **spread cost** row: position value × minimum spread, set against the amount at risk.
+**In position sizing**, an eighth step caps the position at 5% of the 20-day average volume, rounded down to a whole lot. A position above 1% is flagged as large enough to move the price, and the explanation gives the days needed to exit at a fifth of each day's volume. The sizing table also gets a **spread cost** row: position value × minimum spread, set against the amount at risk.
 
 ---
 
-## The verdict's own track record
+## Trend regimes and their track record
 
-The projection has always carried its backtest. V3 does the same for the verdict.
+V3 backtested the BUY / HOLD / SELL verdict and found it did not predict. V3.3 asked the follow-up question properly, with a rule agreed before looking: **if the Technical score, or any simple price-only alternative, had a real edge in some market regime, upgrade the score to it; if not, stop calling a description a recommendation.**
 
-### What is tested
+### The research (21 November 2026 snapshot)
 
-`src/engines/backtestEngine.js` replays the **Technical score** over every past day that has a full window of history behind it, exactly as the live engine would have computed it on that day, and compares it with what the price did over the next **21 trading sessions**.
+The 26 tradable assets, every day from November 2022 to October 2026 with a full year of history behind it (26,656 asset-days), against the return over the next 21 and 63 sessions. Four candidate signals:
 
-- **Window.** The same length as the live window (the asset's year of candles), so the last replayed day reproduces today's live score exactly. A test checks that for every asset in the snapshot.
-- **Verdict.** The score's band (BUY 65 and above, HOLD 45 to 65, SELL below 45) with the two price-based safety rules applied (the downtrend rule and the overheated-RSI rule).
-- **Outcome.** The simple return from that day's close to the close 21 sessions later.
-- **Measures, per asset:** the average forward return and hit rate of each band against the asset's average day; the **rank IC** (Spearman correlation between the score and the forward return); and a rough t-statistic that counts overlapping 21-day windows as one independent observation each, `t ≈ IC × √((n ÷ 21 − 2) ÷ (1 − IC²))`.
-- **Minimum:** 120 scored days. `SNDK`, listed in February 2025, has 175; a stock with five years has about 980 and a coin about 1,440.
+| Signal | Time-series rank IC, 21 sessions | First half · second half | 63 sessions | Cross-sectional IC, 63 sessions (t) |
+|---|---|---|---|---|
+| Technical score | −0.068 (positive for 7 of 26) | −0.158 · −0.045 | −0.141 | −0.105 (−1.36) |
+| Distance from the 200-day average | −0.128 (3 of 26) | −0.257 · −0.140 | −0.218 | −0.113 (−1.29) |
+| 12-1 momentum (12 months, skipping the last) | −0.080 (5 of 26) | −0.094 · −0.112 | −0.158 | +0.005 (0.05) |
+| Volatility-adjusted 6-month momentum | −0.134 (3 of 26) | −0.225 · −0.155 | −0.172 | −0.074 (−0.96) |
 
-### What is deliberately not tested: the Fundamental half
+- **Every signal pointed the wrong way, in both halves, at both horizons.** The only individually significant assets (|t| ≥ 2, counting overlapping windows once) were negative. Across assets, no signal reached |t| of 1.4.
+- **The trend filter as a rule:** days above the 200-day average were followed by +1.99% over 21 sessions (56% up); days below it by **+3.31%** (61% up). A period that rewarded buying dips punished trend following.
+- **Split by VIX regime,** the score's mean IC was −0.03 in normal markets, −0.16 in elevated ones and −0.005 in stressed ones (where only 3 assets had the 60 days needed). Stressed markets were 49 sessions in 18 short episodes: far too few to build a rule on.
 
-Free data has only *today's* fundamentals. Scoring 2022 with 2026 accounts would leak the future into the test (look-ahead bias) and make the result look better than anything a real investor could have achieved. So the backtest covers the half of the verdict that can be tested honestly. For ETFs, indices and crypto the Technical score is the whole verdict; for stocks it is the half that moves day to day. The trace says this in its caveat.
+**The decision:** no price-only edge, so no upgrade. The verdict, the Composite score and Confidence were retired, and the platform now says what the trend *is* rather than what to do about it.
 
-### What it says
+### The five regimes
 
-Across the 30 assets in the 21 November 2026 snapshot (30,093 scored asset-days, 2021 to 2026):
+`src/engines/trendRegimeEngine.js` labels every asset, and every replayed day, from the indicators the site already computes:
 
-| Days the Technical verdict said | Days | Average return over the next 21 sessions | Price higher 21 sessions later |
+| Regime | Rule |
+|---|---|
+| **Uptrend** | close ≥ SMA200 and EMA20 ≥ EMA50 |
+| **Extended** | close ≥ SMA200 and RSI(14) > 70 (checked before the EMAs) |
+| **Pullback** | close ≥ SMA200 but EMA20 < EMA50 |
+| **Recovering** | close < SMA200 but EMA20 ≥ EMA50 |
+| **Downtrend** | close < SMA200 and EMA20 < EMA50 |
+
+The same function labels the live asset and every day of the replay, so the replay's last day reproduces today's label; a test checks that for all 30 assets. The **Technical** and **Fundamental** scores stay, as separate readouts: they describe the chart and the business, and they are never blended into a single rating.
+
+### What followed each regime
+
+The backtest replays each label over every past day and reports the average return over the next 21 sessions, overall and within each VIX regime (pooled over the 30 assets, November 2022 to October 2026):
+
+| Regime | Days | All markets | Price higher | Normal VIX | Elevated | Stressed |
+|---|---|---|---|---|---|---|
+| Uptrend | 16,105 | +1.86% | 57.7% | +1.61% | +2.54% | +4.39% |
+| Extended | 2,927 | +2.83% | 60.2% | +3.03% | +1.63% | −3.01% (44 days) |
+| Pullback | 3,297 | +0.89% | 56.1% | +0.47% | +1.90% | +3.18% |
+| Recovering | 1,329 | +3.02% | 58.5% | +2.45% | +3.71% | +5.84% |
+| Downtrend | 6,435 | **+3.34%** | 61.7% | +1.33% | +6.73% | +8.05% |
+| All days | 30,093 | +2.21% | | +1.63% | +3.64% | +5.81% |
+
+Downtrend days were followed by the best returns, and stressed markets by the best of all: the opposite of what a trend label would suggest, and the reason no label is presented as advice.
+
+Where it is shown:
+
+- A **Trend** section heads every column of the comparison: the regime, how far the price is from its 200-day average with its RSI, and **What followed (backtest)** for that asset's current regime against all its days. Pro mode adds the **Technical score track record**: its rank IC, and the highest and lowest third of days by score against the average day.
+- The leaderboard ranks by regime and then by 3-month relative strength, and its header carries the pooled table above in one line.
+- The screener, the command palette and the URL filter by regime (`?trend=uptrend`).
+- Nothing about it is coloured as good or bad in the record, and nothing was tuned to it.
+
+### What is deliberately not tested: the Fundamental score
+
+Free data has only *today's* fundamentals. Scoring 2022 with 2026 accounts would leak the future into the test (look-ahead bias), so the backtest covers the price-based readouts only, and the trace says so.
+
+## Crash replays
+
+Volatility and VaR summarise ordinary days. The Portfolio sandbox also replays the current allocation through four real sell-offs, each from an S&P 500 closing high to its closing low, taken from the index's own history (a test checks that each window starts at the highest close and ends at the lowest close inside it):
+
+| Window | Dates | S&P 500 (USD) |
+|---|---|---|
+| 2022 rate-hike bear market | 3 Jan 2022 → 12 Oct 2022 | −25.4% |
+| Aug 2024 yen carry unwind | 16 Jul 2024 → 5 Aug 2024 | −8.5% |
+| 2025 tariff shock | 19 Feb 2025 → 8 Apr 2025 | −18.9% |
+| Autumn 2026 sell-off | 6 Oct 2026 → latest close | ongoing (−11.6% on 20 Nov 2026) |
+
+`src/engines/crashReplayEngine.js`, for each window:
+
+1. **Buy and hold** at the exact weights at the first day's close: no rebalancing, no fees; closes are dividend-adjusted.
+2. **Base currency.** Every price is converted at that day's USD/SGD rate, so the currency move is part of the result. Without a stored FX history, today's rate is used and the trace says the currency move is left out.
+3. **Different calendars.** The replay steps through every date on which a holding or the S&P 500 traded; a holding that did not trade that day keeps its last close.
+4. `Valueₜ = Σ wᵢ × Pᵢ,ₜ ÷ Pᵢ,start`; the return is `Value_end − 1`, and each holding's contribution `wᵢ × (Pᵢ,end ÷ Pᵢ,start − 1)` adds up to it exactly.
+5. **Maximum drawdown** (with the dates of the high and the low), the **worst single date**, and the **S&P 500** replayed the same way in the same currency, with the difference in points.
+
+**Missing history is handled out loud.** `SNDK` only trades from 13 February 2025. In the two earlier windows it is left out and the other weights are scaled up to 100%, and the card, the summary, the steps and the raw inputs all say so: "SNDK (20%) has no prices before 13 Feb 2025, so it is left out of this window and the other weights are scaled up ×1.25 to add to 100%."
+
+An example in SGD, `SNDK` 20% · `MU` 20% · `D05.SI` 30% · `BTC-USD` 10% · `VOO` 20%:
+
+| Window | This mix | S&P 500 (SGD) | Max drawdown | Worst day |
+|---|---|---|---|---|
+| 2022 bear market (SNDK left out) | −20.1% | −20.4% | −26.8% | −3.8% (4 Mar 2022) |
+| Aug 2024 yen unwind (SNDK left out) | −16.3% | −9.7% | −16.3% | −5.0% (5 Aug 2024) |
+| 2025 tariff shock | −23.7% | −18.3% | −24.4% | −9.4% (4 Apr 2025) |
+| Autumn 2026 (ongoing) | −30.4% | −10.8% | −30.7% | −8.0% (5 Nov 2026) |
+
+In SGD the S&P 500 lost 20.4% in 2022 rather than 25.4%: the US dollar rose from S$1.348 to S$1.439 over the window. The replays are small (eight holdings, four windows, a few hundred dates), so they run on the main thread, cached on the weights and the currency; they ignore the time range. Pro mode adds a table of each holding's contribution in each window.
+
+The windows were picked after the fact from the S&P 500's own highs and lows. The replay shows how this mix behaved in those falls, not how it will behave in the next one, and every trace says so.
+
+## Sector rotation
+
+The **Rotation** tab (`?view=rotation`) asks which parts of the watchlist the market has been favouring. `src/engines/rotationEngine.js` gives each of the 26 tradable assets (indices are left out) two relative strengths, `(1 + asset return) ÷ (1 + benchmark return) − 1`, over 91 days (across) and 30 days (up):
+
+| Quadrant | RS 3M | RS 1M | Reading |
 |---|---|---|---|
-| BUY | 17,309 | +2.04% | 58.7% |
-| HOLD | 5,161 | +2.16% | 56.2% |
-| SELL | 7,623 | **+2.64%** | **60.1%** |
-| All days | 30,093 | +2.21% | 58.6% |
+| **Leading** | ≥ 0 | ≥ 0 | ahead over both spans |
+| **Weakening** | ≥ 0 | < 0 | ahead over three months, behind over the last one |
+| **Lagging** | < 0 | < 0 | behind over both |
+| **Improving** | < 0 | ≥ 0 | behind over three months, ahead over the last one |
 
-- **Mean rank IC −0.08.** Positive for only 7 of 30 assets; best `SNDK` (+0.20), worst `^DJI` (−0.25).
-- **No asset's IC is statistically distinguishable from zero** (|t| < 2 for all 30) once the overlap between 21-day windows is accounted for.
+- **Benchmark.** By default, the **S&P 500 in USD** for everything, so the whole watchlist sits on one scale; SGD prices are converted at each day's USD/SGD rate, so a stronger or weaker Singapore dollar is part of an SGX asset's result, as it is for a US-dollar investor. `?rs=own` measures each asset against **its own market** (S&P 500, STI or Bitcoin), exactly as the factor engine does; a test checks the two agree to the last digit, and Bitcoin, its own benchmark, shows `N/A`.
+- **Groups.** A fixed map puts the watchlist into 11 themes (Tech & semis, Broad US, Financials, Energy & uranium, Gold & metals, Defensives, Industrials, SG banks, SG REITs, SG other, Crypto); a ticker added later falls back to its Yahoo sector. A group sits at the **median** of its members, so one outlier cannot drag it.
+- **On screen.** One quadrant chart, of the groups or of the assets (crowded labels are left off and listed, and every dot has a tooltip), and two tables that say the same in words: the groups with their medians and members, and every asset with its quadrant and trend regime. Every value opens its working. The screener filters apply to the assets shown; a group's position always uses all its members.
 
-**The honest summary: over 2021 to 2026, the Technical score did not predict 21-day returns on this watchlist.** If anything it was mildly contrarian: SELL days, which follow falls, were followed by slightly larger gains than BUY days, which follow rises, in a period that rewarded buying dips. The score is a trend-following description of the chart, and over a one-month horizon that description has not carried information.
+On 20 November 2026, against the S&P 500 in USD: **Leading**: Defensives (3M +28.2%), Financials (+17.0%), SG other (+10.1%), SG REITs (+3.6%) and Broad US (+1.4%). **Lagging**: Industrials (−31.4%), Tech & semis (−23.0%, with `TSLA` the one member Leading), Gold & metals (−21.4%), Crypto (−16.6%), Energy & uranium (−14.4%) and SG banks (−4.1%). Against their own markets the SG banks become Weakening, ahead of the STI over three months but behind it over the last one.
 
-That result is shown, not hidden:
-
-- A **Track record (backtest)** row under every verdict in the comparison, with the asset's rank IC and band returns, and the full arithmetic in the drawer.
-- The watchlist-wide line in the leaderboard header.
-- Nothing about it is coloured as good or bad, and it does not feed back into the score. Tuning the weights until the backtest looked better would be fitting noise in a sample of five years; the point of the row is to show what the rules are worth as they stand.
+A description of the past one and three months, not a signal: the research above found that momentum did not predict the next month on this watchlist. The one-month span sits inside the three-month one, so the two are not independent.
 
 ---
 
@@ -816,7 +899,7 @@ Each stored story's headline is scored with **VADER** (`vaderSentiment` 3.3.2, p
 - Coverage is uneven: US large caps have fresh news daily, some Singapore names have headlines that are weeks old. Those are marked `stale` (newest older than 7 days) and shown in neutral tone with "old headlines".
 - Live feeds are mostly unique already. In the 21 November 2026 snapshot, 384 headlines formed 382 stories. The boundaries themselves are established by tests rather than by the day's data.
 - Two feeds are empty: Yahoo publishes no headlines for `^STI` or `CSPX.L`, so those assets show "no recent headlines" rather than borrowing another symbol's news.
-- **Tone is context only. It is not an input to any score or to the verdict.**
+- **Tone is context only. It is not an input to any score or to the trend regime.**
 
 Headlines are rendered as links only when they are `http(s)` URLs, open in a new tab with `rel="noopener noreferrer"`, and pass through the same HTML escaping as every other dynamic string.
 
@@ -865,7 +948,7 @@ In the 30-asset snapshot of 21 November 2026, a month that ended in a sharp sell
 - The projection is drawn as a **dotted** line inside a shaded band, visibly different from the solid price line, with a legend.
 - The row beneath it is the **forecast miss rate**, with the "no change" error next to it and, when the model was worse, the words "the model added nothing".
 - When an earnings release falls inside the 30 days, the row says the projection knows nothing about it.
-- The projection is **never coloured** as good or bad and **never enters a score or the verdict**.
+- The projection is **never coloured** as good or bad and **never enters a score or the trend regime**.
 - The trace states that the model sees only past prices: no earnings, no news, no rates.
 
 It earns its place as a teaching device: a visible, quantified example of why a confident-looking line on a chart deserves suspicion.
@@ -895,7 +978,7 @@ flowchart LR
   D --> REF
   P --> TEST["test"]
   PR --> TEST
-  REF --> V["validate snapshot"] --> G1["Gate 1: 151 pipeline unit tests"] --> G2["Gate 2: 358 browser tests in headless Chrome"] --> C["commit snapshot"]
+  REF --> V["validate snapshot"] --> G1["Gate 1: 158 pipeline unit tests"] --> G2["Gate 2: 369 browser tests in headless Chrome"] --> C["commit snapshot"]
   C --> TG["Telegram briefing, always runs, never fails the job"]
   V -.->|"any failure"| TG
   TEST --> V2["validate, Gate 1, Gate 2"]
@@ -909,7 +992,7 @@ flowchart LR
 | `test` | every push and pull request | Validate the committed snapshot → Gate 1 → Gate 2. |
 | `deploy` | after a successful `refresh` or `test`, never on a pull request | Publish the static site to GitHub Pages. |
 
-**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 151 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, 5 trading days against 6, exactly 48 hours), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, and a failed step moved to the top.
+**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 158 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), US half-day cutoffs (a 1:15 p.m. candle dropped, a 1:25 p.m. one kept), snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, 5 trading days against 6, exactly 48 hours), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, the trend-regime tally and the Uptrend and Downtrend lines with no BUY, HOLD or SELL left in any edition, and a failed step moved to the top.
 
 **Gate 2: the browser suite, headless** (`python scripts/run_browser_tests.py --min-tests 100`). The runner starts a local web server, launches headless Chrome or Edge at `tests/engines.test.html`, and waits for the page to report its results to a one-time same-origin URL. It uses only the Python standard library.
 
@@ -921,7 +1004,7 @@ flowchart LR
 
 `--min-tests` guards against the quietest failure of all: a broken import that makes the page run *zero* tests and report zero failures.
 
-Why the gate matters here in particular: **the data changes every day and the code does not.** A daily refresh is a daily deployment of new inputs. Gate 2 runs the engines over the *new* snapshot before it is committed (including the five-year backtest of every asset), so a provider-side change that would produce a broken page is stopped at the gate and yesterday's site stays up.
+Why the gate matters here in particular: **the data changes every day and the code does not.** A daily refresh is a daily deployment of new inputs. Gate 2 runs the engines over the *new* snapshot before it is committed (including the five-year backtest of every asset, the crash replays and the rotation), so a provider-side change that would produce a broken page is stopped at the gate and yesterday's site stays up.
 
 Other properties:
 
@@ -965,25 +1048,22 @@ QuantLens daily briefing · Fri 20 Nov 2026
 
 ⚡ Triggers today
 • Moves beyond 2.5σ: CSPX.L −3.4% (−3.4σ) · VOO −3.4% (−2.6σ) · MU −13.9% (−2.6σ)
-• Tone: AMD positive → negative (+0.15 → −0.29)
+• Tone: AMD neutral → negative (+0.04 → −0.29)
    (its newest headline)
 
-US / Global · 1 BUY · 8 HOLD · 8 SELL
-BUY: XOM 66
-SELL: CSPX.L 13 · VOO 14 · TSLA 23
+US / Global · 5 Uptrend · 1 Recovering · 11 Downtrend
+Uptrend (3M vs S&P 500): WMT +37.0% · BRK-B +27.7% · LLY +19.3% · 2 more
+Downtrend (3M vs S&P 500): SNDK −55.9% · CCJ −37.2% · MU −31.7% · 8 more
 Movers: TSLA −7.6% (−2.5σ) · SNDK −16.1% (−2.4σ)
-3M RS leaders: WMT +37.0% · BRK-B +27.7% vs S&P 500
 
-SGX · 1 BUY · 3 HOLD · 2 SELL
-BUY: C6L.SI 70
-SELL: U11.SI 41 · A17U.SI 44
+SGX · 1 Uptrend · 1 Pullback · 2 Recovering · 2 Downtrend
+Uptrend (3M vs STI): C6L.SI +15.2%
+Downtrend (3M vs STI): A17U.SI −1.5% · U11.SI −0.1%
 Movers: A17U.SI −2.3% (−2.0σ) · D05.SI −1.8% (−1.7σ)
-3M RS leaders: C6L.SI +15.2% · J69U.SI +14.0% vs STI
 
-Crypto (24/7) · 0 BUY · 0 HOLD · 3 SELL
-SELL: BTC-USD 8 · AVAX-USD 9 · ETH-USD 13
+Crypto (24/7) · 3 Downtrend
+Downtrend (3M vs BTC): ETH-USD −14.2% · AVAX-USD +10.6% · BTC-USD
 Movers: ETH-USD −7.7% (−2.5σ) · BTC-USD −5.0% (−2.0σ)
-3M RS leaders: AVAX-USD +10.6% vs BTC
 
 Next 30 days
 Closures: US closed Thu 26 Nov (Thanksgiving Day) · US closes 1:00 PM ET Fri 27 Nov
@@ -991,9 +1071,9 @@ Macro: FOMC rate decision (+ projections) Wed 9 Dec · US CPI (November) Thu 10 
 Earnings: ORCL ~14 Dec ±9.8% (worst −13.5%) · MU ~17 Dec ±5.8% (worst −16.2%)
 Ex-dividend: C6L.SI 25 Nov · NEM 25 Nov · CCJ 30 Nov · BLK 8 Dec · WMT 11 Dec
 
-Tradable: 2 BUY · 11 HOLD · 13 SELL
+Tradable: 6 Uptrend · 1 Pullback · 3 Recovering · 16 Downtrend
 ✅ 30/30 fresh · Open QuantLens · Run log
-Rule-based signals for learning, not financial advice.
+Trend regimes describe the past; they do not predict returns. Not financial advice.
 ```
 
 Two days before the December meeting the ⚡ block leads with the macro calendar, in New York and Singapore time:
@@ -1022,13 +1102,13 @@ Earnings: ORCL ~14 Dec ±9.8% (worst −13.5%) · MU ~17 Dec ±5.8% (worst −16
 Ex-dividend: CCJ 30 Nov · BLK 8 Dec · WMT 11 Dec
 
 Weekend crypto check (UTC day to 20 Nov)
-BTC-USD −5.0% (−2.0σ) · SELL 8
-ETH-USD −7.7% (−2.5σ) · SELL 13 · 3M vs BTC −14.2%
-AVAX-USD −6.7% (−1.5σ) · SELL 9 · 3M vs BTC +10.6%
+BTC-USD −5.0% (−2.0σ) · Downtrend
+ETH-USD −7.7% (−2.5σ) · Downtrend · 3M vs BTC −14.2%
+AVAX-USD −6.7% (−1.5σ) · Downtrend · 3M vs BTC +10.6%
 
-Crypto: 0 BUY · 0 HOLD · 3 SELL
+Crypto: 3 Downtrend
 ✅ 30/30 fresh · Open QuantLens · Run log
-Rule-based signals for learning, not financial advice.
+Trend regimes describe the past; they do not predict returns. Not financial advice.
 ```
 
 (Built from the 21 November 2026 snapshot; headlines omitted here.)
@@ -1050,17 +1130,17 @@ Measured over 2023 to 2026, a move beyond 2.5σ happened on about 42% of weekday
 | Part | Rule |
 |---|---|
 | **Regime** | One line under the title: 🟢 normal, 🟡 elevated (curve flat or in contango) or 🔴 stressed (inverted, with the run length). At weekends it names the session it describes ("Friday close"). |
-| **Buckets** | US / Global (US and London listings), SGX, Crypto (24/7). Indices are not tradable and appear nowhere. Each bucket: its verdict tally, then at most three BUYs (best first), three SELLs (worst first), two movers at 1.5σ or more that are not already triggers and had a new session, and the two strongest positive 3-month relative-strength readings. A line with nothing to show is left out. |
+| **Buckets** | US / Global (US and London listings), SGX, Crypto (24/7). Indices are not tradable and appear nowhere. Each bucket: its trend-regime tally (regimes with no asset are left out), then the **Uptrend** names by 3-month relative strength against the bucket's benchmark, strongest first, and the **Downtrend** names, weakest first (three each, with a count of the rest), and two movers at 1.5σ or more that are not already triggers and had a new session. A line with nothing to show is left out. |
 | **Next 30 days** | Closures within 7 days; FOMC decisions and minutes and CPI releases not already triggered; earnings not already triggered, with the typical and worst move; ex-dividend dates (`~` marks an estimate). |
-| **Week ahead** | Saturday and Sunday: no equity verdicts or movers. The next 7 days in date order (closures, macro events with their New York and Singapore times, earnings, ex-dividends), or one line naming the next FOMC or CPI when the week is quiet; the next 30 days; and the crypto market, whose latest completed UTC day is Friday's on the Saturday run and Saturday's on the Sunday run. |
-| **Footer** | The verdict tally of tradable assets (crypto only at weekends), one status line with the links, a warning if the macro calendar is running out, and the disclaimer. |
+| **Week ahead** | Saturday and Sunday: no equity regimes or movers. The next 7 days in date order (closures, macro events with their New York and Singapore times, earnings, ex-dividends), or one line naming the next FOMC or CPI when the week is quiet; the next 30 days; and the crypto market with each coin's trend regime, whose latest completed UTC day is Friday's on the Saturday run and Saturday's on the Sunday run. |
+| **Footer** | The trend-regime tally of tradable assets (crypto only at weekends), one status line with the links, a warning if the macro calendar is running out, and the disclaimer. |
 | **Failures** | A failed step moves to the top, where it cannot be missed. A failed check withholds the regime and the signals, because that data was not published; a failed refresh reports the last good snapshot and says so. |
 
 The message is shortened from the bottom of the body if it ever approached Telegram's limit, never from the footer.
 
 ### How it is built
 
-- **One source of truth for the signals.** The verdicts, the moves in σ, 3-month relative strength and the earnings and ex-dividend dates come from the site's own JavaScript engines, run in Node.js by `scripts/signals.mjs` over the same snapshot. Re-implementing them in Python would create a second copy that could quietly disagree with the site. The regime and the macro calendar are read straight from the snapshot, so they reach the message even if Node.js is missing.
+- **One source of truth for the signals.** The trend regimes, the Technical and Fundamental scores, the moves in σ, 3-month relative strength and the earnings and ex-dividend dates come from the site's own JavaScript engines, run in Node.js by `scripts/signals.mjs` over the same snapshot. Re-implementing them in Python would create a second copy that could quietly disagree with the site. The regime and the macro calendar are read straight from the snapshot, so they reach the message even if Node.js is missing.
 - **No new dependencies.** The message is sent with Python's `urllib.request` to the Bot API's `sendMessage`, formatted as MarkdownV2 with every special character escaped. If Telegram rejects the formatting for a chat, the same content is resent to that chat as plain text.
 - **The status is real.** The briefing is the last step of the refresh job and runs whatever happened before it (`if: always()`). Each earlier step's outcome is passed in as an environment variable, so the message reports the gates and the commit, not just the fetch.
 - **Least exposure.** The two secrets are given to the briefing step only, not to the steps that run third-party data code.
@@ -1095,7 +1175,7 @@ Most dashboards output a number and ask for trust. QuantLens makes the derivatio
 {
   "id": "rsi14",
   "label": "RSI (14)",
-  "value": 60.9028,              // finite number, or a label such as "BUY", or null
+  "value": 60.9028,              // finite number, or a label such as "Uptrend", or null
   "unit": "index",               // index | ratio | pct | currency | score | shares | label | days
   "status": "ok",                // ok | na
   "naReason": null,              // plain-English reason when status is "na"
@@ -1132,22 +1212,19 @@ Most dashboards output a number and ask for trust. QuantLens makes the derivatio
 
 ### Drill-down through `dependsOn`
 
-`dependsOn` turns isolated explanations into a graph. The drawer renders each child as a link and keeps a breadcrumb, so a verdict can be followed down to raw closing prices:
+`dependsOn` turns isolated explanations into a graph. The drawer renders each child as a link and keeps a breadcrumb, so a trend regime or a score can be followed down to raw closing prices:
 
 ```mermaid
 flowchart TD
-  V["Verdict: BUY"] --> C["Composite score"]
-  V --> G1["guardrail inputs: SMA 200, MACD, RSI"]
-  V -.-> BT["Track record: five-year backtest of the Technical score"]
-  C --> T["Technical score"]
-  C --> F["Fundamental score"]
-  T --> TR["Trend score"]
+  V["Trend regime: Uptrend"] --> TI["SMA 200, EMA 20, EMA 50, RSI 14"]
+  V -.-> BT["What followed: the regime track record, split by VIX regime"]
+  T["Technical score"] --> TR["Trend score"]
   T --> MS["MACD score"]
   T --> RS["RSI score"]
   T --> RG["52-week position score"]
   TR --> SMA["SMA 200, EMA 20, EMA 50"]
   MS --> MACD["MACD"] --> EMA["EMA 12, EMA 26"]
-  F --> R1["EV/EBITDA, margins, FCF yield, D/E, ROE, P/E"]
+  F["Fundamental score"] --> R1["EV/EBITDA, margins, FCF yield, D/E, ROE, P/E"]
   R1 --> RAW["reported figures in the snapshot"]
   PS["Suggested position size"] --> SL["Stop-loss"] --> ATR["ATR 14"]
   PS --> HC["Correlation haircut"] --> CP["pairwise correlations, weekly across sessions"]
@@ -1241,13 +1318,11 @@ Rules common to all profiles:
 - A missing metric is dropped and the remaining weights are renormalised. Below 50% coverage the score is `N/A`.
 - If the trading and reporting currencies differ, ratios that mix them are converted (USD/SGD) or reported as `N/A`.
 
-### Verdict
+### Trend regime
 
-- **Composite:** stocks and REITs `0.5 × Technical + 0.5 × Fundamental`; ETFs, indices, crypto, or a stock with no fundamental score, Technical only.
-- **Bands:** ≥ 65 BUY · 45 to < 65 HOLD · < 45 SELL.
-- **Guardrails** (each caps a BUY at HOLD and appears as a step in the trace): close below SMA200 while MACD is below its signal; RSI above 80; Fundamental score below 30.
-- **Confidence:** High when the two scores are within 20 points and data coverage is at least 80%; Medium within 35 points; Low otherwise, and always Low for a Technical-only verdict.
-- **Not inputs:** headline tone, the projection, the risk figures, events, the backtest, the time range and the portfolio statistics.
+- **Rule:** close against SMA200, then RSI(14) > 70 (Extended, above the average only), then EMA20 against EMA50; see [the five regimes](#the-five-regimes).
+- **Not a forecast and not an input:** the regime moves no score and no position size. Headline tone, the projection, the risk figures, events, the backtest, the crash replays, rotation and the portfolio statistics are not inputs to it either.
+- **Retired in V3.3:** the Composite score (the average of the Technical and Fundamental scores), the BUY / HOLD / SELL bands and their guardrails, and Confidence. The backtest showed the bands did not predict, and a blended number implied a single answer the evidence did not support.
 
 ### Position sizing
 
@@ -1258,12 +1333,13 @@ Inputs: account equity `A`, risk per trade `r`, entry `E`, ATR multiple `m`.
 3. `B = A × r` (risk budget, converted into the asset's currency)
 4. `Raw units = B ÷ R`
 5. `Haircut = 1 ÷ √(1 + (n − 1) × max(0, ρ̄))`
-6. Verdict multiplier: BUY 1.0, HOLD 0.5, SELL 0
-7. `Units = raw × haircut × multiplier`, rounded **down** to the lot size (100 on SGX, 1 in the US, 0.000001 for crypto)
-8. Cap: position value ≤ maximum position % of the account
-9. Liquidity cap: units ≤ 5% of the 20-day average volume, rounded down to a lot (flagged above 1%)
-10. Outputs: units, position value, amount at risk, 2R target (`E + 2R`)
-11. Checks beside them: position VaR and CVaR (one bad day, from history), gap risk (the worst earnings-day fall, when a release is known), the share of daily volume, and the round-trip spread cost (position value × one tick ÷ price)
+6. `Units = raw × haircut`, rounded **down** to the lot size (100 on SGX, 1 in the US, 0.000001 for crypto)
+7. Cap: position value ≤ maximum position % of the account
+8. Liquidity cap: units ≤ 5% of the 20-day average volume, rounded down to a lot (flagged above 1%)
+9. Outputs: units, position value, amount at risk, 2R target (`E + 2R`)
+10. Checks beside them: position VaR and CVaR (one bad day, from history), gap risk (the worst earnings-day fall, when a release is known), the share of daily volume, and the round-trip spread cost (position value × one tick ÷ price)
+
+**Sizing is risk control, not a view on direction.** Until V3.3 a HOLD halved the size and a SELL zeroed it; with the verdict retired the size depends only on the stop, the budget, the haircut and the caps, and the risk sandbox says which of them set it.
 
 An **index** is never sized: it cannot be bought directly, and the sizing table says so and points to a fund that tracks it. ETFs are sized in shares, like stocks.
 
@@ -1301,30 +1377,30 @@ Pearson correlation of log returns, computed only on dates when both assets trad
 
 Two suites, both run in CI as deployment gates.
 
-**`tests/engines.test.html`: 358 tests in 48 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
+**`tests/engines.test.html`: 369 tests in 52 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
 
-**`scripts/test_fetch_fundamentals.py`: 151 tests** of the Python pipeline, standard-library `unittest`.
+**`scripts/test_fetch_fundamentals.py`: 158 tests** of the Python pipeline, standard-library `unittest`.
 
 Every formula is verified against an independent source of truth:
 
 | Method | Examples |
 |---|---|
-| **Hand-computed values** | SMA, EMA and ATR on four-to-five-point series; a full corporate score of 76.238 from six sub-scores; closes of 100, 120, 90, 108 giving a +8% return, a −25% drawdown and a 60% range position; EWMA variance step by step; VaR and CVaR on a sorted list; Spearman correlation on tied ranks |
+| **Hand-computed values** | SMA, EMA and ATR on four-to-five-point series; a full corporate score of 76.238 from six sub-scores; closes of 100, 120, 90, 108 giving a +8% return, a −25% drawdown and a 60% range position; EWMA variance step by step; VaR and CVaR on a sorted list; Spearman correlation on tied ranks; a 60/40 crash replay of −2% with a −12.5% drawdown and contributions that add up; the five trend regimes at their boundaries (RSI exactly 70, equal EMAs, close exactly on the 200-day average) |
 | **Published worked example** | The 14-period RSI example used in most tutorials: 70.53, 66.32, 66.55, 69.41 |
 | **Independent implementation** | Ledoit-Wolf shrinkage against a NumPy port of the authors' own code; beta, R² and the standard error against NumPy least squares; the eigen-decomposition and the concentration figures against NumPy `eigh`; Corwin–Schultz against a separate Python implementation |
 | **Closed-form results** | A constant-correlation matrix's eigenvalues (`1 + (n − 1)ρ`, then `1 − ρ`) and a crowded portfolio with exactly one effective bet; Monte Carlo percentiles against the lognormal formula; a driftless price reaching a 2R target before its stop one time in three; portfolio volatility against a hand-computed `wᵀΣw` with its covariance term |
-| **Algebraic identities** | The correlation haircut restores combined variance to `n`; risk shares total exactly 1; a currency move enters the return as `(1 + r)(1 + fx) − 1`; the bootstrap's drift correction makes the average of `exp(move)` exactly 1 |
+| **Algebraic identities** | The correlation haircut restores combined variance to `n`; risk shares total exactly 1; a currency move enters the return as `(1 + r)(1 + fx) − 1` (checked again for the S&P 500 in SGD in every crash window, and for a flat SGD price measured in USD in the rotation); the bootstrap's drift correction makes the average of `exp(move)` exactly 1 |
 | **Invariants over a grid** | Across 108 combinations of account, risk, ATR and lot size, the amount at risk never exceeds the budget, the cap is never breached and units are whole lots; across account sizes and volumes, the 5% volume cap is never exceeded |
 | **Invariants on any day's data** | Tests that read the live snapshot check only what must always hold: beta contributions add up to the portfolio's beta, variance shares sum to 1, R² stays between 0 and 1, the spread equals one tick ÷ price where the grid is known, and the browser's regime agrees with the pipeline's. They never assert which stocks are crowded today |
-| **Independent recomputation** | SMA, EMA and MACD recomputed from raw candles for every real asset; headline tone recomputed from the stored story scores; the backtest's last day reproduces the live Technical score (and, for assets without fundamentals, the live verdict) for every asset |
+| **Independent recomputation** | SMA, EMA and MACD recomputed from raw candles for every real asset; headline tone recomputed from the stored story scores; the backtest's last day reproduces the live Technical score and the live trend regime for every asset; the rotation's own-market relative strengths equal the factor engine's; each crash window starts at the S&P 500's highest close inside it |
 | **Contract checks on real data** | Every metric of every asset in the committed snapshot, for every time range including `5Y`, passes `validateTrace`, contains no `NaN` or `Infinity`, and has a Guided-mode explainer |
 | **Exact boundaries** | De-duplication at a similarity of 0.85 and at 24 hours; 15 against 14 overlapping returns; earnings exactly at the 21st trading day against the 22nd; the 10-day join gap; midnight New York as "unknown"; VIX ÷ VIX3M exactly 1.00 and 0.95, and VIX exactly 20; SGX ticks at S$0.20 and S$1.00 |
 | **Concurrency** | The job runner with a fake worker whose replies arrive out of order: the stale reply is dropped, queued requests coalesce, a timeout surfaces as an error, and the main-thread fallback gives identical results |
 | **Failure injection** | Corrupted candles, `NaN` strings, a wrong schema version, malformed history, dividends, events, news and forecast blocks, HTTP errors, invalid JSON, timeouts, a dead WebSocket, a missing MAS table, a Telegram chat that rejects the message while others accept it |
 | **Secrets** | The bot token and every chat id are absent from every log line, in every failure path, with one recipient or several |
-| **Pure view helpers** | Command-palette ranking (title over keyword, every word must match), leaderboard ordering (missing values last in both directions), and rounding a suggested mix to whole percentages that total 100 |
+| **Pure view helpers** | Command-palette ranking (title over keyword, every word must match), leaderboard ordering (missing values last in both directions, ties broken by 3-month relative strength), and rounding a suggested mix to whole percentages that total 100 |
 
-The suite also asserts architectural promises: the default view has an empty query string, account size is never serialised, and the page writes nothing to browser storage.
+The suite also asserts architectural promises: the default view has an empty query string, account size is never serialised, an old `verdict=` link is ignored safely, no trace of any asset mentions BUY, HOLD or SELL, and the page writes nothing to browser storage.
 
 ---
 
@@ -1383,13 +1459,16 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 
 | Decision or limitation | Reasoning |
 |---|---|
-| **The scores are heuristics, and the backtest shows they do not predict.** | Weights and thresholds are reasoned rules of thumb. Over 2021 to 2026 the Technical score's rank IC with 21-day returns was −0.08, and no asset's was significant. The project's claim is transparency and correctness of calculation, not predictive power; the backtest makes that claim checkable instead of just stated. |
+| **No BUY, HOLD or SELL.** | A recommendation implies an edge. Over November 2022 to October 2026 neither the Technical score nor the 200-day trend, 12-1 momentum or volatility-adjusted momentum predicted 21- or 63-day returns on this watchlist, in any VIX regime, so the site describes the trend and publishes what followed. The project's claim is transparency and correctness of calculation, not predictive power. |
+| **The scores are heuristics.** | Weights and thresholds are reasoned rules of thumb, kept as readouts of the chart and the business. The Technical score's mean rank IC with 21-day returns was −0.08; it is shown beside the score in Pro mode. |
 | **The market regime is context, not a signal.** | VIX is priced from S&P 500 options: a gauge of the US market, and a statement of what protection costs, not of what happens next. It is shown and explained, and kept out of every score until a test shows it helps. |
 | **Spreads use the tick floor, not a range-based estimate.** | Corwin–Schultz overstated liquid stocks' spreads up to 800 times in a volatile month. The tick floor is exact but is a minimum; London and crypto, whose price grids are not modelled, get no spread figure rather than a misleading one. |
 | **The volume cap rarely binds at retail size.** | Even the thinnest REIT trades about US$14.5 million a day. The cap is there for large hypothetical accounts; for small ones the spread is the liquidity cost that matters, and the sizing table shows it. |
 | **Crowding is measured on the sample covariance.** | Portfolio volatility uses the shrunk matrix to tame noise, but shrinkage would hide which holdings move together. The trace says which matrix each figure uses. |
 | **Beta needs time-aligned closes.** | Pairs that close in different sessions use weekly returns; where a range is too short for that, beta is `N/A` rather than understated. Relative strength still shows, with a note that the closes are hours apart. |
-| **Only the Technical half is backtested.** | Free data has no point-in-time fundamentals, and using today's accounts for past days would be look-ahead bias. Testing half the verdict honestly beats testing all of it dishonestly. |
+| **Only price-based readouts are backtested.** | Free data has no point-in-time fundamentals, and using today's accounts for past days would be look-ahead bias. Testing what can be tested honestly beats testing everything dishonestly. |
+| **Crash windows were chosen after the fact.** | They are the S&P 500's own highs and lows, so they show how a mix behaved in known falls, not in the next one. A holding with no prices at a window's start is left out and the rest rescaled, and every card says so rather than filling the gap with a proxy. |
+| **Rotation is measured in US dollars by default.** | One scale for the whole watchlist makes the quadrants comparable, and it includes the Singapore dollar's move, as a US-dollar investor would see it. The own-market view is one click away and is the factor engine's figure exactly. |
 | **The weights were not tuned to the backtest.** | Five years and 30 correlated assets are a small sample. Optimising the score against it would fit noise and turn a diagnostic into a sales figure. |
 | **The projection does not beat "no change".** | Measured, stored and shown beside every projection. It is context and a teaching device, never an input. See [Prophet forecasting and its limits](#prophet-forecasting-and-its-limits). |
 | **Historical VaR is only as good as its window.** | It cannot imagine a loss worse than the worst day it has seen. `5Y` exists so that 2022 is in the window; the trace says a calm window understates risk going into a storm. |
@@ -1403,7 +1482,6 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 | **The Singapore risk-free rate can be a US proxy.** | MAS publishes through a form-driven page that can change. Resilience was chosen over purity: stale for up to 10 days, then the US yield, always labelled, and the label reaches the Sharpe trace. |
 | **Position sizes change with the time range.** | The haircut uses the same correlation the card displays. Two different correlations on one screen would be worse. |
 | **Fundamental thresholds are absolute and lean towards value.** | With a small watchlist there is no meaningful peer group for relative scoring. Fast-growing companies score low on valuation, and the trace says so. |
-| **The weak-business guardrail cannot fire under 50/50 weights.** | A Fundamental score below 30 caps the composite just under 65, so it can never be a BUY anyway. The rule is kept as a safety net if the weights change, and a test documents this. |
 | **Index levels are shown in their quote currency.** | Yahoo quotes `^GSPC` in USD and `^STI` in SGD, so an index level is labelled and converted like a price. It is a level, not something you can pay, which is why indices are never sized. |
 | **Financial companies share one profile.** | Yahoo's "Financial Services" sector covers banks, insurers and asset managers, so `BLK` is scored like `D05.SI`. That is reasonable on ROE, P/B, net margin and P/E, but an asset manager does report a meaningful EBITDA that the profile leaves out. The watchlist can override the profile per ticker. |
 | **Some companies report in a third currency.** | `CCJ` trades in USD but reports in CAD. Ratios that mix market value with statement figures need a conversion that does not exist here, so they are `N/A` with that reason. |
@@ -1412,7 +1490,7 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 | **No options data.** | Implied volatility would be the market's own forecast of risk and a natural benchmark for EWMA. It was left out of V3 deliberately, to keep a single daily job with one bounded set of requests. |
 | **Crypto is quoted against USDT.** | Binance's public feed uses USDT, which normally trades within a fraction of a percent of the US dollar. The price trace states this. |
 | **Yahoo Finance is an unofficial source.** | It can rate-limit or change shape. Polite pacing, deadlines, keep-last-good, schema validation and the two gates mean the site degrades to slightly older data instead of breaking. |
-| **Leaderboard sort order is not in the URL.** | It resets to Composite on reload. Everything that changes *what* is shown is in the URL; the order of one table was judged not worth another parameter. |
+| **Leaderboard sort order is not in the URL.** | It resets to trend regime, then 3-month relative strength, on reload. Everything that changes *what* is shown is in the URL; the order of one table was judged not worth another parameter. |
 | **ES modules with no build step.** | Nothing to install, nothing to go stale, and the deployed code is the code in the repository. The cost is more HTTP requests, which HTTP/2 on Pages absorbs. |
 | **Rendering by template strings.** | A framework would add a build and a dependency. All dynamic text, including third-party headlines, passes through one escape function. |
 | **Only USD and SGD are converted.** | These are the two trading currencies of the watchlist. Any other pair returns `N/A` rather than a guess. |
@@ -1428,7 +1506,7 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 
 **Why a Web Worker for maths that takes 10 ms?** Because the cost is not one run, it is a slider firing sixty. The interesting part is not the worker but the concurrency rule around it: requests are keyed by their inputs and the reducer drops any reply whose key is no longer current. Correctness comes from the data model, not from timing. And because the engines are pure, the worker, the main-thread fallback, the Node briefing and the tests all import the same file.
 
-**Did you backtest your signals?** Yes, and they do not work: over five years the Technical score's rank IC with 21-day returns was −0.08, and SELL days were followed by slightly better returns than BUY days. I only tested the price-based half, because free data has no point-in-time fundamentals and anything else would be look-ahead bias. I did not tune the weights to improve the number, because that would fit noise. The result is on screen under every verdict. A tool that shows its working should show this too.
+**Did you backtest your signals?** Yes, and they did not work: the Technical score's rank IC with 21-day returns was −0.08, and SELL days were followed by slightly better returns than BUY days. So I tested three textbook alternatives (the 200-day trend, 12-1 momentum, volatility-adjusted momentum) at 21 and 63 days, in both halves of the sample and within each VIX regime, with a decision rule written down first. All four pointed the wrong way. I did not tune anything to rescue the number; I removed BUY / HOLD / SELL instead, and the site now shows a trend regime beside what followed it. A tool that shows its working should be willing to act on what the working says.
 
 **Why EWMA and historical VaR instead of a normal model?** Because the two assumptions behind the normal model, constant volatility and thin tails, are the two things that fail when risk matters. On 21 November 2026, AMD's EWMA volatility was 118% against 75% for its equal-weighted year, and the bootstrap's 21-day 5th percentile was 0.56× the price against 0.69× under the normal model. Same data, very different answer about the downside.
 
@@ -1440,16 +1518,16 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 
 **How do you spot a crowded portfolio?** The first principal component alone is a trap: it is mostly the most volatile holding. I flag "one bet" only when the common driver explains at least 60% of the variance and at least two holdings correlate 0.8 or more with it, and I run it on the sample covariance, because shrinkage would erase the very correlations the check looks for. It names MU and SNDK in a chip portfolio, the two banks among Singapore names, and the miners inside an otherwise diversified mix.
 
-**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 509 tests comparing engines with hand calculations, a published example, closed-form results, an independent NumPy implementation and independent recomputation, including a check that the backtest's last day reproduces the live score for every asset.
+**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 527 tests comparing engines with hand calculations, a published example, closed-form results, an independent NumPy implementation and independent recomputation, including a check that the backtest's last day reproduces the live score for every asset.
 
 **What was the hardest correctness problem?** Data, not formulas. Summing four quarters into a trailing figure is wrong if one quarter is missing, and the provider silently omits them. In V3, earnings timestamps: Yahoo reports them in New York time, so a Singapore release stamped 19:00 in New York is really 08:00 the next morning in Singapore, a different day and before the open; and a midnight stamp means "time unknown", not "before the open". Getting either wrong measures the reaction on the wrong day.
 
 **How do you add notifications without making them a liability?** Make them the last step, give them the secrets alone, and make failure impossible to propagate: missing credentials do nothing, API errors are warnings, the command always exits 0, and the step is `continue-on-error`. With several recipients, one blocked chat cannot stop the others, and chat ids never appear in the log, because GitHub masks the secret as a whole but not its pieces after a split. And never compute the content twice: the briefing runs the site's own engines in Node rather than a Python copy of the scoring.
 
-**What would you do next?** Split the verdict's backtest by market regime, from the five years of VIX history already stored; implied volatility from free options chains, as the market's own forecast to set beside EWMA; point-in-time fundamentals, so that the other half of the verdict could be backtested honestly; peer-relative valuation as the watchlist grows; a proper mean-variance solver with constraints, shown next to the random sample so its sensitivity is visible; and a service worker so the last snapshot works offline.
+**What would you do next?** Implied volatility from free options chains, as the market's own forecast to set beside EWMA; point-in-time fundamentals, so that the Fundamental score could be backtested honestly; a crash replay with rebalancing, set beside buy and hold; peer-relative valuation as the watchlist grows; a proper mean-variance solver with constraints, shown next to the random sample so its sensitivity is visible; and a service worker so the last snapshot works offline.
 
 ---
 
 ## Disclaimer
 
-QuantLens is a learning and portfolio project. Its outputs are produced by fixed rules applied to delayed, third-party data that may be incomplete or wrong. The projection is a trend extrapolation that has not beaten a no-change assumption in testing, and the backtest shows that the price-based half of the verdict has not predicted one-month returns over the last five years. Risk figures describe the past and cannot anticipate a loss larger than any in their window. Nothing here is a recommendation to buy or sell any asset. Do your own research and consider your own circumstances before investing.
+QuantLens is a learning and portfolio project. Its outputs are produced by fixed rules applied to delayed, third-party data that may be incomplete or wrong. The projection is a trend extrapolation that has not beaten a no-change assumption in testing, and the backtest shows that no price-based readout here, the trend regime included, has predicted one- or three-month returns over the last four years. Crash replays use windows chosen after the fact. Risk figures describe the past and cannot anticipate a loss larger than any in their window. Nothing here is a recommendation to buy or sell any asset. Do your own research and consider your own circumstances before investing.

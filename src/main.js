@@ -3,7 +3,7 @@
  *
  * Responsibilities
  *   1. Create the store from the URL
- *      (?t=&ccy=&mode=&class=&mkt=&sector=&trend=&view=&range=&p=) and keep the
+ *      (?t=&ccy=&mode=&class=&mkt=&sector=&trend=&view=&range=&p=&rs=) and keep the
  *      URL and the store in sync in both directions.
  *   2. Load the daily snapshot, run every engine once per asset, and cache the result.
  *   3. Slice each asset to the selected time range (1M / 3M / 6M / 1Y) and derive
@@ -50,12 +50,14 @@ import { analyzeForecast } from './engines/forecastEngine.js';
 import { seedFromString } from './engines/monteCarloEngine.js';
 import { PORTFOLIO_CONFIG } from './engines/portfolioEngine.js';
 import { analyzeCrashReplays, REPLAY_PREFIX } from './engines/crashReplayEngine.js';
+import { analyzeRotation } from './engines/rotationEngine.js';
 import { mountTelemetryBar } from './ui/telemetryBar.js';
 import { mountAppTabs } from './ui/appTabs.js';
 import { mountScreenerPanel } from './ui/screenerPanel.js';
 import { mountComparisonMatrix } from './ui/comparisonMatrix.js';
 import { mountLeaderboardView } from './ui/leaderboardView.js';
 import { mountPortfolioSandbox } from './ui/portfolioSandbox.js';
+import { mountRotationView } from './ui/rotationView.js';
 import { mountDerivationDrawer } from './ui/derivationDrawer.js';
 import { mountRiskSandboxModal } from './ui/riskSandboxModal.js';
 import { mountCommandPalette } from './ui/commandPalette.js';
@@ -80,6 +82,7 @@ function hydrateFromUrl() {
   store.dispatch(actions.setMode(view.mode));
   store.dispatch(actions.setView(view.view));
   store.dispatch(actions.setRange(view.range));
+  store.dispatch(actions.setRotationBenchmark(view.rotation));
   if (Array.isArray(view.portfolio.weights) && view.portfolio.weights.length) {
     store.dispatch(actions.setPortfolioWeights(view.portfolio.weights));
   } else {
@@ -588,6 +591,27 @@ function crashReplays() {
   return replayMemo.value;
 }
 
+// Rotation (V3.3): every tradable's 1- and 3-month relative strength, one analysis per
+// snapshot and benchmark choice. It does not depend on the time range.
+let rotationMemo = { key: null, value: null };
+
+function rotation() {
+  const state = store.getState();
+  if (!state.snapshot) return null;
+  const key = `${state.snapshot.generatedAt}|${state.rotation}`;
+  if (rotationMemo.key !== key) {
+    const fx = selectFx(state);
+    rotationMemo = {
+      key,
+      value: analyzeRotation({
+        assets: state.snapshot.assets, byTicker: state.snapshot.byTicker, mode: state.rotation,
+        fx: { series: state.snapshot.fx.series ?? null, rate: fx ? fx.rate : null },
+      }),
+    };
+  }
+  return rotationMemo.value;
+}
+
 /** The portfolio slot plus the allocation it belongs to. */
 function portfolio() {
   const state = store.getState();
@@ -678,8 +702,10 @@ function traceIndex(ticker) {
   const price = analysis ? priceMetric(ticker) : null;
   const held = !ticker && state.compute.portfolio.result ? state.compute.portfolio.result.analysis : null;
   const replays = !ticker && state.view === 'portfolio' ? crashReplays() : null;
+  const rotated = state.view === 'rotation' ? rotation() : null;
+  const rotationPart = rotated ? (ticker ? (rotated.byTicker[ticker] ? rotated.byTicker[ticker].metrics : null) : rotated.metrics) : null;
   const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
-  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis, replays];
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis, replays, rotationPart];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
@@ -697,6 +723,7 @@ function traceIndex(ticker) {
     current.heat,
     held ? held.metrics : null,
     replays ? replays.metrics : null,
+    rotationPart,
     regimeAnalysis.metrics,
     macroAnalysis.metrics,
   );
@@ -727,6 +754,7 @@ const app = {
   simulation,
   portfolio,
   crashReplays,
+  rotation,
   backtest,
   regime: () => regimeAnalysis,
   describeRegime: () => describeRegime(regimeAnalysis),
@@ -763,6 +791,7 @@ const elements = {
   matrix: document.getElementById('comparison-matrix'),
   leaderboard: document.getElementById('leaderboard'),
   portfolio: document.getElementById('portfolio'),
+  rotation: document.getElementById('rotation'),
   drawer: document.getElementById('derivation-drawer'),
   scrim: document.getElementById('drawer-scrim'),
   sandbox: document.getElementById('risk-sandbox'),
@@ -774,8 +803,9 @@ const viewPanels = Object.freeze({
   compare: elements.matrix,
   leaderboard: elements.leaderboard,
   portfolio: elements.portfolio,
+  rotation: elements.rotation,
 });
-const VIEW_TITLES = Object.freeze({ leaderboard: 'Leaderboard', portfolio: 'Portfolio' });
+const VIEW_TITLES = Object.freeze({ leaderboard: 'Leaderboard', portfolio: 'Portfolio', rotation: 'Rotation' });
 
 let lastError = null;
 
@@ -859,6 +889,7 @@ mountScreenerPanel(elements.screener, app);
 mountComparisonMatrix(elements.matrix, app);
 mountLeaderboardView(elements.leaderboard, app);
 mountPortfolioSandbox(elements.portfolio, app);
+mountRotationView(elements.rotation, app);
 mountDerivationDrawer(elements.drawer, app, elements.scrim);
 mountRiskSandboxModal(elements.sandbox, app);
 const palette = mountCommandPalette(elements.palette, app);

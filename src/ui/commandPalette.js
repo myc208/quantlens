@@ -104,11 +104,12 @@ export function rankCommands(commands, query, { limit = 50 } = {}) {
 /* Component                                                           */
 /* ------------------------------------------------------------------ */
 
-const VIEW_LABELS = Object.freeze({ compare: 'Compare', leaderboard: 'Leaderboard', portfolio: 'Portfolio' });
+const VIEW_LABELS = Object.freeze({ compare: 'Compare', leaderboard: 'Leaderboard', portfolio: 'Portfolio', rotation: 'Rotation' });
 const VIEW_KEYWORDS = Object.freeze({
   compare: ['matrix', 'side by side', 'comparison', 'view', 'tab'],
   leaderboard: ['ranking', 'rank', 'table', 'watchlist', 'scores', 'view', 'tab'],
-  portfolio: ['allocation', 'weights', 'sharpe', 'mpt', 'frontier', 'view', 'tab'],
+  portfolio: ['allocation', 'weights', 'sharpe', 'mpt', 'frontier', 'crash', 'replay', 'view', 'tab'],
+  rotation: ['sector', 'relative strength', 'leading', 'lagging', 'quadrant', 'momentum', 'view', 'tab'],
 });
 const MODE_LABELS = Object.freeze({ guided: 'Guided', pro: 'Pro' });
 const GROUP_ORDER = Object.freeze(['Go to', 'Assets', 'Time range', 'Settings', 'Actions']);

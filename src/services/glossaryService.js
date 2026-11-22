@@ -669,6 +669,20 @@ const ENTRIES = {
     healthy: 'Within the planned amount at risk.',
     risky: 'Several times the planned amount, especially with earnings inside the next 21 trading days.',
   },
+  rotation: {
+    term: 'Rotation quadrant',
+    what: 'Where an asset sits on two relative strengths: over 3 months (across) and over the last month (up). Leading is ahead over both, Weakening ahead over 3 months but behind lately, Improving behind over 3 months but ahead lately, Lagging behind over both. Measured against the S&P 500 in USD, or against the asset\'s own market.',
+    why: 'It shows at a glance which parts of the watchlist the market has been favouring, and which are turning. It is a description of the past one and three months, not a signal.',
+    healthy: 'There is no good or bad quadrant: over 2022–2026 momentum did not predict the next month on this watchlist.',
+    risky: 'The one-month span sits inside the three-month one, so the two are not independent, and a single sharp day can move a point across a line.',
+  },
+  rotationGroup: {
+    term: 'Group rotation',
+    what: 'The median 1-month and 3-month relative strength of a group of the watchlist (for example SG REITs or Tech & semis), and the quadrant of those medians.',
+    why: 'Groups show rotation between themes, which single assets can hide. The median is the middle member, so one outlier cannot drag the group.',
+    healthy: 'A description, not a signal. Groups of one or two members are just those assets.',
+    risky: 'Small groups, and members left out when they have no relative strength (Bitcoin against its own market).',
+  },
   crashReplay: {
     term: 'Crash replay',
     what: 'Your allocation bought at the close on an S&P 500 high and held, at the same weights with no rebalancing, to the low that followed: the 2022 rate-hike bear market, the August 2024 yen carry unwind, the 2025 tariff shock and the autumn 2026 sell-off (to the latest close). Prices are in your display currency at each day\'s exchange rate, set against the S&P 500 replayed the same way.',
@@ -772,6 +786,7 @@ function explainerKey(id) {
   if (typeof id !== 'string') return id;
   if (id.startsWith('corr:')) return 'correlation';
   if (id.startsWith('replay:')) return 'crashReplay';
+  if (id.startsWith('rotationGroup:')) return 'rotationGroup';
   return id;
 }
 

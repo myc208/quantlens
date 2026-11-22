@@ -245,6 +245,7 @@ export function mountDerivationDrawer(root, app, scrim) {
     if (asset) eyebrow = `${asset.ticker} · ${asset.name}`;
     else if (PORTFOLIO_METRICS.has(drawer.trail[0])) eyebrow = 'Your portfolio';
     else if (String(drawer.trail[0]).startsWith('replay:')) eyebrow = 'Your portfolio · crash replay';
+    else if (String(drawer.trail[0]).startsWith('rotationGroup:')) eyebrow = 'Watchlist group · rotation';
     else if (MARKET_METRICS.has(drawer.trail[0])) eyebrow = MARKET_METRICS.get(drawer.trail[0]);
     const scrollTop = lastRenderedId === metric.id ? (root.querySelector('.drawer__body') || {}).scrollTop : 0;
 

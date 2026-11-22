@@ -195,6 +195,8 @@
     import * as macroEngine from '../src/engines/macroCalendarEngine.js';
     import * as trends from '../src/engines/trendRegimeEngine.js';
     import * as replays from '../src/engines/crashReplayEngine.js';
+    import * as rotations from '../src/engines/rotationEngine.js';
+    import { plotPoints } from '../src/ui/rotationView.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT, TREND_RANK } from '../src/ui/leaderboardView.js';
     import { roundAllocation } from '../src/ui/portfolioSandbox.js';
@@ -4580,6 +4582,104 @@
         const empty = replays.analyzeCrashReplays({ weights: [], byTicker: snapshot.byTicker, baseCurrency: 'USD', fx });
         expect(empty.ok).toBeFalse();
         expect(Object.values(empty.metrics).every((metric) => metric.status === 'na' && tracer.validateTrace(metric).length === 0)).toBeTrue();
+      });
+    });
+
+    /* ================================================================== */
+    /* 34. V3.3 rotation: 1-month vs 3-month relative strength              */
+    /* ================================================================== */
+
+    suite('rotation: quadrants, groups, USD conversion and the URL', () => {
+      test('quadrants come from the signs of RS 3M and RS 1M; medians by hand', () => {
+        expect(rotations.quadrantOf(0, 0)).toBe('Leading');                  // zero counts as ahead
+        expect(rotations.quadrantOf(-0.01, 0.02)).toBe('Weakening');
+        expect(rotations.quadrantOf(-0.01, -0.02)).toBe('Lagging');
+        expect(rotations.quadrantOf(0.01, -0.02)).toBe('Improving');
+        expect(rotations.quadrantOf(null, 0.1)).toBeNull();
+        expect(rotations.median([3, 1, 2])).toBe(2);
+        expect(rotations.median([4, 1, 2, 3])).toBe(2.5);
+        expect(rotations.median([null, 'x'])).toBeNull();
+      });
+      test('groups come from the map, then the asset class or the Yahoo sector', () => {
+        expect(rotations.groupFor({ ticker: 'MU' })).toEqual({ id: 'tech', name: 'Tech & semis', source: 'map' });
+        expect(rotations.groupFor({ ticker: 'SOL-USD', assetClass: 'crypto' }).name).toBe('Crypto');
+        expect(rotations.groupFor({ ticker: 'QQQ', assetClass: 'etf' }).name).toBe('Funds');
+        expect(rotations.groupFor({ ticker: 'Z74.SI', assetClass: 'equity', market: 'SG', sector: 'Communication Services' }))
+          .toEqual({ id: 'sector-sg-communication-services', name: 'SG Communication Services', source: 'sector' });
+        expect(rotations.groupFor({ ticker: 'NEW', assetClass: 'equity', market: 'US', sector: null }).name).toBe('Other');
+      });
+      test('an SGD asset against the S&P 500 is converted to USD at each day\'s rate', () => {
+        const dates = Array.from({ length: 120 }, (_, i) => new Date(Date.UTC(2026, 6, 1) + i * 86400000).toISOString().slice(0, 10));
+        const rates = dates.map((_, i) => 1.30 + (0.10 * i) / 119);
+        const flat = (ticker, currency, extra = {}) => ({
+          ticker, currency, assetClass: 'equity', market: currency === 'SGD' ? 'SG' : 'US',
+          series: { dates, close: dates.map(() => 10), high: dates.map(() => 10), low: dates.map(() => 10) }, ...extra,
+        });
+        const byTicker = { '^GSPC': flat('^GSPC', 'USD', { assetClass: 'index' }) };
+        const fx = { series: { dates, rates }, rate: rates[rates.length - 1] };
+        const point = rotations.rotationPoint(flat('S.SI', 'SGD'), { mode: 'spx', byTicker, fx });
+        const rateOn = (iso) => rates[dates.indexOf(iso)];
+        expect(point.ok).toBeTrue();
+        expect(point.converted).toBeTrue();
+        // A flat SGD price loses in USD as USD/SGD rises; the benchmark is flat, so RS is that loss.
+        expect(point.rs3m.value).toBeCloseTo(rateOn(point.rs3m.from) / rates[rates.length - 1] - 1, 1e-12);
+        expect(point.rs1m.value).toBeCloseTo(rateOn(point.rs1m.from) / rates[rates.length - 1] - 1, 1e-12);
+        expect(point.quadrant).toBe('Lagging');
+        const usd = rotations.rotationPoint(flat('U', 'USD'), { mode: 'spx', byTicker, fx });
+        expect(usd.converted).toBeFalse();
+        expect(usd.rs3m.value).toBeCloseTo(0, 1e-12);
+        expect(rotations.rotationPoint(flat('S.SI', 'SGD'), { mode: 'spx', byTicker, fx: null }).ok).toBeFalse();
+        const metric = rotations.rotationMetric(flat('S.SI', 'SGD'), point, { mode: 'spx', fx, group: { id: 'x', name: 'X', source: 'map' } });
+        expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(metric.trace.steps[0].description).toMatch(/Convert S\.SI's SGD closes to USD/);
+        expect(metric.trace.interpretation.caveat).toMatch(/not a signal/);
+      });
+      test('real snapshot: 26 tradables in 11 mapped groups; own-market values equal the factor engine\'s', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const fx = { series: snapshot.fx.series, rate: snapshot.fx.rate };
+        const spx = rotations.analyzeRotation({ assets: snapshot.assets, byTicker: snapshot.byTicker, mode: 'spx', fx });
+        const own = rotations.analyzeRotation({ assets: snapshot.assets, byTicker: snapshot.byTicker, mode: 'own', fx });
+        const tradable = snapshot.assets.filter((asset) => asset.assetClass !== 'index');
+        expect(Object.keys(spx.byTicker).length).toBe(tradable.length);       // indices are left out
+        expect(spx.groups.length).toBe(rotations.ROTATION_GROUPS.length);
+        for (const entry of [...Object.values(spx.byTicker), ...Object.values(own.byTicker)]) {
+          expect(entry.group.source).toBe('map');                            // every watchlist ticker is mapped
+          expect(tracer.validateTrace(entry.metrics.rotation)).toEqual([]);
+        }
+        for (const metric of [...Object.values(spx.metrics), ...Object.values(own.metrics)]) expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(Object.values(spx.byTicker).every((entry) => entry.point.ok)).toBeTrue();   // one scale for everything
+        expect(own.byTicker['BTC-USD'].point.ok).toBeFalse();               // Bitcoin is its own benchmark
+        for (const asset of tradable) {
+          const point = own.byTicker[asset.ticker].point;
+          if (!point.ok) continue;
+          const bench = snapshot.byTicker[factors.benchmarkFor(asset)];
+          const metrics = factors.analyzeFactors({ asset, series: asset.series, benchmark: bench, benchmarkSeries: bench.series }).metrics;
+          expect(point.rs3m.value).toBeCloseTo(metrics.relativeStrength3m.value, 1e-12);
+          expect(point.rs1m.value).toBeCloseTo(metrics.relativeStrength1m.value, 1e-12);
+          // A US listing against the S&P 500 is the same either way.
+          if (asset.currency === 'USD' && asset.market !== 'CRYPTO') expect(spx.byTicker[asset.ticker].point.rs3m.value).toBeCloseTo(point.rs3m.value, 1e-12);
+        }
+        for (const entry of spx.groups) {
+          const members = entry.members.map((ticker) => spx.byTicker[ticker].point.rs3m.value);
+          expect(entry.metric.meta.median3m).toBeCloseTo(rotations.median(members), 1e-12);
+        }
+        const visible = new Set(['MU', 'AMD', 'BTC-USD']);
+        expect(plotPoints(own, visible, 'assets').map((point) => point.key).sort()).toEqual(['AMD', 'MU']);
+        expect(plotPoints(own, visible, 'groups').map((point) => point.key)).toEqual(['tech', 'crypto']);
+        expect(glossary.hasExplainer('rotation')).toBeTrue();
+        expect(glossary.hasExplainer('rotationGroup:tech')).toBeTrue();
+      });
+      test('the benchmark is in the URL, the default leaves it out, and garbage is ignored', () => {
+        expect(storeModule.VIEWS).toContain('rotation');
+        const view = storeModule.parseUrlState('?view=rotation&rs=OWN');
+        expect(view.rotation).toBe('own');
+        expect(storeModule.serializeUrlState(view)).toBe('?view=rotation&rs=own');
+        expect(storeModule.parseUrlState('?rs=maybe').rotation).toBe('spx');
+        expect(storeModule.serializeUrlState(storeModule.parseUrlState('?rs=spx'))).toBe('');
+        const state = storeModule.reduce(storeModule.createInitialState(''), storeModule.actions.setRotationBenchmark('own'));
+        expect(state.rotation).toBe('own');
+        expect(storeModule.reduce(state, storeModule.actions.setRotationBenchmark('nope'))).toBe(state);
       });
     });
 
