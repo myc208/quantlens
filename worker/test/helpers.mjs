@@ -145,3 +145,18 @@ export function markdownProblem(text) {
   }
   return open ? 'unclosed bold' : null;
 }
+
+/** A made-up Gemini key: tests check it never reaches a URL, a log or a chat. */
+export const GEMINI_KEY = 'test-gemini-key-not-real-0001';
+export const GEMINI_ENV = Object.freeze({ ...ENV, GEMINI_API_KEY: GEMINI_KEY });
+
+/** A generateContent response with one answer (and, optionally, a thought part before it). */
+export function geminiReply(text, { finishReason = 'STOP', thought = null } = {}) {
+  const parts = [...(thought ? [{ text: thought, thought: true }] : []), { text }];
+  return json({ candidates: [{ content: { role: 'model', parts }, finishReason, index: 0 }], usageMetadata: { promptTokenCount: 7000, candidatesTokenCount: 60 } });
+}
+
+/** A Gemini API error response. */
+export function geminiError(status, message, reason = 'ERROR') {
+  return json({ error: { code: status, message, status: reason } }, status);
+}

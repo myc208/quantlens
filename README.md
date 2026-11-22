@@ -6,11 +6,13 @@
 
 - **Site:** `https://myc208.github.io/quantlens/`
 - **Tests:** `https://myc208.github.io/quantlens/tests/engines.test.html`
-- **Cost to run:** zero. No server, no database, no API keys, no build step, no browser dependencies.
+- **Cost to run:** zero. No server, no database, no API keys, no build step, no browser dependencies. The optional Telegram agent runs on the free tiers of Cloudflare Workers and Gemini.
 
 > QuantLens is an educational tool. Its trend regimes, scores, position sizes, risk figures and portfolio statistics come from fixed, published rules so that they can be checked. They describe the past, do not predict returns, and are not financial advice.
 
-**What V3.4 adds:** less hand upkeep and sharper alerts. A monthly workflow refreshes the macro calendar from the Fed's FOMC page, FRED's CPI dates, `exchange_calendars` and data.gov.sg, and proposes the result as a pull request after both test gates; SGX half days (12:00 noon on the eves of Chinese New Year, Christmas and New Year) end the Singapore session early, like US half days. The briefing's big-move trigger also fires on a 10% day (15% crypto, 5% ETFs), so a crash cannot hide behind a sell-off's inflated volatility, and a new trigger reports trend flips across the 200-day average or the 20/50-day EMA cross once they have held for a second close. The ongoing crash replay caps itself when the S&P 500 recovers. And every run now publishes `data/bot_context.json`, a 29 KB summary of the snapshot from the site's own engines and trigger rules, the groundwork for a question-answering bot. No new requests in the daily run.
+**What V4.0 adds:** a Telegram agent you can ask. A Cloudflare Worker in `worker/`, separate from the pipeline and the site, answers `/check D05`, `/regime`, `/triggers`, `/rotation` and `/upcoming` by code from `data/bot_context.json`, and plain-English questions through Gemini, which reads only a digest of that file under eight rules (no outside facts, no arithmetic, no advice, untracked assets said as such, N/A reasons word for word). A number check marks any figure the snapshot does not contain, and every reply ends with the snapshot's date. It checks Telegram's secret header, answers only the chats you list, logs no token, chat id or message, and stores nothing. Zero cost, and the daily workflow is unchanged. See [Telegram agent](#telegram-agent) and [`worker/README.md`](worker/README.md).
+
+**V3.4 added** less hand upkeep and sharper alerts. A monthly workflow refreshes the macro calendar from the Fed's FOMC page, FRED's CPI dates, `exchange_calendars` and data.gov.sg, and proposes the result as a pull request after both test gates; SGX half days (12:00 noon on the eves of Chinese New Year, Christmas and New Year) end the Singapore session early, like US half days. The briefing's big-move trigger also fires on a 10% day (15% crypto, 5% ETFs), so a crash cannot hide behind a sell-off's inflated volatility, and a new trigger reports trend flips across the 200-day average or the 20/50-day EMA cross once they have held for a second close. The ongoing crash replay caps itself when the S&P 500 recovers. And every run now publishes `data/bot_context.json`, a 29 KB summary of the snapshot from the site's own engines and trigger rules, the groundwork for a question-answering bot. No new requests in the daily run.
 
 **V3.3 added** the honest consequence of the backtest. A five-year test of the Technical score and three textbook price-only signals, split by VIX regime, found no predictive edge on this watchlist, so **BUY / HOLD / SELL, the Composite score and Confidence are gone.** Each asset now shows its **trend regime** (Uptrend, Extended, Pullback, Recovering or Downtrend) beside what followed each regime, overall and within normal, elevated and stressed markets, and position sizing is pure risk control. The Portfolio sandbox **replays your weights through four S&P 500 sell-offs** (2022, August 2024, the 2025 tariff shock and autumn 2026) against the index in your currency; a new **Rotation** tab plots 1-month against 3-month relative strength for the 26 tradable assets and 11 groups; and the daily candle cutoff knows the US half days. No new requests.
 
@@ -46,16 +48,17 @@
 18. [CI/CD and the testing gates](#cicd-and-the-testing-gates)
 19. [Daily Telegram briefing](#daily-telegram-briefing)
 20. [Agent-ready export](#agent-ready-export)
-21. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
-22. [The Derivation Tracer](#the-derivation-tracer)
-23. [The mathematics](#the-mathematics)
-24. [Numerical safety](#numerical-safety)
-25. [Testing](#testing)
-26. [Accessibility and responsive design](#accessibility-and-responsive-design)
-27. [Deployment](#deployment)
-28. [Changing the watchlist](#changing-the-watchlist)
-29. [Design decisions and known limitations](#design-decisions-and-known-limitations)
-30. [Interview talking points](#interview-talking-points)
+21. [Telegram agent](#telegram-agent)
+22. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
+23. [The Derivation Tracer](#the-derivation-tracer)
+24. [The mathematics](#the-mathematics)
+25. [Numerical safety](#numerical-safety)
+26. [Testing](#testing)
+27. [Accessibility and responsive design](#accessibility-and-responsive-design)
+28. [Deployment](#deployment)
+29. [Changing the watchlist](#changing-the-watchlist)
+30. [Design decisions and known limitations](#design-decisions-and-known-limitations)
+31. [Interview talking points](#interview-talking-points)
 
 ---
 
@@ -197,6 +200,7 @@ flowchart LR
 .github/workflows/update-market-data.yml   refresh, two test gates, deploy to Pages, Telegram briefing
 scripts/watchlist.json                     the 30 assets to track
 .github/workflows/sync-macro-calendar.yml  monthly: refresh the macro calendar, run both gates, open a pull request
+.github/workflows/worker.yml               the Telegram agent's tests, on changes to worker/ or the export
 scripts/macro_calendar.json                FOMC decisions and minutes, US CPI releases, NYSE and SGX holidays and half days
 scripts/sync_macro_calendar.py             the monthly calendar sync (Fed page, FRED, exchange_calendars, data.gov.sg)
 scripts/fetch_fundamentals.py              prices, history, dividends, events, statements, news, yields,
@@ -205,7 +209,7 @@ scripts/fetch_fundamentals.py              prices, history, dividends, events, s
 scripts/signals.mjs                        runs the site's engines in Node.js for the briefing's signals
 scripts/bot_context.mjs                    runs the site's engines in Node.js for the agent-ready export
 scripts/test_fetch_fundamentals.py         176 unit tests for the pipeline (Gate 1)
-scripts/test_sync_macro_calendar.py        25 unit tests for the calendar sync, offline (Gate 1)
+scripts/test_sync_macro_calendar.py        26 unit tests for the calendar sync, offline (Gate 1)
 scripts/run_browser_tests.py               headless Chrome/Edge runner for the test page (Gate 2)
 scripts/requirements.txt                   yfinance, vaderSentiment, prophet (pipeline only)
 scripts/requirements-calendar.txt          exchange_calendars, pinned (the monthly sync only)
@@ -226,6 +230,9 @@ src/ui/        telemetryBar.js  appTabs.js  commandPalette.js  screenerPanel.js
                comparisonMatrix.js  leaderboardView.js  portfolioSandbox.js  rotationView.js
                derivationDrawer.js  riskSandboxModal.js  regimeBanner.js
 tests/engines.test.html                    376 browser-run tests in 55 suites, zero dependencies
+worker/                                    the Telegram agent: a Cloudflare Worker, deployed by hand (V4.0)
+  wrangler.toml  src/index.js  telegram.js  context.js  commands.js  tickers.js  format.js
+  digest.js  prompt.js  gemini.js  numbers.js  answer.js   test/  87 node --test tests, no dependencies
 ```
 
 ---
@@ -996,7 +1003,7 @@ It earns its place as a teaching device: a visible, quantified example of why a 
 
 ## CI/CD and the testing gates
 
-The daily workflow, `.github/workflows/update-market-data.yml`, has three jobs; a second, monthly workflow keeps the macro calendar current (see [the monthly sync](#the-monthly-calendar-sync)).
+The daily workflow, `.github/workflows/update-market-data.yml`, has three jobs; a second, monthly workflow keeps the macro calendar current (see [the monthly sync](#the-monthly-calendar-sync)), and a third, `worker.yml`, runs the Telegram agent's tests whenever `worker/` or `data/bot_context.json` changes (see [Telegram agent](#telegram-agent)).
 
 ```mermaid
 flowchart LR
@@ -1010,7 +1017,7 @@ flowchart LR
   D --> REF
   P --> TEST["test"]
   PR --> TEST
-  REF --> V["validate snapshot"] --> BCX["agent context, never blocks"] --> G1["Gate 1: 201 pipeline unit tests"] --> G2["Gate 2: 376 browser tests in headless Chrome"] --> C["commit snapshot and context"]
+  REF --> V["validate snapshot"] --> BCX["agent context, never blocks"] --> G1["Gate 1: 202 pipeline unit tests"] --> G2["Gate 2: 376 browser tests in headless Chrome"] --> C["commit snapshot and context"]
   C --> TG["Telegram briefing, always runs, never fails the job"]
   V -.->|"any failure"| TG
   TEST --> V2["validate, Gate 1, Gate 2"]
@@ -1024,7 +1031,7 @@ flowchart LR
 | `test` | every push and pull request | Validate the committed snapshot → Gate 1 → Gate 2. |
 | `deploy` | after a successful `refresh` or `test`, never on a pull request | Publish the static site to GitHub Pages. |
 
-**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 201 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), US and SGX half-day cutoffs (a 1:15 p.m. New York candle dropped and a 1:25 p.m. one kept; 12:15 against 12:25 in Singapore), the monthly calendar sync against offline fixtures of every source (a full sync must reproduce the committed file, a failed source keeps its entries, the FRED key never reaches a message), the agent-ready export's contract, snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, a 10% day against 9.99%, 5 trading days against 6, exactly 48 hours, a trend flip after one close against two), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, the trend-regime tally and the Uptrend and Downtrend lines with no BUY, HOLD or SELL left in any edition, and a failed step moved to the top.
+**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 202 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), US and SGX half-day cutoffs (a 1:15 p.m. New York candle dropped and a 1:25 p.m. one kept; 12:15 against 12:25 in Singapore), the monthly calendar sync against offline fixtures of every source (a full sync must reproduce the committed file, a failed source keeps its entries, the FRED key never reaches a message), the agent-ready export's contract, snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, a 10% day against 9.99%, 5 trading days against 6, exactly 48 hours, a trend flip after one close against two), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, the trend-regime tally and the Uptrend and Downtrend lines with no BUY, HOLD or SELL left in any edition, and a failed step moved to the top.
 
 **Gate 2: the browser suite, headless** (`python scripts/run_browser_tests.py --min-tests 100`). The runner starts a local web server, launches headless Chrome or Edge at `tests/engines.test.html`, and waits for the page to report its results to a one-time same-origin URL. It uses only the Python standard library.
 
@@ -1189,7 +1196,7 @@ The message is shortened from the bottom of the body if it ever approached Teleg
 
 ## Agent-ready export
 
-Every daily run publishes `data/bot_context.json` (served at `/data/bot_context.json`), the groundwork for a question-answering bot that should only ever quote auditable QuantLens numbers. It is built in the refresh job after the snapshot is validated and before the gates, which check it, and committed with the snapshot.
+Every daily run publishes `data/bot_context.json` (served at `/data/bot_context.json`), the only source of the [Telegram agent](#telegram-agent), which should only ever quote auditable QuantLens numbers. It is built in the refresh job after the snapshot is validated and before the gates, which check it, and committed with the snapshot.
 
 ```jsonc
 {
@@ -1212,6 +1219,30 @@ Every daily run publishes `data/bot_context.json` (served at `/data/bot_context.
 - **Small enough to read whole.** About 29 KB for 30 assets, against a 50 KB limit the validator enforces, with no candle or history arrays (no list may hold more than 64 items) and floats rounded to six significant figures.
 - **Checked twice.** Gate 1 builds it from the committed snapshot through Node and validates its contract; Gate 2 recomputes the trend regime, relative strength, beta, EWMA volatility, spread, Amihud and rotation quadrant of every asset in the browser and requires the committed file to match.
 - **It never blocks the data.** The build step is allowed to fail; the snapshot is still committed, and the previous export stays, with its own `asOf` showing it is a day old.
+
+## Telegram agent
+
+V4.0 adds a bot you can ask about the watchlist, built so that it can only repeat QuantLens's own numbers. It is a Cloudflare Worker in [`worker/`](worker/README.md), deployed by hand with `wrangler`; the daily workflow, the snapshot and the site do not depend on it.
+
+```mermaid
+flowchart LR
+  TG["Telegram"] -->|"webhook + secret header"| W["Worker: secret, chat allowlist"]
+  W -->|"200 at once"| TG
+  W --> C["bot_context.json from Pages, 5-minute edge cache"]
+  C --> CMD["slash command: answered by code"]
+  C --> D["facts digest: the commands' own lines + rankings"]
+  D --> G["Gemini, eight rules"] --> N["number check + snapshot footer"]
+  CMD --> R["reply: MarkdownV2, split at 4,096"]
+  N --> R2["reply: plain text"]
+```
+
+- **Commands by code.** `/check <ticker>` (tickers, short codes and names: `D05`, `DBS`, `BTC`, `SPX`, `BRK.B`), `/regime` (the VIX curve and its inverted streak, the next FOMC decision and CPI release in New York and Singapore time), `/triggers` (the briefing's rules), `/rotation`, `/upcoming`. A missing figure carries the export's own reason, word for word.
+- **Questions through Gemini, held to the snapshot.** Gemini never sees raw JSON: it reads a digest made of the same lines the commands print, plus rankings, so comparisons need no arithmetic. Its rules forbid outside facts, calculation, advice and predictions; an untracked asset is said to be untracked. Every decimal or percentage in the answer must appear in the digest or the question, or it is listed under the answer as not in the snapshot. Follow-ups work by replying to the bot, with no stored conversation.
+- **Locked to its owner.** Telegram's `secret_token` header, compared in constant time; replies only to the chats in the Worker's `TELEGRAM_CHAT_ID`; logs that name the event and outcome, never a token, a chat id or a message.
+- **Degrades in words.** GitHub Pages down, a stale snapshot, no Gemini key, a spent free quota, a blocked or empty answer, a timeout or a retired model: each gets its own reply, and the commands keep working without the model.
+- **Tested without a network.** 87 `node --test` tests fake Telegram, GitHub Pages and Gemini, and run every command over both a frozen export and the committed one, so a change to the export that would break a reply fails the `Worker tests` workflow.
+
+Setup (about fifteen minutes: a free Cloudflare account, an optional free Gemini key, four Worker secrets, one `setWebhook` call), operation, key rotation and troubleshooting are in [`worker/README.md`](worker/README.md).
 
 ## Live feeds and their fallbacks
 
@@ -1439,11 +1470,13 @@ Pearson correlation of log returns, computed only on dates when both assets trad
 
 ## Testing
 
-Two suites, both run in CI as deployment gates.
+Two suites run in CI as deployment gates, and a third covers the Telegram agent.
 
 **`tests/engines.test.html`: 376 tests in 55 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
 
-**`scripts/test_fetch_fundamentals.py` and `scripts/test_sync_macro_calendar.py`: 201 tests** of the Python side, standard-library `unittest`; the calendar sync's tests run offline against fixtures shaped like each source.
+**`scripts/test_fetch_fundamentals.py` and `scripts/test_sync_macro_calendar.py`: 202 tests** of the Python side, standard-library `unittest`; the calendar sync's tests run offline against fixtures shaped like each source.
+
+**`worker/test/*.test.mjs`: 87 tests** of the Telegram agent, `node --test` with no dependencies and no network (see [Telegram agent](#telegram-agent)). They are not a deployment gate, since the Worker is deployed by hand, but the `Worker tests` workflow runs them on every change to `worker/` or to the export.
 
 Every formula is verified against an independent source of truth:
 
@@ -1495,7 +1528,7 @@ The leaderboard and the portfolio sandbox adapt to **their own width** with CSS 
 2. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
 3. Run the workflow once from the Actions tab (or push to `main`). From then on it refreshes the data, runs both gates and redeploys every day.
 
-No secrets, tokens or environment variables are needed for the site. Optional: the two Telegram secrets (see [Daily Telegram briefing](#daily-telegram-briefing)), and `FRED_API_KEY` plus the *Allow GitHub Actions to create and approve pull requests* setting for [the monthly calendar sync](#the-monthly-calendar-sync).
+No secrets, tokens or environment variables are needed for the site. Optional: the two Telegram secrets (see [Daily Telegram briefing](#daily-telegram-briefing)), `FRED_API_KEY` plus the *Allow GitHub Actions to create and approve pull requests* setting for [the monthly calendar sync](#the-monthly-calendar-sync), and the [Telegram agent](worker/README.md), a separate Cloudflare Worker with its own four secrets.
 
 ---
 
@@ -1534,7 +1567,9 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 | **The calendar sync proposes; a person merges.** | A wrong FOMC or CPI date would misfire a trigger for a month. The sync gathers, validates and tests, but the change lands only through a reviewed pull request, and the daily run never depends on a website being up. |
 | **SGX half days come from a rule, not a feed.** | No free source lists them, and `exchange_calendars` stops its SGX calendar at 2026 with no half days at all. The rule (the eves of Chinese New Year, Christmas and New Year on trading days, from the SGX rulebook) reproduced every hand-entered date. |
 | **The size guardrail is mostly one stock.** | 45 of the 76 extra big-move days in five years were SNDK, and more were rises than falls: the muting it fixes is chronic high volatility more than sell-offs. It stays, because a 10% day matters to anyone holding the stock. |
-| **The export is groundwork, not a bot.** | `bot_context.json` holds only numbers the site can show with their working. A bot built on it can quote, compare and explain them; it must not forecast with them, and the file says so in its notes. |
+| **The bot quotes; it does not forecast.** | `bot_context.json` holds only numbers the site can show with their working. The agent can quote, compare and explain them, and its rules forbid forecasts, advice and outside facts. A language model can still break a rule, which is why the number check and the code-written footer do not rely on it. |
+| **The number check is a heuristic.** | It catches an invented or calculated decimal or percentage, not a wrong word: "DBS is in an Uptrend" passes it. Whole numbers are not checked, since most are counts and dates. It flags rather than blocks, so a correct answer quoting the question's own figure still goes out. |
+| **Follow-ups carry their own context.** | A stored conversation would need a database. Replying to the bot's message sends that message with the question, which covers the usual follow-up at no cost, and an older thread is simply not remembered. |
 | **Crash windows were chosen after the fact.** | They are the S&P 500's own highs and lows, so they show how a mix behaved in known falls, not in the next one. A holding with no prices at a window's start is left out and the rest rescaled, and every card says so rather than filling the gap with a proxy. |
 | **Rotation is measured in US dollars by default.** | One scale for the whole watchlist makes the quadrants comparable, and it includes the Singapore dollar's move, as a US-dollar investor would see it. The own-market view is one click away and is the factor engine's figure exactly. |
 | **The weights were not tuned to the backtest.** | Five years and 30 correlated assets are a small sample. Optimising the score against it would fit noise and turn a diagnostic into a sales figure. |
@@ -1586,13 +1621,15 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 
 **How do you spot a crowded portfolio?** The first principal component alone is a trap: it is mostly the most volatile holding. I flag "one bet" only when the common driver explains at least 60% of the variance and at least two holdings correlate 0.8 or more with it, and I run it on the sample covariance, because shrinkage would erase the very correlations the check looks for. It names MU and SNDK in a chip portfolio, the two banks among Singapore names, and the miners inside an otherwise diversified mix.
 
-**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 577 tests comparing engines with hand calculations, a published example, closed-form results, an independent NumPy implementation and independent recomputation, including a check that the backtest's last day reproduces the live score for every asset.
+**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 578 tests comparing engines with hand calculations, a published example, closed-form results, an independent NumPy implementation and independent recomputation, including a check that the backtest's last day reproduces the live score for every asset.
 
 **What was the hardest correctness problem?** Data, not formulas. Summing four quarters into a trailing figure is wrong if one quarter is missing, and the provider silently omits them. In V3, earnings timestamps: Yahoo reports them in New York time, so a Singapore release stamped 19:00 in New York is really 08:00 the next morning in Singapore, a different day and before the open; and a midnight stamp means "time unknown", not "before the open". Getting either wrong measures the reaction on the wrong day.
 
 **How do you add notifications without making them a liability?** Make them the last step, give them the secrets alone, and make failure impossible to propagate: missing credentials do nothing, API errors are warnings, the command always exits 0, and the step is `continue-on-error`. With several recipients, one blocked chat cannot stop the others, and chat ids never appear in the log, because GitHub masks the secret as a whole but not its pieces after a split. And never compute the content twice: the briefing runs the site's own engines in Node rather than a Python copy of the scoring.
 
-**What would you do next?** The V4.0 question-answering bot on Telegram, answering only from `data/bot_context.json` so every number it quotes can be checked on the site; implied volatility from free options chains, as the market's own forecast to set beside EWMA; point-in-time fundamentals, so that the Fundamental score could be backtested honestly; a crash replay with rebalancing, set beside buy and hold; peer-relative valuation as the watchlist grows; a proper mean-variance solver with constraints, shown next to the random sample so its sensitivity is visible; and a service worker so the last snapshot works offline.
+**How do you stop a language model from inventing numbers?** By not trusting it to stop itself. It reads a digest built by the same code as the commands, rules forbid arithmetic and outside facts, and then code checks the answer: any decimal or percentage that is not in the digest or the question is listed under the reply. The commands that matter most never touch the model at all.
+
+**What would you do next?** Implied volatility from free options chains, as the market's own forecast to set beside EWMA; point-in-time fundamentals, so that the Fundamental score could be backtested honestly; a crash replay with rebalancing, set beside buy and hold; peer-relative valuation as the watchlist grows; a proper mean-variance solver with constraints, shown next to the random sample so its sensitivity is visible; and a service worker so the last snapshot works offline.
 
 ---
 

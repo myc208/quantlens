@@ -36,10 +36,18 @@ export function sig(value, count = 2) {
   return fixed(value, Math.max(0, count - 1 - magnitude));
 }
 
+// Intl formatters are slow to build, and a Worker has 10 ms of CPU per message: build each once.
+const THOUSANDS = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const clock = (timeZone) => new Intl.DateTimeFormat('en-US', {
+  timeZone, hour: 'numeric', minute: '2-digit', hour12: true, weekday: 'short', day: 'numeric', month: 'short',
+});
+// Built when the Worker starts (startup time is not counted against a message's CPU).
+const CLOCKS = new Map(['America/New_York', 'Asia/Singapore'].map((zone) => [zone, clock(zone)]));
+
 /** A price: thousands separators from 1,000, four decimals below 1, two otherwise. */
 export function price(value) {
   if (!finite(value)) return 'N/A';
-  if (Math.abs(value) >= 1000) return value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (Math.abs(value) >= 1000) return THOUSANDS.format(value);
   return value.toFixed(Math.abs(value) < 1 ? 4 : 2);
 }
 
@@ -71,9 +79,8 @@ export function dayLabel(iso) {
 
 /** An instant on the clock of a time zone: { time: "2:00 PM", weekday: "Wed", day: "Wed 9 Dec" }. */
 export function clockIn(at, timeZone) {
-  const fields = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
-    timeZone, hour: 'numeric', minute: '2-digit', hour12: true, weekday: 'short', day: 'numeric', month: 'short',
-  }).formatToParts(new Date(at)).map((part) => [part.type, part.value]));
+  if (!CLOCKS.has(timeZone)) CLOCKS.set(timeZone, clock(timeZone));
+  const fields = Object.fromEntries(CLOCKS.get(timeZone).formatToParts(new Date(at)).map((part) => [part.type, part.value]));
   return {
     time: `${fields.hour}:${fields.minute} ${fields.dayPeriod.toUpperCase()}`,
     weekday: fields.weekday,

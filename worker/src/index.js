@@ -21,10 +21,14 @@ import { loadContext } from './context.js';
 import { parseCommand, runCommand } from './commands.js';
 import { answerQuestion } from './answer.js';
 
-/** Constant-time string comparison, so the secret cannot be guessed one character at a time. */
+/**
+ * Constant-time string comparison, so the secret cannot be guessed one character at a time.
+ * Surrounding whitespace is dropped on both sides: HTTP strips it from header values, and a
+ * secret pasted into `wrangler secret put` can carry a stray newline.
+ */
 export function sameSecret(given, expected) {
-  const a = new TextEncoder().encode(String(given ?? ''));
-  const b = new TextEncoder().encode(String(expected ?? ''));
+  const a = new TextEncoder().encode(String(given ?? '').trim());
+  const b = new TextEncoder().encode(String(expected ?? '').trim());
   let difference = a.length ^ b.length;
   for (let i = 0; i < Math.max(a.length, b.length); i += 1) difference |= (a[i] ?? 0) ^ (b[i] ?? 0);
   return difference === 0 && b.length > 0;
@@ -51,8 +55,8 @@ export async function respond(message, env, deps = {}) {
       return outcome;
     }
     await sendTyping(env, chatId, { fetchImpl });
-    const outcome = await answerQuestion(message, env, { ...deps, fetchImpl, now });
-    log('question', { outcome });
+    const { outcome, answer, flagged } = await answerQuestion(message, env, { ...deps, fetchImpl, now });
+    log('question', { followUp: Boolean(message.replyTo), answer, flagged, outcome });
     return outcome;
   } catch (error) {
     log('error', { kind: error && error.name ? error.name : 'Error' });
