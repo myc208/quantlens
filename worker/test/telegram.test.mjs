@@ -57,6 +57,12 @@ test('a reply is sent as escaped MarkdownV2, without link previews, replying to 
   });
 });
 
+test('a token stored with a stray newline still makes a valid URL', async () => {
+  const fetchImpl = fakeFetch();
+  await sendLines({ ...ENV, TELEGRAM_BOT_TOKEN: `${TOKEN}\r\n` }, CHAT, ['hi'], { fetchImpl });
+  assert.equal(fetchImpl.calls[0].url, `https://api.telegram.org/bot${TOKEN}/sendMessage`);
+});
+
 test('a long reply goes out as several messages, each under 4,096 characters', async () => {
   const fetchImpl = fakeFetch();
   assert.equal(await sendLines(ENV, CHAT, manyLines(200), { fetchImpl, replyTo: 9 }), 'sent');

@@ -49,7 +49,8 @@ export function readUpdate(update) {
 }
 
 async function call(env, method, payload, fetchImpl) {
-  const response = await fetchImpl(`${API}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+  const token = String(env.TELEGRAM_BOT_TOKEN ?? '').trim();
+  const response = await fetchImpl(`${API}/bot${token}/${method}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),

@@ -60,6 +60,8 @@ test('sameSecret compares whole values', () => {
   assert.equal(sameSecret(undefined, 'abc'), false);
   assert.equal(sameSecret('', ''), false);
   assert.equal(sameSecret(null, undefined), false);
+  assert.equal(sameSecret('abc', 'abc\r\n'), true, 'a pasted secret may end in a newline');
+  assert.equal(sameSecret('', '  \n'), false, 'a blank secret is no secret');
 });
 
 test('an allowed private chat gets its answer, after Telegram has its 200', async () => {
