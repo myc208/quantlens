@@ -9,6 +9,10 @@
  *   2025 tariff shock            19 Feb 2025 → 8 Apr 2025   −18.9%
  *   Autumn 2026 sell-off         6 Oct 2026 → latest close   (ongoing)
  *
+ * An open window (no end date) caps itself (V3.4): once the S&P 500 closes above the window's
+ * opening high, the window ends at the lowest close between that high and the recovery, and
+ * stops changing. Until then it runs to the latest close and is marked ongoing.
+ *
  * Replay, for each window
  *   1. Buy the mix at the close on the first day, at the exact weights, and hold it:
  *      no rebalancing, no fees. Closes are dividend-adjusted.
@@ -50,7 +54,7 @@ export const CRASH_WINDOWS = Object.freeze([
   }),
   Object.freeze({
     id: 'autumn2026', name: 'Autumn 2026 sell-off', short: 'Autumn 2026', from: '2026-10-06', to: null, ongoing: true,
-    context: 'The current fall from the S&P 500\'s high of 6 October 2026. It has not ended, so it is replayed to the latest close and its figures change every day.',
+    context: 'The fall from the S&P 500\'s high of 6 October 2026.',
   }),
 ]);
 
@@ -107,6 +111,35 @@ function seriesOf(asset) {
   return asset.longSeries && Array.isArray(asset.longSeries.dates) && asset.longSeries.dates.length ? asset.longSeries : asset.series;
 }
 
+/**
+ * A window with its end date settled. A fixed window is returned as it is. An open one ends at
+ * the lowest S&P 500 close between its high and the first close above that high, once there is
+ * one (recovered), or runs to the latest close (ongoing).
+ * @returns {{ to:string|null, ongoing:boolean, recovered:string|null }} merged into the window
+ */
+export function resolveWindow(window, benchmark) {
+  if (window.to) return { ...window, ongoing: false, recovered: null };
+  const series = benchmark ? seriesOf(benchmark) : null;
+  const start = series ? indexOnOrBefore(series.dates, window.from) : -1;
+  if (start < 0) return { ...window, to: null, ongoing: true, recovered: null };
+  const peak = series.close[start];
+  let trough = start;
+  for (let i = start + 1; i < series.close.length; i += 1) {
+    if (series.close[i] > peak) {
+      return { ...window, to: series.dates[trough], ongoing: false, recovered: series.dates[i] };
+    }
+    if (series.close[i] < series.close[trough]) trough = i;
+  }
+  return { ...window, to: series.dates[series.dates.length - 1], ongoing: true, recovered: null };
+}
+
+/** The sentence an open window adds to its context: still falling, or recovered and capped. */
+export function windowStatus(window) {
+  if (window.recovered) return ` The S&P 500 closed above that high again on ${longDate(window.recovered)}, so the window ends at its lowest close before then, ${longDate(window.to)}.`;
+  if (window.ongoing) return ' It has not ended, so it is replayed to the latest close and its figures change every day.';
+  return '';
+}
+
 /** Return, maximum drawdown and worst step of a value path that starts at 1. */
 export function pathStatistics(dates, values) {
   let peak = values[0];
@@ -146,7 +179,8 @@ export function replayWindow({ holdings, benchmark = null, baseCurrency, fx, win
   if (!list.length || !(total > 0)) return { ok: false, reason: 'Give at least one holding a weight above zero.' };
   const benchSeries = benchmark ? seriesOf(benchmark) : null;
   const lastDates = [...list.map((entry) => seriesOf(entry.asset).dates.at(-1)), ...(benchSeries ? [benchSeries.dates.at(-1)] : [])];
-  const to = window.to ?? (benchSeries ? benchSeries.dates.at(-1) : lastDates.sort().at(-1));
+  const resolved = resolveWindow(window, benchmark);
+  const to = resolved.to ?? lastDates.sort().at(-1);
   const from = window.from;
   if (!to || to <= from) return { ok: false, reason: `The stored history does not reach past ${longDate(from)}.` };
   const fxReady = Boolean(fx) && ((fx.series && fx.series.dates.length) || (isNum(fx.rate) && fx.rate > 0));
@@ -214,7 +248,7 @@ export function replayWindow({ holdings, benchmark = null, baseCurrency, fx, win
 
   return {
     ok: true,
-    window: { ...window, to },
+    window: { ...resolved, to },
     baseCurrency,
     fxMode: rows.some((row) => row.currency !== baseCurrency) || (bench && benchmark.currency !== baseCurrency) ? (fx.series ? 'history' : 'constant') : 'none',
     fx: fx && (fx.series || isNum(fx.rate)) ? { start: fxOn(fx, from), end: fxOn(fx, to) } : null,
@@ -251,6 +285,7 @@ export function replayMetric(replay, window, baseCurrency) {
   const label = `Crash replay: ${window.name}`;
   if (!replay.ok) return notAvailable({ id, label, unit: 'pct', formula: FORMULA, reason: replay.reason, meta: { window } });
   const end = replay.window.to;
+  const { ongoing } = replay.window;
   const bench = replay.benchmark;
   const fxNote = replay.fxMode === 'history'
     ? ` Prices are converted to ${baseCurrency} at each day's USD/SGD rate (${fmtN(replay.fx.start)} at the start, ${fmtN(replay.fx.end)} at the end), so the currency move is included.`
@@ -262,7 +297,8 @@ export function replayMetric(replay, window, baseCurrency) {
 
   const rawInputs = [
     input('Window start (S&P 500 closing high)', window.from, 'date', 'crashReplayEngine: CRASH_WINDOWS'),
-    input(window.ongoing ? 'Window end (latest close, ongoing)' : 'Window end (S&P 500 closing low)', end, 'date', 'crashReplayEngine: CRASH_WINDOWS'),
+    input(ongoing ? 'Window end (latest close, ongoing)' : 'Window end (S&P 500 closing low)', end, 'date',
+      replay.window.recovered ? `the lowest close before the S&P 500 recovered its high on ${replay.window.recovered}` : 'crashReplayEngine: CRASH_WINDOWS'),
   ];
   for (const row of replay.rows) {
     rawInputs.push(input(`${row.ticker} weight in the replay`, row.weight, 'fraction', replay.excluded.length ? `your allocation, scaled ×${fmtN(replay.scale, 2)}` : 'your allocation'));
@@ -278,7 +314,7 @@ export function replayMetric(replay, window, baseCurrency) {
   }
 
   const steps = [
-    step('Window: from the S&P 500\'s closing high to its closing low', `${window.from} → ${end}${window.ongoing ? ' (latest close: the fall is ongoing)' : ''}`, `${replay.dates.length - 1} trading dates replayed`),
+    step('Window: from the S&P 500\'s closing high to its closing low', `${window.from} → ${end}${ongoing ? ' (latest close: the fall is ongoing)' : replay.window.recovered ? ` (capped: recovered on ${replay.window.recovered})` : ''}`, `${replay.dates.length - 1} trading dates replayed`),
   ];
   if (replay.excluded.length) {
     steps.push(step('Leave out holdings with no price at the start, and scale the rest to 100%',
@@ -312,14 +348,14 @@ export function replayMetric(replay, window, baseCurrency) {
     rawInputs,
     steps,
     interpretation: interpretation(
-      `Bought at the close on ${longDate(window.from)} and held to ${window.ongoing ? `the latest close (${longDate(end)})` : longDate(end)}, this mix returned ${signed(replay.totalReturn)} in ${baseCurrency}${comparison}. At its worst it was ${fmtPct(-replay.maxDrawdown, 1)} below its high${replay.worstDay ? `, and its worst day was ${signed(replay.worstDay.value)} on ${longDate(replay.worstDay.date)}` : ''}.${rescale ? ` ${rescale}` : ''}`,
+      `Bought at the close on ${longDate(window.from)} and held to ${ongoing ? `the latest close (${longDate(end)})` : longDate(end)}, this mix returned ${signed(replay.totalReturn)} in ${baseCurrency}${comparison}. At its worst it was ${fmtPct(-replay.maxDrawdown, 1)} below its high${replay.worstDay ? `, and its worst day was ${signed(replay.worstDay.value)} on ${longDate(replay.worstDay.date)}` : ''}.${rescale ? ` ${rescale}` : ''}`,
       [
         threshold(`${points(REPLAY_BANDS.better)} or more better than the S&P 500`, 'Held up better than the market', 'healthy'),
         threshold(`Within ${points(REPLAY_BANDS.better)}`, 'Fell about as much as the market', 'neutral'),
         threshold(`${points(REPLAY_BANDS.worse)} to ${points(REPLAY_BANDS.muchWorse)} worse`, 'Fell more than the market', 'caution'),
         threshold(`More than ${points(REPLAY_BANDS.muchWorse)} worse`, 'Fell much more than the market', 'risky'),
       ],
-      `${window.context} Buy and hold at today's weights, with no rebalancing, fees or taxes; closes are dividend-adjusted. The windows were picked after the fact from the S&P 500's own highs and lows, so this shows how the mix behaved in those falls, not how it will behave in the next one. Markets close at different times: a holding that did not trade on a date keeps its last close, which can move the worst day by a session.${fxNote}`,
+      `${window.context}${windowStatus(replay.window)} Buy and hold at today's weights, with no rebalancing, fees or taxes; closes are dividend-adjusted. The windows were picked after the fact from the S&P 500's own highs and lows, so this shows how the mix behaved in those falls, not how it will behave in the next one. Markets close at different times: a holding that did not trade on a date keeps its last close, which can move the worst day by a session.${fxNote}`,
     ),
     dependsOn: [],
   });

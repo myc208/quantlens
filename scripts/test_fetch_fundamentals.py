@@ -21,8 +21,10 @@ import math
 import random
 import shutil
 import sys
+import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.error
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -1662,6 +1664,27 @@ class RiskFirstBriefing(unittest.TestCase):
         block = self.text(signals=rows, shifts=shifts).split("⚡ Triggers today\n")[1].split("\n\n")[0].split("\n")
         self.assertEqual([line.split(":")[0] for line in block if line.startswith("•")], ["• Big moves", "• Trend flips (held two closes)", "• Tone"])
 
+    # --- trigger records, shared with data/bot_context.json (V3.4) -----------------------
+
+    def test_triggers_are_records_and_the_message_is_rendered_from_them(self):
+        rows = self.signals() + [self.row("AMD", dailyReturn=-0.132, zScore=-2.09,
+                                          trendHistory=self.states(("Pullback", True, False), ("Downtrend", False, False), ("Downtrend", False, False)))]
+        snapshot, previous = self.snapshot(), self.previous()
+        records = ff.collect_triggers(snapshot, rows, None, previous, self.WEEKDAY, weekend=False)
+        kinds = [record["kind"] for record in records]
+        self.assertEqual(kinds, sorted(kinds, key=["macro", "vix", "move", "flip", "earnings", "tone"].index))
+        moves = {record["ticker"]: record for record in records if record["kind"] == "move"}
+        self.assertEqual(moves["MU"]["rule"], "both")                        # −13.9% and −2.63σ
+        self.assertEqual(moves["VOO"]["rule"], "sigma")                      # an ETF: 3.4% is under its 5%
+        self.assertEqual(moves["AMD"]["rule"], "size")
+        self.assertEqual(moves["AMD"]["threshold"], 0.10)
+        flip = next(record for record in records if record["kind"] == "flip")
+        self.assertEqual((flip["ticker"], flip["from"], flip["to"], flip["crossed200"]), ("AMD", "Pullback", "Downtrend", True))
+        lines, seen = ff.render_triggers(records, ff.BriefingFormat(False))
+        self.assertEqual((lines, seen), ff.briefing_triggers(snapshot, rows, None, previous, self.WEEKDAY, False, ff.BriefingFormat(False)))
+        self.assertEqual(seen["flips"], {"AMD"})
+        self.assertEqual(json_roundtrip(records), records)                   # plain data, ready for JSON
+
     def test_triggered_moves_are_not_repeated_as_bucket_movers(self):
         text = self.text()
         movers = [line for line in text.split("\n") if line.startswith("Movers:")]
@@ -1905,6 +1928,95 @@ class EarlyCloses(unittest.TestCase):
         self.assertEqual(ff.closure_text(sg, date_first=True), "Thu 24 Dec: SGX closes 12:00 PM SGT")
         self.assertEqual(ff.closure_text({**sg, "market": "US"}), "US closes 1:00 PM ET Thu 24 Dec")
         self.assertEqual(ff.macro_label(sg), "SGX closes 12:00 PM SGT (Christmas Eve)")
+
+
+def json_roundtrip(value):
+    return json.loads(json.dumps(value))
+
+
+class BotContext(unittest.TestCase):
+    """data/bot_context.json (V3.4): the engines' summary plus the briefing's triggers, compact."""
+
+    @staticmethod
+    def cell_asset(ticker: str) -> dict:
+        cells = {key: {"v": 1.0} for key in ff.BOT_CONTEXT_CELLS}
+        cells["shock"] = {"ret": -0.01, "z": -0.5, "date": "2026-11-20"}
+        return {"ticker": ticker, "name": ticker, **cells}
+
+    def context(self, tickers=("AAA", "BBB")) -> dict:
+        engine = {"regime": {"state": "normal", "asOf": "2026-11-20"}, "rotation": {"groups": []},
+                  "assets": [self.cell_asset(ticker) for ticker in tickers]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "snapshot.json"
+            path.write_text(json.dumps({"generatedAt": "2026-11-21T22:00:00Z", "assets": [{"ticker": ticker} for ticker in tickers]}), encoding="utf-8")
+            return ff.build_bot_context(path, None, NOW, signals=[], engine=engine)
+
+    def test_a_built_context_meets_its_contract(self):
+        context = self.context()
+        self.assertEqual(list(context), ["schema", "asOf", "builtAt", "source", "notes", "units", "regime", "events", "triggers", "rotation", "assets"])
+        self.assertEqual(ff.validate_bot_context(context, {"generatedAt": "2026-11-21T22:00:00Z", "assets": [{"ticker": "AAA"}, {"ticker": "BBB"}]}), [])
+        self.assertEqual(context["builtAt"], "2026-11-16T12:00:00Z")
+
+    def test_the_contract_catches_what_a_bot_must_never_see(self):
+        def errors(change, snapshot=None):
+            context = self.context()
+            change(context)
+            return ff.validate_bot_context(context, snapshot)
+        self.assertTrue(errors(lambda c: c["regime"].update(history={"dates": []})))                       # no history
+        self.assertTrue(errors(lambda c: c["assets"][0].update(beta=None)))                                # a value or a reason
+        self.assertTrue(errors(lambda c: c["assets"][0].update(beta={"na": " "})))                         # an empty reason
+        self.assertTrue(errors(lambda c: c["assets"][0].update(closes=list(range(250)))))                  # no candle arrays
+        self.assertTrue(errors(lambda c: c["notes"].append("x" * 60_000)))                                 # the size limit
+        self.assertTrue(errors(lambda c: c["triggers"].append({"kind": "rumour"})))
+        self.assertTrue(errors(lambda c: None, {"generatedAt": "2026-11-20T22:00:00Z", "assets": [{"ticker": "AAA"}, {"ticker": "BBB"}]}))   # stale
+        self.assertTrue(errors(lambda c: None, {"generatedAt": "2026-11-21T22:00:00Z", "assets": [{"ticker": "BBB"}, {"ticker": "AAA"}]}))   # order
+        self.assertEqual(errors(lambda c: c["assets"][0].update(beta={"na": "BTC-USD is its own benchmark."})), [])
+
+    def test_floats_are_rounded_and_the_file_is_compact(self):
+        context = self.context()
+        context["assets"][0]["beta"] = {"v": 1.2345678912}
+        rounded = ff._rounded(context)
+        self.assertEqual(rounded["assets"][0]["beta"], {"v": 1.23457})
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bot_context.json"
+            size = ff.write_bot_context(rounded, path)
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(size, len(text.encode("utf-8")))
+            self.assertNotIn("\n ", text)                                     # one compact line
+            self.assertEqual(json.loads(text), rounded)
+
+    def test_a_failed_build_writes_nothing_and_exits_1(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "bot_context.json"
+            settings = argparse.Namespace(output=Path(folder) / "missing.json", previous=None)
+            with mock.patch.object(ff, "BOT_CONTEXT_PATH", target), self.assertLogs(ff.LOG, level="WARNING"):
+                self.assertEqual(ff.run_bot_context(settings), 1)
+            self.assertFalse(target.exists())
+
+    @unittest.skipIf(shutil.which("node") is None, "Node.js is not installed")
+    def test_the_real_snapshot_through_the_sites_engines(self):
+        snapshot = ff.load_json(SNAPSHOT_PATH)
+        signals = ff.compute_signals(SNAPSHOT_PATH)
+        context = ff.build_bot_context(SNAPSHOT_PATH, None, NOW, signals=signals)
+        self.assertEqual(ff.validate_bot_context(context, snapshot), [])
+        size = len(json.dumps(context, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self.assertLess(size, ff.BOT_CONTEXT_MAX_BYTES)
+        by_ticker = {asset["ticker"]: asset for asset in context["assets"]}
+        for row in signals:                                                  # the same engines, the same answers
+            self.assertEqual(by_ticker[row["ticker"]]["trend"], {"v": row["trend"]}, row["ticker"])
+        self.assertNotIn("history", context["regime"])
+        self.assertRegex(by_ticker["BTC-USD"]["rs1m"]["na"], "relative strength is 0")
+        self.assertEqual(context["triggers"], json_roundtrip(ff._rounded(ff.collect_triggers(snapshot, signals, None, None, NOW, ff.is_weekend_run(NOW)))))
+        self.assertTrue(all(event["date"] >= "2026-11-16" for event in context["events"]))
+        self.assertEqual(len(context["rotation"]["groups"]), 11)
+
+    def test_the_committed_context_meets_its_contract(self):
+        if not ff.BOT_CONTEXT_PATH.exists():
+            self.skipTest("no data/bot_context.json committed yet")
+        context = ff.load_json(ff.BOT_CONTEXT_PATH)
+        snapshot = ff.load_json(SNAPSHOT_PATH)
+        # A failed export step leaves yesterday's file: still valid, just not this snapshot's.
+        self.assertEqual(ff.validate_bot_context(context, snapshot if context["asOf"] == snapshot["generatedAt"] else None), [])
 
 
 if __name__ == "__main__":

@@ -10,7 +10,9 @@
 
 > QuantLens is an educational tool. Its trend regimes, scores, position sizes, risk figures and portfolio statistics come from fixed, published rules so that they can be checked. They describe the past, do not predict returns, and are not financial advice.
 
-**What V3.3 adds:** the honest consequence of the backtest. A five-year test of the Technical score and three textbook price-only signals, split by VIX regime, found no predictive edge on this watchlist, so **BUY / HOLD / SELL, the Composite score and Confidence are gone.** Each asset now shows its **trend regime** (Uptrend, Extended, Pullback, Recovering or Downtrend) beside what followed each regime, overall and within normal, elevated and stressed markets, and position sizing is pure risk control. The Portfolio sandbox **replays your weights through four S&P 500 sell-offs** (2022, August 2024, the 2025 tariff shock and autumn 2026) against the index in your currency; a new **Rotation** tab plots 1-month against 3-month relative strength for the 26 tradable assets and 11 groups; and the daily candle cutoff knows the US half days. No new requests.
+**What V3.4 adds:** less hand upkeep and sharper alerts. A monthly workflow refreshes the macro calendar from the Fed's FOMC page, FRED's CPI dates, `exchange_calendars` and data.gov.sg, and proposes the result as a pull request after both test gates; SGX half days (12:00 noon on the eves of Chinese New Year, Christmas and New Year) end the Singapore session early, like US half days. The briefing's big-move trigger also fires on a 10% day (15% crypto, 5% ETFs), so a crash cannot hide behind a sell-off's inflated volatility, and a new trigger reports trend flips across the 200-day average or the 20/50-day EMA cross once they have held for a second close. The ongoing crash replay caps itself when the S&P 500 recovers. And every run now publishes `data/bot_context.json`, a 29 KB summary of the snapshot from the site's own engines and trigger rules, the groundwork for a question-answering bot. No new requests in the daily run.
+
+**V3.3 added** the honest consequence of the backtest. A five-year test of the Technical score and three textbook price-only signals, split by VIX regime, found no predictive edge on this watchlist, so **BUY / HOLD / SELL, the Composite score and Confidence are gone.** Each asset now shows its **trend regime** (Uptrend, Extended, Pullback, Recovering or Downtrend) beside what followed each regime, overall and within normal, elevated and stressed markets, and position sizing is pure risk control. The Portfolio sandbox **replays your weights through four S&P 500 sell-offs** (2022, August 2024, the 2025 tariff shock and autumn 2026) against the index in your currency; a new **Rotation** tab plots 1-month against 3-month relative strength for the 26 tradable assets and 11 groups; and the daily candle cutoff knows the US half days. No new requests.
 
 **V3.2 added** a risk-first Telegram briefing (the regime first; a ⚡ block that appears only when something happened, with the Singapore time of any FOMC or CPI release within 48 hours; tradable assets in US / Global, SGX and Crypto buckets; the next 30 days; a one-line status) with a week-ahead edition at weekends; and a hand-kept macro calendar of FOMC decisions, CPI releases and NYSE and SGX holidays, shown on the site and used to make trading-day counts exact.
 
@@ -43,16 +45,17 @@
 17. [Prophet forecasting and its limits](#prophet-forecasting-and-its-limits)
 18. [CI/CD and the testing gates](#cicd-and-the-testing-gates)
 19. [Daily Telegram briefing](#daily-telegram-briefing)
-20. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
-21. [The Derivation Tracer](#the-derivation-tracer)
-22. [The mathematics](#the-mathematics)
-23. [Numerical safety](#numerical-safety)
-24. [Testing](#testing)
-25. [Accessibility and responsive design](#accessibility-and-responsive-design)
-26. [Deployment](#deployment)
-27. [Changing the watchlist](#changing-the-watchlist)
-28. [Design decisions and known limitations](#design-decisions-and-known-limitations)
-29. [Interview talking points](#interview-talking-points)
+20. [Agent-ready export](#agent-ready-export)
+21. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
+22. [The Derivation Tracer](#the-derivation-tracer)
+23. [The mathematics](#the-mathematics)
+24. [Numerical safety](#numerical-safety)
+25. [Testing](#testing)
+26. [Accessibility and responsive design](#accessibility-and-responsive-design)
+27. [Deployment](#deployment)
+28. [Changing the watchlist](#changing-the-watchlist)
+29. [Design decisions and known limitations](#design-decisions-and-known-limitations)
+30. [Interview talking points](#interview-talking-points)
 
 ---
 
@@ -79,6 +82,7 @@
 | **Risk sandbox** | Change account size, risk per trade, stop distance and position cap, and watch the position and a Monte Carlo fan respond. The fan resamples the asset's real days at today's volatility, and warns when an earnings release falls inside it. |
 | **Telemetry bar** | Live crypto ticks, the market regime, USD/SGD, the US and Singapore 10-year yields and the age of the daily data, each labelled with its source and fallback state. |
 | **Daily briefing** | Optional. After each scheduled refresh, a short Telegram message to one chat or several: the market regime, a ⚡ block only when something happened, each bucket's trend-regime tally with its Uptrend and Downtrend names by 3-month relative strength, the next 30 days, and whether the run passed its checks. |
+| **Agent-ready export** | `data/bot_context.json` on every run: each asset's trend regime, scores, relative strength, beta, EWMA volatility, latest move in σ, spread and Amihud, the regime, the next 30 days and the day's triggers, under 50 KB, every number from the site's engines and every gap with its reason. |
 
 The watchlist (30 assets):
 
@@ -149,6 +153,7 @@ flowchart LR
     GATE -->|"pass: commit"| SNAP[("data/market_snapshot.json")]
     GATE -->|"fail"| KEEP["nothing committed, nothing deployed"]
     SNAP --> SIG["scripts/signals.mjs: the site's engines in Node"]
+    SNAP --> BC["scripts/bot_context.mjs: data/bot_context.json"]
     GATE -.->|"status, pass or fail"| TG["--notify: daily briefing"]
     SIG --> TG
   end
@@ -191,14 +196,21 @@ flowchart LR
 ```
 .github/workflows/update-market-data.yml   refresh, two test gates, deploy to Pages, Telegram briefing
 scripts/watchlist.json                     the 30 assets to track
-scripts/macro_calendar.json                FOMC decisions and minutes, US CPI releases, NYSE and SGX holidays (kept by hand)
+.github/workflows/sync-macro-calendar.yml  monthly: refresh the macro calendar, run both gates, open a pull request
+scripts/macro_calendar.json                FOMC decisions and minutes, US CPI releases, NYSE and SGX holidays and half days
+scripts/sync_macro_calendar.py             the monthly calendar sync (Fed page, FRED, exchange_calendars, data.gov.sg)
 scripts/fetch_fundamentals.py              prices, history, dividends, events, statements, news, yields,
-                                           forecasts -> validated JSON; --notify sends the Telegram briefing
+                                           forecasts -> validated JSON; --notify sends the Telegram briefing;
+                                           --bot-context writes data/bot_context.json
 scripts/signals.mjs                        runs the site's engines in Node.js for the briefing's signals
-scripts/test_fetch_fundamentals.py         158 unit tests for the pipeline (Gate 1)
+scripts/bot_context.mjs                    runs the site's engines in Node.js for the agent-ready export
+scripts/test_fetch_fundamentals.py         176 unit tests for the pipeline (Gate 1)
+scripts/test_sync_macro_calendar.py        25 unit tests for the calendar sync, offline (Gate 1)
 scripts/run_browser_tests.py               headless Chrome/Edge runner for the test page (Gate 2)
 scripts/requirements.txt                   yfinance, vaderSentiment, prophet (pipeline only)
+scripts/requirements-calendar.txt          exchange_calendars, pinned (the monthly sync only)
 data/market_snapshot.json                  schema v3 snapshot (committed)
+data/bot_context.json                      compact agent-ready summary of the snapshot (committed with it)
 index.html
 styles/    tokens.css  layout.css  components.css  guided.css
 src/main.js                                composition root: URL sync, caches, worker jobs, view switching
@@ -213,7 +225,7 @@ src/engines/   technicalEngine.js  trendRegimeEngine.js  fundamentalEngine.js  c
 src/ui/        telemetryBar.js  appTabs.js  commandPalette.js  screenerPanel.js
                comparisonMatrix.js  leaderboardView.js  portfolioSandbox.js  rotationView.js
                derivationDrawer.js  riskSandboxModal.js  regimeBanner.js
-tests/engines.test.html                    369 browser-run tests in 52 suites, zero dependencies
+tests/engines.test.html                    376 browser-run tests in 55 suites, zero dependencies
 ```
 
 ---
@@ -399,7 +411,7 @@ A full run for the 30-asset watchlist takes about two minutes, most of it networ
 | Concern | Handling |
 |---|---|
 | **`NaN` and `Infinity`** | `clean_number` converts anything that is not a finite number to `null`. The JSON encoder runs with `allow_nan=False` as a backstop. |
-| **In-progress sessions** | A candle dated today is kept only after that market's close, in the exchange's own time zone (New York 16:00, or 13:00 on the US half days in the macro calendar; Singapore 17:00; London 16:30; plus 20 minutes). The VIX closes follow the same rule; the current UTC day is always dropped for crypto. |
+| **In-progress sessions** | A candle dated today is kept only after that market's close, in the exchange's own time zone (New York 16:00, or 13:00 on the US half days in the macro calendar; Singapore 17:00, or 12:00 on SGX half days; London 16:30; plus 20 minutes). The VIX closes follow the same rule; the current UTC day is always dropped for crypto. |
 | **Assets without accounts** | ETFs, indices and crypto get no statements request at all (fewer calls, nothing to misread). Their fundamentals are `null`, except crypto's market cap and an ETF's trailing distribution yield, kept for context. |
 | **Implausible Price-to-Book** | If Yahoo's P/B differs from market cap ÷ book equity by more than a factor of two (same currency only), the computed value is used and logged. Yahoo has reported Berkshire Hathaway B at 0.001; the check corrects it to about 1.6. |
 | **Bad ticks** | High and low are repaired so that `high ≥ max(open, close)` and `low ≤ min(open, close)`; rows with missing prices are dropped. |
@@ -627,7 +639,7 @@ What the 21 November 2026 snapshot shows:
 
 ### The macro calendar: FOMC, CPI and market holidays
 
-Company events are not the only scheduled gaps. `scripts/macro_calendar.json` holds the Federal Reserve's rate decisions and minutes, the US CPI releases, and the weekday closures of the NYSE and SGX, transcribed from the Fed, BLS, NYSE and Ministry of Manpower pages it links to. It is kept by hand, like the watchlist, and copied into an optional `macro.calendar` block of the snapshot on every run (the last 30 days and everything ahead).
+Company events are not the only scheduled gaps. `scripts/macro_calendar.json` holds the Federal Reserve's rate decisions and minutes, the US CPI releases, and the weekday closures of the NYSE and SGX, from the Fed, BLS (through FRED), NYSE and Ministry of Manpower sources it links to. Since V3.4 a monthly workflow refreshes it and proposes the result as a pull request (see [the monthly sync](#the-monthly-calendar-sync)); the daily run only reads it, copying it into an optional `macro.calendar` block of the snapshot (the last 30 days and everything ahead).
 
 ```jsonc
 { "type": "fomc-decision", "date": "2026-12-09", "at": "2026-12-09T14:00:00-05:00", "meeting": "2026-12-08/09", "projections": true }
@@ -641,8 +653,26 @@ Company events are not the only scheduled gaps. `scripts/macro_calendar.json` ho
 - **It never fails a run.** An unreadable or invalid file gives an unavailable block and a warning. Coverage is checked against the file's own `updated` date, not today's, so the tests do not start failing as time passes; when the calendar is within 60 days of running out, the step summary and the explanation view say so.
 - **On the site:** a **Next macro** pill in the top bar (amber within 48 hours) opens the next FOMC decision or CPI release with its time in New York and Singapore, the US trading days until then and what else is due in the next 7 days. The Events section repeats it for each compared asset and says when it falls inside the 21-day sizing horizon, and the risk sandbox notes when the first simulated horizon contains it.
 - **Holidays make trading-day counts exact.** Thanksgiving week has four US sessions, not five, which matters for "earnings within 5 trading days".
-- **Half days end the US session early.** The `market-early-close` entries (the day after Thanksgiving, Christmas Eve) move the US close to 13:00 New York, so a half-day candle is kept from 13:20 rather than thrown away until the next run.
+- **Half days end the session early.** The `market-early-close` entries move the US close to 13:00 New York (the day after Thanksgiving, Christmas Eve) and, since V3.4, the SGX close to 12:00 noon Singapore (the eves of Chinese New Year, Christmas and New Year when they fall on a trading day: 24 and 31 December 2026, 5 February 2027, 24 and 31 December 2027). Each market gets only its own half days, so a half-day candle is kept from 13:20 New York or 12:20 Singapore rather than thrown away until the next run, and validation checks each market's half-day time.
 - Context only, like the regime: it changes no score, trend regime or position size.
+
+### The monthly calendar sync
+
+`scripts/sync_macro_calendar.py`, run on the 1st of each month by `.github/workflows/sync-macro-calendar.yml`:
+
+| Part | Source | If the source fails |
+|---|---|---|
+| FOMC decisions, strategy meetings, minutes | The Fed's FOMC calendar page: a `*` marks projections, "Strategy Meeting" means no decision, "Released …" gives past minutes; later minutes are a date already confirmed in the file, or decision + 21 days marked `derived`; the page's note on next year's first meeting is read too | the existing entries stay |
+| CPI releases | FRED's release dates for release 10, at 8:30 a.m. New York, each covering the month before (a recorded period is kept, for a delayed release). Needs the `FRED_API_KEY` repository secret; the BLS site refuses scripted requests | the existing entries stay, and the pull request says why |
+| US closures and half days | `exchange_calendars` (XNYS), pinned | the existing entries stay |
+| SG closures | data.gov.sg, the Ministry of Manpower's gazetted holidays, with a back-off when it rate-limits | the existing entries stay |
+| SGX half days | by rule from the SG holidays: the eves above, when they are weekdays and not holidays | with the SG holidays |
+
+- **The window** runs from the first day of last month (so the 30-day look-back is always covered) to 18 months ahead; **coverage ends where the shortest source does** (today: 31 December 2027, because the Fed, FRED and MOM have published through 2027), and it keeps its old start when a source failed.
+- **Nothing unchecked is proposed.** The merged file must pass the pipeline's own calendar validation, or nothing is written and the job fails. Otherwise the workflow runs Gate 1 and Gate 2 and opens (or updates) one pull request from `automation/macro-calendar`, whose description lists every added, removed and changed date by source. A month in which nothing changes from today on opens no pull request.
+- **The file stays readable.** The writer reproduces the committed layout byte for byte, one event per line in a fixed order, so a pull request shows one line per change.
+- **Verified against the hand-kept file.** A live dry run on 22 November 2026 (the Fed page, data.gov.sg and `exchange_calendars`) reproduced the calendar with zero changes, including every SGX half day and the October 2027 strategy meeting.
+- **One-time setup:** add the `FRED_API_KEY` secret (free from FRED), and tick *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*. A pull request opened with the workflow's token does not start the Test workflow by itself; both gates have already run in the sync job, and closing and reopening the pull request runs them again.
 
 Where it appears: an **Events** section in the comparison, a **gap-risk** row in sizing, a warning on the projection when earnings fall inside its 30 days, a banner above the Monte Carlo fan when a release falls inside the simulated horizon, an `Earnings 23d` chip on the leaderboard, and an earnings section in the Telegram briefing.
 
@@ -839,6 +869,8 @@ An example in SGD, `SNDK` 20% · `MU` 20% · `D05.SI` 30% · `BTC-USD` 10% · `V
 
 In SGD the S&P 500 lost 20.4% in 2022 rather than 25.4%: the US dollar rose from S$1.348 to S$1.439 over the window. The replays are small (eight holdings, four windows, a few hundred dates), so they run on the main thread, cached on the weights and the currency; they ignore the time range. Pro mode adds a table of each holding's contribution in each window.
 
+**The ongoing window caps itself** (V3.4). Until the S&P 500 closes above its 6 October 2026 high, the autumn 2026 window runs to the latest close and is marked ongoing. From the first close above that high, it ends at the lowest close in between, stops changing, and its card and trace say on which day the index recovered. The same rule applies to any window with no fixed end.
+
 The windows were picked after the fact from the S&P 500's own highs and lows. The replay shows how this mix behaved in those falls, not how it will behave in the next one, and every trace says so.
 
 ## Sector rotation
@@ -964,7 +996,7 @@ It earns its place as a teaching device: a visible, quantified example of why a 
 
 ## CI/CD and the testing gates
 
-One workflow, three jobs: `.github/workflows/update-market-data.yml`.
+The daily workflow, `.github/workflows/update-market-data.yml`, has three jobs; a second, monthly workflow keeps the macro calendar current (see [the monthly sync](#the-monthly-calendar-sync)).
 
 ```mermaid
 flowchart LR
@@ -978,7 +1010,7 @@ flowchart LR
   D --> REF
   P --> TEST["test"]
   PR --> TEST
-  REF --> V["validate snapshot"] --> G1["Gate 1: 158 pipeline unit tests"] --> G2["Gate 2: 369 browser tests in headless Chrome"] --> C["commit snapshot"]
+  REF --> V["validate snapshot"] --> BCX["agent context, never blocks"] --> G1["Gate 1: 201 pipeline unit tests"] --> G2["Gate 2: 376 browser tests in headless Chrome"] --> C["commit snapshot and context"]
   C --> TG["Telegram briefing, always runs, never fails the job"]
   V -.->|"any failure"| TG
   TEST --> V2["validate, Gate 1, Gate 2"]
@@ -988,11 +1020,11 @@ flowchart LR
 
 | Job | Runs on | What it does |
 |---|---|---|
-| `refresh` | schedule, manual dispatch | Fetch → validate the schema → **Gate 1** → **Gate 2 against the new data** → commit → Telegram briefing. If any check fails, nothing is committed; the briefing still runs and reports the failure. |
+| `refresh` | schedule, manual dispatch | Fetch → validate the schema → build `data/bot_context.json` (allowed to fail) → **Gate 1** → **Gate 2 against the new data** → commit → Telegram briefing. If any check fails, nothing is committed; the briefing still runs and reports the failure. |
 | `test` | every push and pull request | Validate the committed snapshot → Gate 1 → Gate 2. |
 | `deploy` | after a successful `refresh` or `test`, never on a pull request | Publish the static site to GitHub Pages. |
 
-**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 158 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), US half-day cutoffs (a 1:15 p.m. candle dropped, a 1:25 p.m. one kept), snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, 5 trading days against 6, exactly 48 hours), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, the trend-regime tally and the Uptrend and Downtrend lines with no BUY, HOLD or SELL left in any edition, and a failed step moved to the top.
+**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 201 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), US and SGX half-day cutoffs (a 1:15 p.m. New York candle dropped and a 1:25 p.m. one kept; 12:15 against 12:25 in Singapore), the monthly calendar sync against offline fixtures of every source (a full sync must reproduce the committed file, a failed source keeps its entries, the FRED key never reaches a message), the agent-ready export's contract, snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, a 10% day against 9.99%, 5 trading days against 6, exactly 48 hours, a trend flip after one close against two), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, the trend-regime tally and the Uptrend and Downtrend lines with no BUY, HOLD or SELL left in any edition, and a failed step moved to the top.
 
 **Gate 2: the browser suite, headless** (`python scripts/run_browser_tests.py --min-tests 100`). The runner starts a local web server, launches headless Chrome or Edge at `tests/engines.test.html`, and waits for the page to report its results to a one-time same-origin URL. It uses only the Python standard library.
 
@@ -1047,14 +1079,15 @@ QuantLens daily briefing · Fri 20 Nov 2026
 🔴 Market regime: stressed · VIX curve inverted (VIX 35.9 above VIX3M 30.9), 4th session in a row
 
 ⚡ Triggers today
-• Moves beyond 2.5σ: CSPX.L −3.4% (−3.4σ) · VOO −3.4% (−2.6σ) · MU −13.9% (−2.6σ)
-• Tone: AMD neutral → negative (+0.04 → −0.29)
+• Big moves: MU −13.9% (−2.6σ) · CSPX.L −3.4% (−3.4σ) · AMD −13.2% (−2.1σ, beyond 10%) · VOO −3.4% (−2.6σ)
+• Trend flips (held two closes): J69U.SI Uptrend → Recovering · TSLA Uptrend → Recovering · VOO Pullback → Downtrend
+• Tone: SNDK positive → negative (+0.21 → −0.20)
    (its newest headline)
 
 US / Global · 5 Uptrend · 1 Recovering · 11 Downtrend
 Uptrend (3M vs S&P 500): WMT +37.0% · BRK-B +27.7% · LLY +19.3% · 2 more
-Downtrend (3M vs S&P 500): SNDK −55.9% · CCJ −37.2% · MU −31.7% · 8 more
-Movers: TSLA −7.6% (−2.5σ) · SNDK −16.1% (−2.4σ)
+Downtrend (3M vs S&P 500): SNDK −49.8% · CCJ −37.2% · MU −31.7% · 8 more
+Movers: TSLA −7.6% (−2.5σ) · ORCL −8.5% (−2.1σ)
 
 SGX · 1 Uptrend · 1 Pullback · 2 Recovering · 2 Downtrend
 Uptrend (3M vs STI): C6L.SI +15.2%
@@ -1119,11 +1152,16 @@ Trend regimes describe the past; they do not predict returns. Not financial advi
 |---|---|---|
 | **Macro** | an FOMC rate decision or a CPI release is within 48 hours (inclusive at exactly 48 h). Minutes and the meeting without a decision are listed ahead, never triggers | — |
 | **VIX curve** | the first session of an inversion (`invertedStreak` 1), or the first session out of one | once per session: a weekend does not repeat Friday's |
-| **Moves** | a tradable asset's latest session moved more than 2.5σ, measured as `ln(Cₜ ÷ Cₜ₋₁) ÷ σₜ₋₁` against the EWMA volatility known the day before. That is exactly the bootstrap's filtered residual, so the briefing and the simulator agree. Up to five, largest first | once per new session, by comparing with the previous snapshot; on a US holiday US names simply have no new session |
+| **Big moves** | a tradable asset's latest session moved more than 2.5σ, measured as `ln(Cₜ ÷ Cₜ₋₁) ÷ σₜ₋₁` against the EWMA volatility known the day before (exactly the bootstrap's filtered residual, so the briefing and the simulator agree), **or** by at least 10% for a stock, 15% for crypto or 5% for an ETF, whatever σ says. A move caught only by its size is marked "beyond 10%". Up to five, ranked by how far past its trigger each is | once per new session, by comparing with the previous snapshot; on a US holiday US names simply have no new session |
+| **Trend flips** | a tradable asset crossed its 200-day average or its 20/50-day EMA cross, and the new state held for a second close. RSI alone (Uptrend ↔ Extended) is never a flip. 200-day crossings first, up to four | it fires on the confirming session only, which is a new session once |
 | **Earnings** | a tradable stock reports within 5 trading days, counted with the market's holidays from the macro calendar (weekdays only; the weekend edition lists the week ahead instead) | a countdown, by design |
 | **Tone** | a tradable asset's headline tone flipped sign or moved by 0.25, fresh news only, at most three, each with its headline | once per snapshot |
 
 Measured over 2023 to 2026, a move beyond 2.5σ happened on about 42% of weekdays, so on most days the block is not there at all.
+
+**Why a size rule as well (V3.4).** In a long sell-off the EWMA volatility inflates, and a crash can land under 2.5σ. Over five years of the watchlist, the size rule adds about 15 asset-days a year (10% is about the 99.3rd percentile of daily stock moves, 15% the 99.5th of crypto; ETFs never move 10%, so they get 5%). It would have caught AMD's −13.2% on 20 November 2026 (−2.1σ), and SNDK's −15.0% (−1.8σ) and MU's −10.0% (−1.4σ) on 10 April 2025, the day after the tariff pause. Honestly, it is mostly about SNDK's chronic volatility (45 of the 76 extra asset-days) and more often a rise than a fall.
+
+**Why trend flips wait for a second close.** Across the watchlist, the 200-day or EMA state changes about 13 times per asset-year, and 38% of those changes reverse within five sessions. Waiting one close removes the one-day blips and leaves about one flip a weekday across the 26 tradable assets. A flip confirmed on a day the job did not run is not reported later.
 
 **The body:**
 
@@ -1140,7 +1178,7 @@ The message is shortened from the bottom of the body if it ever approached Teleg
 
 ### How it is built
 
-- **One source of truth for the signals.** The trend regimes, the Technical and Fundamental scores, the moves in σ, 3-month relative strength and the earnings and ex-dividend dates come from the site's own JavaScript engines, run in Node.js by `scripts/signals.mjs` over the same snapshot. Re-implementing them in Python would create a second copy that could quietly disagree with the site. The regime and the macro calendar are read straight from the snapshot, so they reach the message even if Node.js is missing.
+- **One source of truth for the signals.** The trend regimes and their last three sessions, the Technical and Fundamental scores, the moves in σ, 3-month relative strength and the earnings and ex-dividend dates come from the site's own JavaScript engines, run in Node.js by `scripts/signals.mjs` over the same snapshot. Re-implementing them in Python would create a second copy that could quietly disagree with the site. The regime and the macro calendar are read straight from the snapshot, so they reach the message even if Node.js is missing.
 - **No new dependencies.** The message is sent with Python's `urllib.request` to the Bot API's `sendMessage`, formatted as MarkdownV2 with every special character escaped. If Telegram rejects the formatting for a chat, the same content is resent to that chat as plain text.
 - **The status is real.** The briefing is the last step of the refresh job and runs whatever happened before it (`if: always()`). Each earlier step's outcome is passed in as an environment variable, so the message reports the gates and the commit, not just the fetch.
 - **Least exposure.** The two secrets are given to the briefing step only, not to the steps that run third-party data code.
@@ -1148,6 +1186,32 @@ The message is shortened from the bottom of the body if it ever approached Teleg
 - **It can never break the pipeline.** Missing secrets (local runs, pull requests, forks) skip it silently. An unreachable API, a bad token, a failed chat or an unexpected error is a warning; network errors, rate limits and server errors get one retry per chat. The result is `sent`, `sent-plain`, `partial` (some chats) or `failed`, the command always exits 0, and the step is also marked `continue-on-error`, so the deployment never waits on Telegram.
 
 ---
+
+## Agent-ready export
+
+Every daily run publishes `data/bot_context.json` (served at `/data/bot_context.json`), the groundwork for a question-answering bot that should only ever quote auditable QuantLens numbers. It is built in the refresh job after the snapshot is validated and before the gates, which check it, and committed with the snapshot.
+
+```jsonc
+{
+  "schema": "quantlens.bot_context/1", "asOf": "2026-11-22T02:32:27Z", "builtAt": "…", "source": "…",
+  "notes": ["Every number is computed by the QuantLens engines…", "A value is {\"v\": …} or {\"na\": \"<reason>\"}…"],
+  "units":   { "rs1m": "fraction: (1 + asset return) / (1 + benchmark return) - 1 over 30 days, against 'vs'", … },
+  "regime":  { "state": "stressed", "levels": {…}, "ratio": 1.16, "invertedStreak": 4, "rules": {…} },   // no history
+  "events":  [ { "date": "2026-12-09", "kind": "fomc-decision", "label": "FOMC rate decision (+ projections)", "at": "…" }, … ],
+  "triggers":[ { "kind": "move", "ticker": "AMD", "dailyReturn": -0.132, "zScore": -2.09, "rule": "size", "threshold": 0.1 }, … ],
+  "rotation":{ "benchmark": "the S&P 500 in USD …", "groups": [ { "group": "Defensives", "quadrant": "Leading", "rs1m": 0.205, "rs3m": 0.282, "members": [ "WMT", "LLY" ] }, … ] },
+  "assets":  [ { "ticker": "D05.SI", "trend": { "v": "Pullback" }, "rs1m": { "v": -0.0208, "vs": "^STI" }, "beta": { "v": 1.099 },
+                 "ewmaVol": { "v": 0.184 }, "shock": { "ret": -0.0183, "z": -1.68, "date": "2026-11-20" }, "spread": { "v": 0.000151 },
+                 "amihud": { "v": 0.238 }, "fundamental": { "v": 65.2 }, "nextEarnings": { "date": "2027-02-15", "tradingDays": 58 }, … },
+               { "ticker": "BTC-USD", "beta": { "na": "BTC-USD is the benchmark for crypto: measured against itself its beta is 1 by definition." }, … } ]
+}
+```
+
+- **The engines, not a copy of them.** `scripts/bot_context.mjs` runs the site's own engines over the snapshot (trend regime, scores, relative strength against each asset's benchmark, its rotation quadrant against the S&P 500 in USD, beta, EWMA volatility and one-day VaR over the last year, the latest move in σ, the tick-floor spread, Amihud, traded value, the next earnings and ex-dividend dates). The triggers come from `collect_triggers`, the same function the Telegram message is rendered from, against the same previous snapshot, so the export and the message cannot disagree.
+- **Every gap has its reason.** A value is `{"v": …}` or `{"na": "<the engine's own reason>"}`; nothing is filled in.
+- **Small enough to read whole.** About 29 KB for 30 assets, against a 50 KB limit the validator enforces, with no candle or history arrays (no list may hold more than 64 items) and floats rounded to six significant figures.
+- **Checked twice.** Gate 1 builds it from the committed snapshot through Node and validates its contract; Gate 2 recomputes the trend regime, relative strength, beta, EWMA volatility, spread, Amihud and rotation quadrant of every asset in the browser and requires the committed file to match.
+- **It never blocks the data.** The build step is allowed to fail; the snapshot is still committed, and the previous export stays, with its own `asOf` showing it is a day old.
 
 ## Live feeds and their fallbacks
 
@@ -1377,9 +1441,9 @@ Pearson correlation of log returns, computed only on dates when both assets trad
 
 Two suites, both run in CI as deployment gates.
 
-**`tests/engines.test.html`: 369 tests in 52 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
+**`tests/engines.test.html`: 376 tests in 55 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
 
-**`scripts/test_fetch_fundamentals.py`: 158 tests** of the Python pipeline, standard-library `unittest`.
+**`scripts/test_fetch_fundamentals.py` and `scripts/test_sync_macro_calendar.py`: 201 tests** of the Python side, standard-library `unittest`; the calendar sync's tests run offline against fixtures shaped like each source.
 
 Every formula is verified against an independent source of truth:
 
@@ -1431,7 +1495,7 @@ The leaderboard and the portfolio sandbox adapt to **their own width** with CSS 
 2. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
 3. Run the workflow once from the Actions tab (or push to `main`). From then on it refreshes the data, runs both gates and redeploys every day.
 
-No secrets, tokens or environment variables are needed. The two Telegram secrets are optional (see [Daily Telegram briefing](#daily-telegram-briefing)).
+No secrets, tokens or environment variables are needed for the site. Optional: the two Telegram secrets (see [Daily Telegram briefing](#daily-telegram-briefing)), and `FRED_API_KEY` plus the *Allow GitHub Actions to create and approve pull requests* setting for [the monthly calendar sync](#the-monthly-calendar-sync).
 
 ---
 
@@ -1467,6 +1531,10 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 | **Crowding is measured on the sample covariance.** | Portfolio volatility uses the shrunk matrix to tame noise, but shrinkage would hide which holdings move together. The trace says which matrix each figure uses. |
 | **Beta needs time-aligned closes.** | Pairs that close in different sessions use weekly returns; where a range is too short for that, beta is `N/A` rather than understated. Relative strength still shows, with a note that the closes are hours apart. |
 | **Only price-based readouts are backtested.** | Free data has no point-in-time fundamentals, and using today's accounts for past days would be look-ahead bias. Testing what can be tested honestly beats testing everything dishonestly. |
+| **The calendar sync proposes; a person merges.** | A wrong FOMC or CPI date would misfire a trigger for a month. The sync gathers, validates and tests, but the change lands only through a reviewed pull request, and the daily run never depends on a website being up. |
+| **SGX half days come from a rule, not a feed.** | No free source lists them, and `exchange_calendars` stops its SGX calendar at 2026 with no half days at all. The rule (the eves of Chinese New Year, Christmas and New Year on trading days, from the SGX rulebook) reproduced every hand-entered date. |
+| **The size guardrail is mostly one stock.** | 45 of the 76 extra big-move days in five years were SNDK, and more were rises than falls: the muting it fixes is chronic high volatility more than sell-offs. It stays, because a 10% day matters to anyone holding the stock. |
+| **The export is groundwork, not a bot.** | `bot_context.json` holds only numbers the site can show with their working. A bot built on it can quote, compare and explain them; it must not forecast with them, and the file says so in its notes. |
 | **Crash windows were chosen after the fact.** | They are the S&P 500's own highs and lows, so they show how a mix behaved in known falls, not in the next one. A holding with no prices at a window's start is left out and the rest rescaled, and every card says so rather than filling the gap with a proxy. |
 | **Rotation is measured in US dollars by default.** | One scale for the whole watchlist makes the quadrants comparable, and it includes the Singapore dollar's move, as a US-dollar investor would see it. The own-market view is one click away and is the factor engine's figure exactly. |
 | **The weights were not tuned to the backtest.** | Five years and 30 correlated assets are a small sample. Optimising the score against it would fit noise and turn a diagnostic into a sales figure. |
@@ -1518,13 +1586,13 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 
 **How do you spot a crowded portfolio?** The first principal component alone is a trap: it is mostly the most volatile holding. I flag "one bet" only when the common driver explains at least 60% of the variance and at least two holdings correlate 0.8 or more with it, and I run it on the sample covariance, because shrinkage would erase the very correlations the check looks for. It names MU and SNDK in a chip portfolio, the two banks among Singapore names, and the miners inside an otherwise diversified mix.
 
-**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 527 tests comparing engines with hand calculations, a published example, closed-form results, an independent NumPy implementation and independent recomputation, including a check that the backtest's last day reproduces the live score for every asset.
+**How do you know the numbers are right?** Three layers. Guarded arithmetic that cannot emit `NaN`. A tracer contract that attaches the derivation to every value and is machine-checked on real data. And 577 tests comparing engines with hand calculations, a published example, closed-form results, an independent NumPy implementation and independent recomputation, including a check that the backtest's last day reproduces the live score for every asset.
 
 **What was the hardest correctness problem?** Data, not formulas. Summing four quarters into a trailing figure is wrong if one quarter is missing, and the provider silently omits them. In V3, earnings timestamps: Yahoo reports them in New York time, so a Singapore release stamped 19:00 in New York is really 08:00 the next morning in Singapore, a different day and before the open; and a midnight stamp means "time unknown", not "before the open". Getting either wrong measures the reaction on the wrong day.
 
 **How do you add notifications without making them a liability?** Make them the last step, give them the secrets alone, and make failure impossible to propagate: missing credentials do nothing, API errors are warnings, the command always exits 0, and the step is `continue-on-error`. With several recipients, one blocked chat cannot stop the others, and chat ids never appear in the log, because GitHub masks the secret as a whole but not its pieces after a split. And never compute the content twice: the briefing runs the site's own engines in Node rather than a Python copy of the scoring.
 
-**What would you do next?** Implied volatility from free options chains, as the market's own forecast to set beside EWMA; point-in-time fundamentals, so that the Fundamental score could be backtested honestly; a crash replay with rebalancing, set beside buy and hold; peer-relative valuation as the watchlist grows; a proper mean-variance solver with constraints, shown next to the random sample so its sensitivity is visible; and a service worker so the last snapshot works offline.
+**What would you do next?** The V4.0 question-answering bot on Telegram, answering only from `data/bot_context.json` so every number it quotes can be checked on the site; implied volatility from free options chains, as the market's own forecast to set beside EWMA; point-in-time fundamentals, so that the Fundamental score could be backtested honestly; a crash replay with rebalancing, set beside buy and hold; peer-relative valuation as the watchlist grows; a proper mean-variance solver with constraints, shown next to the random sample so its sensitivity is visible; and a service worker so the last snapshot works offline.
 
 ---
 

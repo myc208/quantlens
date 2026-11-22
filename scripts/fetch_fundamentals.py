@@ -296,6 +296,30 @@ WEEKDAY_FULL = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturda
 MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
                "October", "November", "December")
 SIGNALS_SCRIPT = REPO_ROOT / "scripts" / "signals.mjs"
+# V3.4: data/bot_context.json, a compact summary for a future question-answering bot.
+BOT_CONTEXT_SCRIPT = REPO_ROOT / "scripts" / "bot_context.mjs"
+BOT_CONTEXT_PATH = REPO_ROOT / "data" / "bot_context.json"
+BOT_CONTEXT_SCHEMA = "quantlens.bot_context/1"
+BOT_CONTEXT_MAX_BYTES = 50_000
+BOT_CONTEXT_EVENT_DAYS = 30
+BOT_CONTEXT_MAX_LIST = 64        # no candle or history arrays: no list may be longer than this
+BOT_CONTEXT_CELLS = ("trend", "technical", "fundamental", "rs1m", "rs3m", "rotation", "beta", "ewmaVol", "var95",
+                     "spread", "amihud", "adv", "nextEarnings", "nextExDividend", "shock")
+BOT_CONTEXT_UNITS = {
+    "close": "the asset's currency (ccy), last completed daily close",
+    "trend": "trend regime label: Uptrend, Extended, Pullback, Recovering or Downtrend",
+    "technical": "score 0-100", "fundamental": "score 0-100",
+    "rs1m": "fraction: (1 + asset return) / (1 + benchmark return) - 1 over 30 days, against 'vs'",
+    "rs3m": "fraction, the same over 91 days",
+    "rotation": "quadrant against the S&P 500 in USD: Leading, Weakening, Lagging or Improving",
+    "beta": "ratio against the asset's benchmark, last year",
+    "ewmaVol": "annualised fraction (EWMA, lambda 0.94), last year",
+    "var95": "fraction: one-day 95% historical value at risk, last year",
+    "shock": "ret: the latest session's simple return; z: its log return over the EWMA volatility known the day before",
+    "spread": "fraction of the price: one tick, the minimum round-trip spread",
+    "amihud": "basis points of price move per US$1 million traded, last 20 sessions",
+    "adv": "average daily traded value over 20 sessions, in 'ccy'",
+}
 # A Telegram chat id: a user or group number (groups and channels are negative), or a public @channel.
 CHAT_ID_RE = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$")
 SIGNALS_TIMEOUT = 60.0
@@ -2609,6 +2633,31 @@ def finite_or_none(value: Any) -> float | None:
     return value if is_finite_number(value) else None
 
 
+def run_node_json(script: Path, snapshot_path: Path, label: str, consequence: str) -> Any | None:
+    """Run one of the site's Node scripts over a snapshot and parse the JSON it prints, or warn
+    and return None (Node.js missing, a failure, a timeout, or output that is not JSON)."""
+    node = shutil.which("node")
+    if node is None:
+        warn(f"Node.js is not installed, so {consequence}")
+        return None
+    try:
+        completed = subprocess.run(
+            [node, "--no-warnings", str(script), str(snapshot_path)],
+            capture_output=True, text=True, encoding="utf-8", timeout=SIGNALS_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        warn(f"the {label} script did not run: {type(exc).__name__}")
+        return None
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        warn(f"the {label} script failed: {detail[-1][:200] if detail else f'exit code {completed.returncode}'}")
+        return None
+    try:
+        return json.loads(completed.stdout)
+    except ValueError:
+        warn(f"the {label} script did not print valid JSON")
+        return None
+
+
 def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
     """Every asset's trend regime, Technical and Fundamental scores and the figures the
     briefing needs (bucket, the latest move in σ, 3-month relative strength, the next
@@ -2618,25 +2667,8 @@ def compute_signals(snapshot_path: Path) -> list[dict[str, Any]] | None:
     the briefing says exactly what the site shows. Returns None, with a warning,
     if Node.js is missing or the script fails; the briefing then goes out without signals.
     """
-    node = shutil.which("node")
-    if node is None:
-        warn("Node.js is not installed, so the briefing will not include signals")
-        return None
-    try:
-        completed = subprocess.run(
-            [node, "--no-warnings", str(SIGNALS_SCRIPT), str(snapshot_path)],
-            capture_output=True, text=True, encoding="utf-8", timeout=SIGNALS_TIMEOUT, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        warn(f"the signals script did not run: {type(exc).__name__}")
-        return None
-    if completed.returncode != 0:
-        detail = (completed.stderr or "").strip().splitlines()
-        warn(f"the signals script failed: {detail[-1][:200] if detail else f'exit code {completed.returncode}'}")
-        return None
-    try:
-        payload = json.loads(completed.stdout)
-    except ValueError:
-        warn("the signals script did not print valid JSON")
+    payload = run_node_json(SIGNALS_SCRIPT, snapshot_path, "signals", "the briefing will not include signals")
+    if payload is None:
         return None
     rows = payload.get("assets") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
@@ -2968,19 +3000,18 @@ def earnings_size(row: dict[str, Any]) -> str:
 TIMING_WORDS = {"before-open": "before the open", "during-session": "during the session", "after-close": "after the close"}
 
 
-def briefing_triggers(snapshot: dict[str, Any], signals: list[dict[str, Any]], shifts: list[dict[str, Any]] | None,
-                      previous: dict[str, Any] | None, now: datetime, weekend: bool, fmt: BriefingFormat) -> tuple[list[str], dict[str, set]]:
-    """The ⚡ block: only what happened or is about to. Returns its lines (none on a quiet day)
-    and what it already mentioned, so the rest of the message does not repeat it."""
-    lines: list[str] = []
-    seen: dict[str, set] = {"moves": set(), "flips": set(), "earnings": set(), "events": set()}
-    # T4: an FOMC decision or CPI release within 48 hours, with the time in New York and Singapore.
+def collect_triggers(snapshot: dict[str, Any], signals: list[dict[str, Any]], shifts: list[dict[str, Any]] | None,
+                     previous: dict[str, Any] | None, now: datetime, weekend: bool) -> list[dict[str, Any]]:
+    """Everything the ⚡ block reports, as records (V3.4): the Telegram message renders them and
+    data/bot_context.json stores them, so the two can never disagree. In the block's order:
+    macro (T4), vix (T2), move (T1), flip (T6), earnings (T3), tone (T5)."""
+    triggers: list[dict[str, Any]] = []
+    # T4: an FOMC decision or CPI release within 48 hours.
     for event in calendar_events(snapshot):
         hours = event_hours(event, now)
         if event["type"] in MARKET_MOVING and hours is not None and 0 < hours <= BRIEFING_MACRO_HOURS:
-            et, sgt = event_clocks(event["at"])
-            lines.append(fmt.text(f"• {macro_label(event)}: {day_label(event['date'])} {et} · {sgt} · in {round(hours)} h"))
-            seen["events"].add((event["type"], event["date"]))
+            triggers.append({"kind": "macro", "type": event["type"], "date": event["date"], "at": event["at"],
+                             "label": macro_label(event), "hours": hours})
     # T2: the first session of an inversion, or the first one out of it (once per session).
     macro = snapshot.get("macro") or {}
     regime = macro.get("regime")
@@ -2989,47 +3020,81 @@ def briefing_triggers(snapshot: dict[str, Any], signals: list[dict[str, Any]], s
     old_as_of = old_regime.get("asOf") if isinstance(old_regime, dict) else None
     if isinstance(regime, dict) and regime.get("status") in {"fresh", "stale"} and (old_as_of is None or regime["asOf"] > old_as_of):
         change = regime_transition(regime)
-        vix, vix3m = regime["levels"]["vix"], regime["levels"]["vix3m"]
-        if change["dayOne"]:
-            lines.append(fmt.text(f"• VIX curve inverted today, day 1: VIX {vix:.1f} above VIX3M {vix3m:.1f}"))
-        elif change["uninverted"]:
-            run = f"{change['priorStreak']} inverted session{'s' if change['priorStreak'] != 1 else ''}"
-            lines.append(fmt.text(f"• VIX curve no longer inverted: {regime['state']} after {run} (VIX {vix:.1f}, VIX3M {vix3m:.1f})"))
-    # T1: a session move beyond 2.5σ of the EWMA volatility, or a 10% day (15% crypto, 5% ETFs),
-    # once per new session (crypto only at weekends).
+        if change["dayOne"] or change["uninverted"]:
+            triggers.append({"kind": "vix", "change": "inverted" if change["dayOne"] else "uninverted", "state": regime["state"],
+                             "vix": regime["levels"]["vix"], "vix3m": regime["levels"]["vix3m"], "priorStreak": change["priorStreak"]})
+    # T1: beyond 2.5σ, or a 10% day (15% crypto, 5% ETFs); once per new session, crypto only at weekends.
     before = previous_dates(previous)
-    moves = big_moves(signals, before, weekend)
-    if moves:
-        shown = " · ".join(move_text(row) for row in moves[:BRIEFING_MAX_MOVES])
-        extra = f" · +{len(moves) - BRIEFING_MAX_MOVES} more" if len(moves) > BRIEFING_MAX_MOVES else ""
-        lines.append(fmt.text(f"• Big moves: {shown}{extra}"))
-        seen["moves"] = {row["ticker"] for row in moves}
-    # T6: a trend flip across the 200-day average or the 20/50-day EMA cross, held for two closes (V3.4).
-    flips = trend_flips(signals, before, weekend)
-    if flips:
-        shown = " · ".join(flip_text(flip) for flip in flips[:BRIEFING_MAX_FLIPS])
-        extra = f" · +{len(flips) - BRIEFING_MAX_FLIPS} more" if len(flips) > BRIEFING_MAX_FLIPS else ""
-        lines.append(fmt.text(f"• Trend flips (held two closes): {shown}{extra}"))
-        seen["flips"] = {flip["ticker"] for flip in flips}
+    for row in big_moves(signals, before, weekend):
+        rule = "both" if beyond_sigma(row) and beyond_size(row) else "sigma" if beyond_sigma(row) else "size"
+        triggers.append({"kind": "move", "ticker": row["ticker"], "assetClass": row.get("assetClass"), "dailyReturn": row["dailyReturn"],
+                         "zScore": row.get("zScore"), "threshold": move_threshold(row), "rule": rule, "date": row.get("quoteAsOf")})
+    # T6: a trend flip across the 200-day average or the 20/50-day EMA cross, held for two closes.
+    for flip in trend_flips(signals, before, weekend):
+        triggers.append({"kind": "flip", **flip})
     # T3: earnings within 5 trading days (weekdays; the weekend edition lists the week ahead).
     if not weekend:
         soon = [row for row in signals if row.get("tradable") and row.get("nextEarnings")
                 and row["nextEarnings"].get("tradingDays") is not None and row["nextEarnings"]["tradingDays"] <= BRIEFING_EARNINGS_TRIGGER]
         for row in sorted(soon, key=lambda row: (row["nextEarnings"]["days"], row["ticker"])):
             upcoming = row["nextEarnings"]
-            when = TIMING_WORDS.get(upcoming.get("timing") or "", "time not known")
-            sessions = upcoming["tradingDays"]
-            lines.append(fmt.text(f"• Earnings: {row['ticker']} ~{day_label(upcoming['date'])}, {when} "
-                                  f"({sessions} trading day{'s' if sessions != 1 else ''}) · {earnings_size(row)}"))
-            seen["earnings"].add(row["ticker"])
-    # T5: headline tone shifts, tradable assets only. Never a "no shifts" line.
+            triggers.append({"kind": "earnings", "ticker": row["ticker"], "date": upcoming["date"], "days": upcoming["days"],
+                             "tradingDays": upcoming["tradingDays"], "timing": upcoming.get("timing"),
+                             "typicalMove": row.get("typicalMove"), "worstMove": row.get("worstMove")})
+    # T5: headline tone shifts, tradable assets only.
     tradable = {asset["ticker"] for asset in snapshot.get("assets", []) if isinstance(asset, dict) and asset.get("assetClass") != "index"}
     for shift in [shift for shift in (shifts or []) if shift["ticker"] in tradable][:BRIEFING_MAX_TONE]:
+        triggers.append({"kind": "tone", "ticker": shift["ticker"], "from": shift["from"], "to": shift["to"],
+                         "before": shift["before"], "after": shift["after"], "headline": shift.get("headline")})
+    return triggers
+
+
+def render_triggers(triggers: list[dict[str, Any]], fmt: BriefingFormat) -> tuple[list[str], dict[str, set]]:
+    """The ⚡ block's lines from the trigger records (none on a quiet day), and what they already
+    mentioned, so the rest of the message does not repeat it."""
+    lines: list[str] = []
+    seen: dict[str, set] = {"moves": set(), "flips": set(), "earnings": set(), "events": set()}
+    by_kind = {kind: [trigger for trigger in triggers if trigger["kind"] == kind] for kind in ("macro", "vix", "move", "flip", "earnings", "tone")}
+    for event in by_kind["macro"]:
+        et, sgt = event_clocks(event["at"])
+        lines.append(fmt.text(f"• {event['label']}: {day_label(event['date'])} {et} · {sgt} · in {round(event['hours'])} h"))
+        seen["events"].add((event["type"], event["date"]))
+    for vix in by_kind["vix"]:
+        if vix["change"] == "inverted":
+            lines.append(fmt.text(f"• VIX curve inverted today, day 1: VIX {vix['vix']:.1f} above VIX3M {vix['vix3m']:.1f}"))
+        else:
+            run = f"{vix['priorStreak']} inverted session{'s' if vix['priorStreak'] != 1 else ''}"
+            lines.append(fmt.text(f"• VIX curve no longer inverted: {vix['state']} after {run} (VIX {vix['vix']:.1f}, VIX3M {vix['vix3m']:.1f})"))
+    moves = by_kind["move"]
+    if moves:
+        shown = " · ".join(move_text(move) for move in moves[:BRIEFING_MAX_MOVES])
+        extra = f" · +{len(moves) - BRIEFING_MAX_MOVES} more" if len(moves) > BRIEFING_MAX_MOVES else ""
+        lines.append(fmt.text(f"• Big moves: {shown}{extra}"))
+        seen["moves"] = {move["ticker"] for move in moves}
+    flips = by_kind["flip"]
+    if flips:
+        shown = " · ".join(flip_text(flip) for flip in flips[:BRIEFING_MAX_FLIPS])
+        extra = f" · +{len(flips) - BRIEFING_MAX_FLIPS} more" if len(flips) > BRIEFING_MAX_FLIPS else ""
+        lines.append(fmt.text(f"• Trend flips (held two closes): {shown}{extra}"))
+        seen["flips"] = {flip["ticker"] for flip in flips}
+    for earnings in by_kind["earnings"]:
+        when = TIMING_WORDS.get(earnings.get("timing") or "", "time not known")
+        sessions = earnings["tradingDays"]
+        lines.append(fmt.text(f"• Earnings: {earnings['ticker']} ~{day_label(earnings['date'])}, {when} "
+                              f"({sessions} trading day{'s' if sessions != 1 else ''}) · {earnings_size(earnings)}"))
+        seen["earnings"].add(earnings["ticker"])
+    for shift in by_kind["tone"]:
         lines.append(fmt.text(f"• Tone: {shift['ticker']} {shift['from']} → {shift['to']} ({signed(shift['before'])} → {signed(shift['after'])})"))
         if shift.get("headline"):
             headline = shift["headline"] if len(shift["headline"]) <= 70 else shift["headline"][:67].rstrip() + "..."
             lines.append("   " + fmt.italic(headline))
     return lines, seen
+
+
+def briefing_triggers(snapshot: dict[str, Any], signals: list[dict[str, Any]], shifts: list[dict[str, Any]] | None,
+                      previous: dict[str, Any] | None, now: datetime, weekend: bool, fmt: BriefingFormat) -> tuple[list[str], dict[str, set]]:
+    """The ⚡ block: only what happened or is about to."""
+    return render_triggers(collect_triggers(snapshot, signals, shifts, previous, now, weekend), fmt)
 
 
 def tally_text(rows: list[dict[str, Any]]) -> str:
@@ -3423,6 +3488,166 @@ def deliver_briefing(snapshot_path: Path, previous_path: Path | None, env: dict[
         return "failed"
 
 
+# --- Agent-ready export (V3.4) ------------------------------------------------------------
+
+def bot_context_events(snapshot: dict[str, Any], signals: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """The next 30 days: macro calendar entries, earnings and ex-dividend dates of tradable assets."""
+    today = now.date().isoformat()
+    horizon = (now.date() + timedelta(days=BOT_CONTEXT_EVENT_DAYS)).isoformat()
+    events: list[dict[str, Any]] = []
+    for event in calendar_events(snapshot):
+        if today <= event["date"] <= horizon:
+            entry = {"date": event["date"], "kind": event["type"], "label": macro_label(event)}
+            if event.get("at"):
+                entry["at"] = event["at"]
+            if event.get("market"):
+                entry["market"] = event["market"]
+            events.append(entry)
+    for row in signals:
+        if not row.get("tradable"):
+            continue
+        upcoming = row.get("nextEarnings")
+        if upcoming and today <= upcoming["date"] <= horizon:
+            events.append({"date": upcoming["date"], "kind": "earnings", "ticker": row["ticker"], "timing": upcoming.get("timing"),
+                           "tradingDays": upcoming.get("tradingDays"), "typicalMove": row.get("typicalMove"), "worstMove": row.get("worstMove")})
+        dividend = row.get("nextExDividend")
+        if dividend and today <= dividend["date"] <= horizon:
+            events.append({"date": dividend["date"], "kind": "ex-dividend", "ticker": row["ticker"], "estimated": dividend.get("estimated", False)})
+    return sorted(events, key=lambda event: (event["date"], event["kind"], event.get("ticker", "")))
+
+
+def _rounded(value: Any) -> Any:
+    """Six significant figures for every float, recursively: plenty for anything quoted."""
+    if isinstance(value, float):
+        return float(f"{value:.6g}") if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _rounded(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rounded(item) for item in value]
+    return value
+
+
+def build_bot_context(snapshot_path: Path, previous: dict[str, Any] | None, now: datetime,
+                      signals: list[dict[str, Any]] | None = None, engine: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """data/bot_context.json: the engines' summary (bot_context.mjs) plus the triggers, computed by
+    the very functions the Telegram briefing uses, and the next 30 days of events."""
+    snapshot = load_previous(snapshot_path)
+    if not snapshot:
+        warn("the agent context was not built: the snapshot could not be read")
+        return None
+    signals = signals if signals is not None else compute_signals(snapshot_path)
+    engine = engine if engine is not None else run_node_json(BOT_CONTEXT_SCRIPT, snapshot_path, "agent context", "no agent context is built")
+    if signals is None or not isinstance(engine, dict):
+        return None
+    shifts = sentiment_shifts(previous, snapshot) if previous else None
+    triggers = collect_triggers(snapshot, signals, shifts, previous, now, is_weekend_run(now))
+    return _rounded({
+        "schema": BOT_CONTEXT_SCHEMA,
+        "asOf": snapshot["generatedAt"],
+        "builtAt": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": "data/market_snapshot.json, through the site's own engines (scripts/bot_context.mjs and scripts/signals.mjs)",
+        "notes": [
+            "Every number is computed by the QuantLens engines from the snapshot of the same asOf; each one can be traced on the site.",
+            "A value is {\"v\": ...} or {\"na\": \"<the reason it is not available>\"}. Never fill a gap with a guess.",
+            "Trend regimes and relative strength describe the past and do not predict returns. Nothing here is financial advice.",
+            "Triggers use the Telegram briefing's rules against the previous snapshot; an empty list means a quiet day.",
+        ],
+        "units": BOT_CONTEXT_UNITS,
+        "regime": engine.get("regime"),
+        "events": bot_context_events(snapshot, signals, now),
+        "triggers": triggers,
+        "rotation": engine.get("rotation"),
+        "assets": engine.get("assets"),
+    })
+
+
+def validate_bot_context(context: Any, snapshot: dict[str, Any] | None = None) -> list[str]:
+    """The export's contract: its schema, a value or a reason in every cell, no long arrays, and a
+    size a chat model can read whole. With the snapshot, the assets must be the same tickers."""
+    if not isinstance(context, dict):
+        return ["the agent context must be an object"]
+    errors: list[str] = []
+    expected = ["schema", "asOf", "builtAt", "source", "notes", "units", "regime", "events", "triggers", "rotation", "assets"]
+    if list(context) != expected:
+        return [f"the agent context must have exactly {expected}, in that order"]
+    if context["schema"] != BOT_CONTEXT_SCHEMA:
+        errors.append(f"schema must be {BOT_CONTEXT_SCHEMA}")
+    size = len(json.dumps(context, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    if size > BOT_CONTEXT_MAX_BYTES:
+        errors.append(f"the agent context is {size} bytes; the limit is {BOT_CONTEXT_MAX_BYTES}")
+
+    def walk(value: Any, where: str) -> None:
+        if isinstance(value, list):
+            if len(value) > BOT_CONTEXT_MAX_LIST:
+                errors.append(f"{where} holds {len(value)} items: no long arrays belong in the agent context")
+            for index, item in enumerate(value):
+                walk(item, f"{where}[{index}]")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                walk(item, f"{where}.{key}")
+        elif isinstance(value, float) and not math.isfinite(value):
+            errors.append(f"{where} is not a finite number")
+    walk(context, "context")
+    regime = context["regime"]
+    if isinstance(regime, dict) and "history" in regime:
+        errors.append("regime must not carry its five-year history")
+    if not isinstance(context["assets"], list) or not context["assets"]:
+        return errors + ["assets must be a non-empty list"]
+    for asset in context["assets"]:
+        ticker = asset.get("ticker") if isinstance(asset, dict) else None
+        if not isinstance(ticker, str):
+            errors.append("every asset needs a ticker")
+            continue
+        for key in BOT_CONTEXT_CELLS:
+            value = asset.get(key)
+            good = isinstance(value, dict) and (("na" in value and isinstance(value["na"], str) and value["na"].strip())
+                                                 or ("v" in value) or ("date" in value) or ("ret" in value))
+            if not good:
+                errors.append(f"{ticker}.{key} must hold a value or an N/A reason")
+    if not all(isinstance(trigger, dict) and trigger.get("kind") in {"macro", "vix", "move", "flip", "earnings", "tone"}
+               for trigger in context["triggers"]):
+        errors.append("every trigger needs a known kind")
+    if snapshot is not None:
+        if context["asOf"] != snapshot.get("generatedAt"):
+            errors.append(f"asOf {context['asOf']} is not the snapshot's {snapshot.get('generatedAt')}")
+        tickers = [asset.get("ticker") for asset in snapshot.get("assets", []) if isinstance(asset, dict)]
+        if [asset.get("ticker") for asset in context["assets"] if isinstance(asset, dict)] != tickers:
+            errors.append("the agent context must list the snapshot's assets in the same order")
+    return errors
+
+
+def write_bot_context(context: dict[str, Any], path: Path) -> int:
+    """Compact JSON, written atomically. Returns the size in bytes."""
+    text = json.dumps(context, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8", newline="\n")
+    os.replace(temporary, path)
+    return len(text.encode("utf-8"))
+
+
+def run_bot_context(settings: argparse.Namespace) -> int:
+    """Entry point for --bot-context. Exits 1 (and leaves any previous file alone) if the context
+    cannot be built or breaks its contract; the workflow runs it with continue-on-error, so a
+    missing export never blocks the data commit."""
+    now = datetime.now(timezone.utc)
+    previous = load_previous(settings.previous) if settings.previous is not None else None
+    context = build_bot_context(settings.output, previous, now)
+    if context is None:
+        fail("the agent context could not be built")
+        return 1
+    errors = validate_bot_context(context, load_previous(settings.output))
+    if errors:
+        for message in errors[:10]:
+            fail(f"agent context: {message}")
+        return 1
+    size = write_bot_context(context, BOT_CONTEXT_PATH)
+    kinds = sorted({trigger["kind"] for trigger in context["triggers"]})
+    LOG.info("agent context: %d assets, %d events, %d triggers (%s), %.1f KB",
+             len(context["assets"]), len(context["events"]), len(context["triggers"]), ", ".join(kinds) or "none", size / 1024)
+    return 0
+
+
 def run_notify(settings: argparse.Namespace) -> int:
     """Entry point for --notify. Always exits 0: a briefing must never block a deployment."""
     try:
@@ -3467,8 +3692,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                              "needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, otherwise does nothing)")
     parser.add_argument("--calendar", type=Path, default=DEFAULT_CALENDAR,
                         help="the hand-kept macro calendar (FOMC, CPI, market holidays) copied into the snapshot")
+    parser.add_argument("--bot-context", action="store_true",
+                        help="write data/bot_context.json, the agent-ready summary of the snapshot at --output, and exit")
     parser.add_argument("--previous", type=Path, default=None,
-                        help="with --notify: the snapshot before this run, to detect shifts in headline tone")
+                        help="with --notify or --bot-context: the snapshot before this run, to tell new sessions and tone shifts")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -3506,6 +3733,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_validation(settings.output)
     if settings.notify:
         return run_notify(settings)
+    if settings.bot_context:
+        return run_bot_context(settings)
 
     try:
         watchlist = load_json(settings.watchlist)

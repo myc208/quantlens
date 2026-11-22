@@ -174,11 +174,14 @@ export function analyzeFactors({ asset, series, benchmark = null, benchmarkSerie
     relativeStrength3m: `Relative strength (3M) vs ${benchmarkTicker ?? 'benchmark'}`,
   };
   const units = { beta: 'ratio', rSquared: 'pct', idioVolatility: 'pct', relativeStrength1m: 'pct', relativeStrength3m: 'pct' };
-  const allNa = (reason) => Object.fromEntries(FACTOR_METRIC_IDS.map((id) => [id, na(id, labels[id], units[id], FORMULAS[id], reason)]));
+  const allNa = (reason) => Object.fromEntries(FACTOR_METRIC_IDS.map((id) => [id, na(id, labels[id], units[id], FORMULAS[id], typeof reason === 'function' ? reason(id) : reason)]));
 
   if (!benchmarkTicker) {
     const group = asset.assetClass === 'crypto' ? 'crypto' : asset.market === 'SG' ? 'Singapore assets' : 'US- and London-listed assets';
-    return { benchmark: null, metrics: allNa(`${ticker} is the benchmark for ${group}: measured against itself its beta is 1 by definition.`) };
+    // Each measure says what it would be against itself (V3.4: RS no longer speaks of beta).
+    const self = { beta: 'its beta is 1', rSquared: 'its R² is 100%', idioVolatility: 'none of its volatility is its own',
+      relativeStrength1m: 'its relative strength is 0', relativeStrength3m: 'its relative strength is 0' };
+    return { benchmark: null, metrics: allNa((id) => `${ticker} is the benchmark for ${group}: measured against itself ${self[id]} by definition.`) };
   }
   if (!benchmark || !benchmark.series) {
     return { benchmark: benchmarkTicker, metrics: allNa(`The benchmark ${benchmarkTicker} is not in this snapshot.`) };
