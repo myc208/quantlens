@@ -16,7 +16,9 @@ calls any of this: it keeps reading the committed file, with no requests of its 
                              key, or if the request fails, the CPI dates already in the file stay
 
 Every source can fail on its own: a failed source keeps its existing entries and the summary
-says so. The merged file must pass validate_macro_calendar, the same check the daily pipeline
+says so. A source that succeeds but reaches less far than the file (FRED lists next year's CPI
+dates only once BLS publishes them) replaces the file's entries up to its own horizon and keeps
+the file's later ones, so coverage never shrinks because a source is behind (v3.4.1). The merged file must pass validate_macro_calendar, the same check the daily pipeline
 applies, or nothing is written and the script exits 1.
 
   python scripts/sync_macro_calendar.py [--calendar PATH] [--summary PATH] [--today YYYY-MM-DD] [--dry-run]
@@ -454,8 +456,10 @@ def ordered(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def merge(previous: dict[str, Any], results: dict[str, SourceResult], today: date, window: Window) -> dict[str, Any]:
-    """The new calendar. A failed source keeps its previous entries and horizon; names already in
-    the file are kept for the same date; everything is clipped to the common horizon."""
+    """The new calendar. A failed source keeps its previous entries and horizon. A source that
+    reaches less far than the file replaces entries only up to its own horizon and keeps the
+    file's later ones, so its horizon is never shorter than the file's. Names already in the file
+    are kept for the same date; everything is clipped to the common horizon."""
     old_events = previous.get("events", [])
     old_names = {event_key(event): event["name"] for event in old_events if "name" in event}
     old_to = date.fromisoformat(previous["coverage"]["to"])
@@ -464,11 +468,19 @@ def merge(previous: dict[str, Any], results: dict[str, SourceResult], today: dat
     for family in FAMILIES:
         result = results.get(family)
         if result is not None and result.ok:
+            reach = result.horizon or old_to
+            short = reach < old_to
             for event in result.events:
+                if short and event["date"] > reach.isoformat():
+                    continue
                 if "name" in event and event_key(event) in old_names:
                     event = {**event, "name": old_names[event_key(event)]}
                 events.append(event)
-            horizons[family] = result.horizon or old_to
+            if short:
+                # The source has not published that far yet: keep what the file already holds.
+                events.extend(event for event in old_events if family_of(event) == family
+                              and event["date"] > reach.isoformat() and window.holds(event["date"]))
+            horizons[family] = max(reach, old_to)
         else:
             events.extend(event for event in old_events if family_of(event) == family and window.holds(event["date"]))
             horizons[family] = old_to
@@ -520,7 +532,12 @@ def report(previous: dict[str, Any], merged: dict[str, Any], results: dict[str, 
     for family in FAMILIES:
         result = results.get(family)
         if result is not None and result.ok:
-            lines.append(f"| {family} | ✅ {result.note} | {result.horizon.isoformat() if result.horizon else '—'} |")
+            reach = result.horizon.isoformat() if result.horizon else "—"
+            if result.horizon and reach < previous["coverage"]["to"]:
+                lines.append(f"| {family} | ✅ {result.note}; kept the existing entries after {reach}, "
+                             f"which the source does not list yet | {previous['coverage']['to']} |")
+            else:
+                lines.append(f"| {family} | ✅ {result.note} | {reach} |")
         else:
             why = result.note if result is not None else "not run"
             lines.append(f"| {family} | ⚠️ kept the existing entries: {why} | {previous['coverage']['to']} |")

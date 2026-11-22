@@ -295,16 +295,50 @@ class Merge(unittest.TestCase):
         self.assertEqual([e for e in merged["events"] if e["type"].startswith("fomc") and e["date"] >= "2026-11-01"],
                          [e for e in COMMITTED["events"] if e["type"].startswith("fomc")])
 
-    def test_coverage_stops_at_the_shortest_source(self):
-        fetchers = {**committed_fetchers(), "cpi": lambda window: fred_payload(["2026-12-10", "2027-01-13", "2027-02-11", "2027-03-10", "2027-04-13", "2027-05-12", "2027-06-10"])}
-        merged, _, errors = sync.run_sync(copy.deepcopy(COMMITTED), TODAY, fetchers)
+    def test_a_source_that_reaches_less_far_keeps_the_files_later_entries(self):
+        # The live run of 22 Nov 2026: FRED listed CPI only to 10 Dec 2026 (it loads next year's
+        # dates once BLS publishes them). Its releases replace the file's up to its horizon; the
+        # file's 2027 releases stay, and coverage does not shrink. Here FRED also moves December.
+        fetchers = {**committed_fetchers(), "cpi": lambda window: fred_payload(["2026-10-14", "2026-11-10", "2026-12-11"])}
+        merged, results, errors = sync.run_sync(copy.deepcopy(COMMITTED), TODAY, fetchers)
         self.assertEqual(errors, [])
-        self.assertEqual(merged["coverage"]["to"], "2027-06-10")
-        self.assertTrue(all(event["date"] <= "2027-06-10" for event in merged["events"]))
+        self.assertTrue(results["cpi"].ok)
+        self.assertEqual(results["cpi"].horizon, date(2026, 12, 31))
+        self.assertEqual(merged["coverage"]["to"], COMMITTED["coverage"]["to"])          # never shrinks
+        cpi = [e for e in merged["events"] if e["type"] == "cpi"]
+        self.assertEqual([e["date"] for e in cpi if e["date"] <= "2026-12-31"], ["2026-10-14", "2026-11-10", "2026-12-11"])   # FRED's
+        self.assertEqual([e for e in cpi if e["date"] > "2026-12-31"],
+                         [e for e in COMMITTED["events"] if e["type"] == "cpi" and e["date"] > "2026-12-31"])           # the file's
+        self.assertEqual(next(e for e in cpi if e["date"] == "2026-12-11")["period"], "2026-11")
+        others = lambda calendar: [e for e in calendar["events"] if e["type"] != "cpi" and e["date"] >= "2026-11-01"]
+        self.assertEqual(others(merged), others(COMMITTED))                                       # nothing else moves
+        text = sync.report(COMMITTED, merged, results, errors)
+        self.assertIn("| cpi | ✅ 3 releases to 2026-12-11; kept the existing entries after 2026-12-31, which the source does not list yet | 2027-12-31 |", text)
+        self.assertIn("- 2026-12-10 cpi: 2026-11", text)                                    # reported as removed…
+        self.assertIn("- 2026-12-11 cpi: 2026-11", text)                                    # …and added
+
+    def test_coverage_grows_only_as_far_as_the_shortest_source(self):
+        trimmed = copy.deepcopy(COMMITTED)
+        trimmed["coverage"]["to"] = "2027-06-30"
+        trimmed["events"] = [e for e in trimmed["events"] if e["date"] <= "2027-06-30"]
+        merged, _, errors = sync.run_sync(copy.deepcopy(trimmed), TODAY, committed_fetchers())
+        self.assertEqual(errors, [])
+        self.assertEqual(merged["coverage"]["to"], "2027-12-31")                                 # every source reaches further
+        short = {**committed_fetchers(), "cpi": lambda window: fred_payload(["2026-12-10", "2027-01-13", "2027-02-11", "2027-03-10"])}
+        merged, _, errors = sync.run_sync(copy.deepcopy(trimmed), TODAY, short)
+        self.assertEqual(errors, [])
+        self.assertEqual(merged["coverage"]["to"], "2027-06-30")                                 # CPI is known only to June
+        self.assertTrue(all(event["date"] <= "2027-06-30" for event in merged["events"]))
+        self.assertEqual([e["date"] for e in merged["events"] if e["type"] == "cpi" and e["date"] > "2027-03-10"],
+                         ["2027-04-13", "2027-05-12", "2027-06-10"])                             # kept from the file
 
     def test_a_calendar_that_would_run_out_is_not_written(self):
+        # A file already near its end, and a source that cannot extend it: validation refuses it.
+        trimmed = copy.deepcopy(COMMITTED)
+        trimmed["coverage"]["to"] = "2026-12-31"
+        trimmed["events"] = [e for e in trimmed["events"] if e["date"] <= "2026-12-31"]
         fetchers = {**committed_fetchers(), "cpi": lambda window: fred_payload(["2026-12-10"])}
-        merged, results, errors = sync.run_sync(copy.deepcopy(COMMITTED), TODAY, fetchers)
+        merged, results, errors = sync.run_sync(trimmed, TODAY, fetchers)
         self.assertTrue(any("60 days" in error for error in errors))
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "macro_calendar.json"
