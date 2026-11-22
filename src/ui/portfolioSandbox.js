@@ -394,7 +394,7 @@ export function mountPortfolioSandbox(root, app) {
     return `
       <button type="button" class="replay" data-action="trace" data-trace="${esc(metric.id)}" data-key="${esc(key)}" aria-label="${esc(label)}">
         <span class="replay__name">${esc(title)}</span>
-        <span class="replay__dates">${esc(h.shortDate(window.from, true))} → ${esc(h.shortDate(end, true))}${window.ongoing ? ' · latest close' : ''}</span>
+        <span class="replay__dates">${esc(h.shortDate(window.from, true))} → ${esc(h.shortDate(end, true))}${window.ongoing ? ' · latest close' : window.recovered ? ` · recovered ${esc(h.shortDate(window.recovered, true))}` : ''}</span>
         <span class="replay__figures">
           <span class="replay__figure"><span class="replay__label"><span class="replay__key replay__key--mix"></span>This mix</span>
             <span class="replay__value">${h.toneMark(metric.tone)}${esc(h.signedPercent(m.totalReturn, 1))}</span></span>

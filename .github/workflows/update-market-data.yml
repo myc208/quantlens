@@ -4,7 +4,8 @@ name: Update market data and deploy
 #
 #   refresh  Scheduled and manual runs. Fetches data, validates it, runs the
 #            pipeline unit tests and the browser test suite against the NEW
-#            snapshot, and only then commits it. If any step fails the job stops:
+#            snapshot, and only then commits it (with data/bot_context.json, the
+#            agent-ready summary, when it builds). If any step fails the job stops:
 #            nothing is committed, nothing is deployed, and the site keeps serving
 #            yesterday's data. Last, whatever happened, it sends the daily
 #            Telegram briefing (top signals, headline-tone shifts, run status).
@@ -89,6 +90,14 @@ jobs:
         id: validate
         run: python scripts/fetch_fundamentals.py --validate-only
 
+      # V3.4: data/bot_context.json, the agent-ready summary for a future question-answering bot,
+      # built by the site's engines and the briefing's trigger rules. Before the gates, so they
+      # check it too; continue-on-error, so a missing export can never block the data commit.
+      - name: Build the agent context (bot_context.json)
+        id: context
+        continue-on-error: true
+        run: python scripts/fetch_fundamentals.py --bot-context --previous "$RUNNER_TEMP/previous_snapshot.json"
+
       - name: "Gate 1: pipeline unit tests"
         id: gate1
         run: python -m unittest discover -s scripts -p "test_*.py"
@@ -103,6 +112,7 @@ jobs:
           BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           git add data/market_snapshot.json
+          if [ -f data/bot_context.json ]; then git add data/bot_context.json; fi
           if git diff --cached --quiet; then
             echo "Snapshot unchanged; nothing to commit."
             exit 0

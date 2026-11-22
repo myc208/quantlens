@@ -105,6 +105,33 @@ export function technicalScoreAt(close, high, low) {
 }
 
 /**
+ * The trend state of an asset's last `count` sessions, oldest first (V3.4). Each one is computed
+ * from the window ending that day, exactly as the live engine would have computed it then, so the
+ * last entry is today's live label. `above` (close ≥ SMA 200) and `emaUp` (EMA 20 ≥ EMA 50) are
+ * the two crossings a trend flip is made of; RSI only separates Extended from Uptrend.
+ * @returns {{ date:string, label:string|null, above:boolean|null, emaUp:boolean|null }[]}
+ */
+export function recentTrendStates(asset, count = 3) {
+  const long = asset.longSeries ?? { dates: asset.series.dates, close: asset.series.close };
+  const window = asset.series.close.length;
+  const historyCount = long.close.length - window;
+  const highs = long.close.map((close, i) => (i >= historyCount ? asset.series.high[i - historyCount] : close));
+  const lows = long.close.map((close, i) => (i >= historyCount ? asset.series.low[i - historyCount] : close));
+  const states = [];
+  for (let t = Math.max(window - 1, long.close.length - count); t < long.close.length; t += 1) {
+    const from = t - window + 1;
+    const point = technicalScoreAt(long.close.slice(from, t + 1), highs.slice(from, t + 1), lows.slice(from, t + 1));
+    const label = classifyTrend(point);
+    states.push({
+      date: long.dates[t], label,
+      above: label ? point.close >= point.sma200 : null,
+      emaUp: label ? point.ema20 >= point.ema50 : null,
+    });
+  }
+  return states;
+}
+
+/**
  * A function from an ISO date to the VIX regime of the last session on or before it
  * (normal | elevated | stressed), or null before the history starts.
  * @param {{ history:{dates:string[], vix:number[], vix3m:number[]}, rules:object }|null} regime the normalised macro.regime

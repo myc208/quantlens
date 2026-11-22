@@ -21,8 +21,10 @@ import math
 import random
 import shutil
 import sys
+import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.error
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -1348,8 +1350,10 @@ class MacroCalendar(unittest.TestCase):
 
     def test_the_committed_calendar_is_valid_and_spans_both_offsets(self):
         self.assertEqual(ff.validate_macro_calendar(self.calendar), [])
-        offsets = {event["at"][-6:] for event in self.calendar["events"] if "at" in event}
+        offsets = {event["at"][-6:] for event in self.calendar["events"] if "at" in event and event.get("market") != "SG"}
         self.assertEqual(offsets, {"-05:00", "-04:00"})                       # winter and summer time both present
+        singapore = {event["at"][-6:] for event in self.calendar["events"] if event.get("market") == "SG" and "at" in event}
+        self.assertEqual(singapore, {"+08:00"})                               # SGX half days are Singapore time (V3.4)
         kinds = {event["type"] for event in self.calendar["events"]}
         self.assertTrue({"fomc-decision", "fomc-minutes", "cpi", "market-holiday", "fomc-meeting"} <= kinds)
 
@@ -1565,15 +1569,121 @@ class RiskFirstBriefing(unittest.TestCase):
     def test_moves_fire_beyond_two_and_a_half_sigma_only(self):
         rows = [self.row("EDGE", dailyReturn=-0.03, zScore=-2.50), self.row("OVER", dailyReturn=-0.03, zScore=-2.51)]
         text = self.text(signals=rows)
-        self.assertIn("Moves beyond 2.5σ: OVER −3.0% (−2.5σ)", text)
+        self.assertIn("Big moves: OVER −3.0% (−2.5σ)", text)
         self.assertNotIn("EDGE −3.0%", text.split("US / Global")[0])
 
     def test_a_move_is_reported_once_per_session(self):
         repeat = self.text(previous=self.previous(as_of="2026-11-20"))      # the previous run already had this session
-        self.assertNotIn("Moves beyond", repeat)
+        self.assertNotIn("Big moves", repeat)
         self.assertNotIn("Movers:", repeat)
         first = self.text(previous=None)                                     # nothing to compare with: report it
-        self.assertIn("Moves beyond 2.5σ: MU −13.9% (−2.6σ) · VOO −3.4% (−2.6σ)", first)
+        self.assertIn("Big moves: MU −13.9% (−2.6σ) · VOO −3.4% (−2.6σ)", first)
+
+    # --- T1 absolute-move guardrail (V3.4) ----------------------------------------
+
+    @staticmethod
+    def previous_for(rows, as_of):
+        """A previous snapshot whose assets are these rows, last traded on `as_of`."""
+        return {"assets": [{"ticker": row["ticker"], "assetClass": row["assetClass"], "status": "fresh", "quote": {"asOf": as_of}} for row in rows],
+                "macro": {"regime": {"asOf": as_of}}}
+
+    def test_a_ten_percent_day_fires_even_when_sigma_is_muted(self):
+        rows = [self.row("AMD", dailyReturn=-0.132, zScore=-2.09), self.row("NEAR", dailyReturn=-0.0999, zScore=-1.2),
+                self.row("EXACT", dailyReturn=0.10, zScore=1.1)]
+        text = self.text(signals=rows)
+        self.assertIn("• Big moves: AMD −13.2% (−2.1σ, beyond 10%) · EXACT +10.0% (+1.1σ, beyond 10%)", text)
+        self.assertNotIn("NEAR −10.0%", text.split("US / Global")[0])      # 9.99% stays a mover at most
+
+    def test_each_asset_class_has_its_own_size(self):
+        rows = [self.row("COIN", "crypto", dailyReturn=-0.15, zScore=-1.9), self.row("COIN2", "crypto", dailyReturn=-0.149, zScore=-1.9),
+                self.row("FUND", dailyReturn=-0.05, zScore=-2.0, assetClass="etf"), self.row("FUND2", dailyReturn=-0.049, zScore=-2.0, assetClass="etf")]
+        moved = [row["ticker"] for row in ff.big_moves(rows, {}, weekend=False)]
+        self.assertEqual(moved, ["COIN", "FUND"])
+        self.assertEqual(ff.move_text(rows[2]), "FUND −5.0% (−2.0σ, beyond 5%)")
+        self.assertEqual(ff.move_threshold(self.row("IDX", assetClass="index")), None)   # indices are never tradable anyway
+
+    def test_moves_are_ranked_by_how_far_past_their_trigger_they_are(self):
+        rows = [self.row("SIGMA", dailyReturn=-0.03, zScore=-2.6), self.row("SIZE", dailyReturn=-0.14, zScore=-2.0),
+                self.row("BOTH", dailyReturn=-0.12, zScore=-3.5)]
+        self.assertEqual([row["ticker"] for row in ff.big_moves(rows, {}, weekend=False)], ["SIZE", "BOTH", "SIGMA"])   # 1.40, 1.40 (3.5/2.5), 1.04
+        unknown = self.row("NEW", dailyReturn=-0.11, zScore=None)
+        self.assertEqual(ff.move_text(unknown), "NEW −11.0% (σ not known, beyond 10%)")
+
+    def test_a_size_trigger_is_also_reported_once_per_session_and_crypto_only_at_weekends(self):
+        rows = [self.row("BIG", dailyReturn=-0.12, zScore=-1.5)]
+        self.assertNotIn("Big moves", self.text(signals=rows, previous=self.previous_for(rows, "2026-11-20")))
+        self.assertIn("Big moves", self.text(signals=rows, previous=self.previous_for(rows, "2026-11-19")))
+        self.assertNotIn("Big moves", self.text(signals=rows, now=self.SUNDAY, previous=self.previous_for(rows, "2026-11-19")))
+
+    # --- T6 trend flips (V3.4) ------------------------------------------------------
+
+    @staticmethod
+    def states(*specs):
+        """('Uptrend', True, True) per session, oldest first, on consecutive dates."""
+        days = ["2026-11-18", "2026-11-19", "2026-11-20"][-len(specs):]
+        return [{"date": day, "label": label, "above": above, "emaUp": up} for day, (label, above, up) in zip(days, specs)]
+
+    def test_a_flip_needs_a_second_close(self):
+        up, recovering, pullback = ("Uptrend", True, True), ("Recovering", False, True), ("Pullback", True, False)
+        confirmed = self.row("TSLA", trendHistory=self.states(up, recovering, recovering))
+        self.assertEqual(ff.trend_flip(confirmed), {"ticker": "TSLA", "from": "Uptrend", "to": "Recovering", "date": "2026-11-20",
+                                                   "crossed200": True, "crossedEma": False})
+        self.assertIsNone(ff.trend_flip(self.row("NEW", trendHistory=self.states(up, up, recovering))))           # one close only
+        self.assertIsNone(ff.trend_flip(self.row("BACK", trendHistory=self.states(up, recovering, up))))         # reversed
+        self.assertIsNone(ff.trend_flip(self.row("OLD", trendHistory=self.states(recovering, recovering, recovering))))
+        ema = ff.trend_flip(self.row("EMA", trendHistory=self.states(up, pullback, pullback)))
+        self.assertEqual((ema["crossed200"], ema["crossedEma"]), (False, True))
+        self.assertIsNone(ff.trend_flip(self.row("SHORT", trendHistory=self.states(up, recovering))))
+
+    def test_rsi_alone_is_never_a_flip(self):
+        up, extended = ("Uptrend", True, True), ("Extended", True, True)
+        self.assertIsNone(ff.trend_flip(self.row("HOT", trendHistory=self.states(up, extended, extended))))
+        stretched_pullback = ("Extended", True, False)                       # EMAs already crossed down, RSI above 70
+        self.assertIsNone(ff.trend_flip(self.row("COOL", trendHistory=self.states(stretched_pullback, ("Pullback", True, False), ("Pullback", True, False)))))
+
+    def test_flips_are_listed_200_day_first_capped_and_never_repeated(self):
+        up, recovering, down, pullback = ("Uptrend", True, True), ("Recovering", False, True), ("Downtrend", False, False), ("Pullback", True, False)
+        rows = [self.row("EMA1", trendHistory=self.states(up, pullback, pullback)),
+                self.row("VOO", trendHistory=self.states(pullback, down, down)),
+                self.row("TSLA", trendHistory=self.states(up, recovering, recovering)),
+                self.row("J69U.SI", "sgx", trendHistory=self.states(up, recovering, recovering)),
+                self.row("EMA2", trendHistory=self.states(down, recovering, recovering))]
+        flips = ff.trend_flips(rows, {}, weekend=False)
+        self.assertEqual([flip["ticker"] for flip in flips], ["J69U.SI", "TSLA", "VOO", "EMA1", "EMA2"])
+        text = self.text(signals=rows)
+        self.assertIn("• Trend flips (held two closes): J69U.SI Uptrend → Recovering · TSLA Uptrend → Recovering · "
+                      "VOO Pullback → Downtrend · EMA1 Uptrend → Pullback · +1 more", text)
+        self.assertNotIn("Trend flips", self.text(signals=rows, previous=self.previous_for(rows, "2026-11-20")))   # same session again
+        everything = rows + [self.row("ETH-USD", "crypto", trendHistory=self.states(up, recovering, recovering))]
+        weekend = self.text(signals=everything, now=self.SUNDAY, previous=self.previous_for(everything, "2026-11-19"))
+        self.assertIn("• Trend flips (held two closes): ETH-USD Uptrend → Recovering", weekend)              # crypto only
+
+    def test_flips_sit_after_moves_and_before_tone(self):
+        rows = [self.row("MU", dailyReturn=-0.139, zScore=-2.63, trendHistory=self.states(("Uptrend", True, True), ("Recovering", False, True), ("Recovering", False, True)))]
+        shifts = [{"ticker": "MU", "from": "positive", "to": "negative", "before": 0.5, "after": -0.5, "delta": -1.0, "headline": "H"}]
+        block = self.text(signals=rows, shifts=shifts).split("⚡ Triggers today\n")[1].split("\n\n")[0].split("\n")
+        self.assertEqual([line.split(":")[0] for line in block if line.startswith("•")], ["• Big moves", "• Trend flips (held two closes)", "• Tone"])
+
+    # --- trigger records, shared with data/bot_context.json (V3.4) -----------------------
+
+    def test_triggers_are_records_and_the_message_is_rendered_from_them(self):
+        rows = self.signals() + [self.row("AMD", dailyReturn=-0.132, zScore=-2.09,
+                                          trendHistory=self.states(("Pullback", True, False), ("Downtrend", False, False), ("Downtrend", False, False)))]
+        snapshot, previous = self.snapshot(), self.previous()
+        records = ff.collect_triggers(snapshot, rows, None, previous, self.WEEKDAY, weekend=False)
+        kinds = [record["kind"] for record in records]
+        self.assertEqual(kinds, sorted(kinds, key=["macro", "vix", "move", "flip", "earnings", "tone"].index))
+        moves = {record["ticker"]: record for record in records if record["kind"] == "move"}
+        self.assertEqual(moves["MU"]["rule"], "both")                        # −13.9% and −2.63σ
+        self.assertEqual(moves["VOO"]["rule"], "sigma")                      # an ETF: 3.4% is under its 5%
+        self.assertEqual(moves["AMD"]["rule"], "size")
+        self.assertEqual(moves["AMD"]["threshold"], 0.10)
+        flip = next(record for record in records if record["kind"] == "flip")
+        self.assertEqual((flip["ticker"], flip["from"], flip["to"], flip["crossed200"]), ("AMD", "Pullback", "Downtrend", True))
+        lines, seen = ff.render_triggers(records, ff.BriefingFormat(False))
+        self.assertEqual((lines, seen), ff.briefing_triggers(snapshot, rows, None, previous, self.WEEKDAY, False, ff.BriefingFormat(False)))
+        self.assertEqual(seen["flips"], {"AMD"})
+        self.assertEqual(json_roundtrip(records), records)                   # plain data, ready for JSON
 
     def test_triggered_moves_are_not_repeated_as_bucket_movers(self):
         text = self.text()
@@ -1671,7 +1781,7 @@ class RiskFirstBriefing(unittest.TestCase):
         rows = self.signals()
         rows[-1] = dict(rows[-1], quoteAsOf="2026-11-21", zScore=-3.1, dailyReturn=-0.09)   # a new UTC day for ETH
         text = self.text(signals=rows, now=self.SUNDAY, previous=self.previous(as_of="2026-11-20", regime_as_of="2026-11-20"))
-        self.assertIn("• Moves beyond 2.5σ: ETH-USD −9.0% (−3.1σ)", text)
+        self.assertIn("• Big moves: ETH-USD −9.0% (−3.1σ)", text)
         self.assertNotIn("MU −13.9%", text)
 
     # --- failures, markdown, size ---------------------------------------------------
@@ -1737,6 +1847,10 @@ class RiskFirstBriefing(unittest.TestCase):
             self.assertIsNotNone(row["nextEarnings"]["tradingDays"])
         self.assertTrue(any(row["nextExDividend"] for row in signals))
         self.assertTrue(any(row["relativeStrength3m"] is not None for row in signals))
+        for row in signals:                                                  # V3.4: the last three trend states
+            self.assertEqual(len(row["trendHistory"]), 3, row["ticker"])
+            self.assertEqual(row["trendHistory"][-1]["label"], row["trend"], row["ticker"])
+            self.assertEqual(row["trendHistory"][-1]["date"], row["quoteAsOf"], row["ticker"])
         tradable = [row for row in signals if row["tradable"]]
         tally = ff.tally_text(tradable)                                      # every tradable is counted exactly once
         self.assertEqual(sum(int(part.split(" ")[0]) for part in tally.split(" · ")), len(tradable))
@@ -1744,7 +1858,8 @@ class RiskFirstBriefing(unittest.TestCase):
 
 
 class EarlyCloses(unittest.TestCase):
-    """US half days from the macro calendar end the session at 1:00 p.m. New York (V3.3)."""
+    """Half days from the macro calendar end the session early: 1:00 p.m. New York (V3.3) and
+    12:00 noon Singapore (V3.4). Each market is given its own half days."""
 
     @staticmethod
     def us_frame(last_day: str):
@@ -1755,11 +1870,14 @@ class EarlyCloses(unittest.TestCase):
         half = frozenset({"2026-11-27"})
         self.assertEqual(ff.session_close("US", "2026-11-27", half), dtime(13, 0))
         self.assertEqual(ff.session_close("US", "2026-11-25", half), dtime(16, 0))
-        self.assertEqual(ff.session_close("SG", "2026-11-27", half), dtime(17, 0))   # SGX is not a US half day
+        self.assertEqual(ff.session_close("SG", "2026-11-27", frozenset()), dtime(17, 0))   # SGX is not a US half day
+        self.assertEqual(ff.session_close("SG", "2026-12-24", frozenset({"2026-12-24"})), dtime(12, 0))
+        self.assertEqual(ff.session_close("UK", "2026-12-24", frozenset({"2026-12-24"})), dtime(16, 30))   # no London half days
 
     def test_half_days_come_from_the_calendar(self):
         block = ff.build_calendar(ff.DEFAULT_CALENDAR, datetime(2026, 11, 22, tzinfo=timezone.utc))
         self.assertEqual(ff.early_close_dates(block), frozenset({"2026-11-27", "2026-12-24", "2027-11-26"}))
+        self.assertEqual(ff.early_close_dates(block, "SG"), frozenset({"2026-12-24", "2026-12-31", "2027-02-05", "2027-12-24", "2027-12-31"}))
         self.assertEqual(ff.early_close_dates(ff.empty_calendar("down")), frozenset())
         self.assertEqual(ff.early_close_dates(None), frozenset())
 
@@ -1778,6 +1896,127 @@ class EarlyCloses(unittest.TestCase):
         after = datetime(2026, 11, 27, 18, 25, tzinfo=timezone.utc)
         self.assertEqual(ff.regime_closes(frame, after, frozenset({"2026-11-27"})), {"2026-11-25": 24.5, "2026-11-27": 26.0})
         self.assertEqual(ff.regime_closes(frame, after), {"2026-11-25": 24.5})
+
+
+    @staticmethod
+    def sg_frame(last_day: str):
+        index = pd.DatetimeIndex([pd.Timestamp("2026-12-23", tz="Asia/Singapore"), pd.Timestamp(last_day, tz="Asia/Singapore")])
+        return pd.DataFrame({"Open": [10.0, 11.0], "High": [10.5, 11.5], "Low": [9.5, 10.5], "Close": [10.2, 11.2], "Volume": [100, 100]}, index=index)
+
+    def test_an_sgx_half_day_candle_is_kept_after_12_20_pm_not_before(self):
+        half = frozenset({"2026-12-24"})
+        frame = self.sg_frame("2026-12-24")
+        before = datetime(2026, 12, 24, 4, 15, tzinfo=timezone.utc)    # 12:15 p.m. in Singapore
+        after = datetime(2026, 12, 24, 4, 25, tzinfo=timezone.utc)     # 12:25 p.m.: closed at 12:00, past the buffer
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "SG", before, half)], ["2026-12-23"])
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "SG", after, half)], ["2026-12-23", "2026-12-24"])
+        self.assertEqual([c[0] for c in ff.build_candles(frame, "SG", after)], ["2026-12-23"])   # a normal day closes at 5:00
+
+    def test_each_market_must_close_at_its_own_half_day_time(self):
+        us = {"type": "market-early-close", "date": "2026-12-24", "at": "2026-12-24T13:00:00-05:00", "market": "US", "name": "Christmas Eve"}
+        sg = {"type": "market-early-close", "date": "2026-12-24", "at": "2026-12-24T12:00:00+08:00", "market": "SG", "name": "Christmas Eve"}
+        self.assertEqual(ff.validate_calendar_event(us, "e"), [])
+        self.assertEqual(ff.validate_calendar_event(sg, "e"), [])
+        self.assertTrue(ff.validate_calendar_event({**sg, "at": "2026-12-24T13:00:00-05:00"}, "e"))   # a US time on an SGX half day
+        self.assertTrue(ff.validate_calendar_event({**us, "at": "2026-12-24T12:00:00+08:00"}, "e"))
+        self.assertTrue(ff.validate_calendar_event({**sg, "at": "2026-12-24T12:30:00+08:00"}, "e"))
+        self.assertEqual(ff.early_close_at("US", "2027-07-02"), "2027-07-02T13:00:00-04:00")      # daylight saving in New York
+        self.assertEqual(ff.early_close_at("SG", "2027-02-05"), "2027-02-05T12:00:00+08:00")
+
+    def test_the_briefing_names_each_half_day_in_its_own_time(self):
+        sg = {"type": "market-early-close", "date": "2026-12-24", "market": "SG", "name": "Christmas Eve"}
+        self.assertEqual(ff.closure_text(sg, date_first=True), "Thu 24 Dec: SGX closes 12:00 PM SGT")
+        self.assertEqual(ff.closure_text({**sg, "market": "US"}), "US closes 1:00 PM ET Thu 24 Dec")
+        self.assertEqual(ff.macro_label(sg), "SGX closes 12:00 PM SGT (Christmas Eve)")
+
+
+def json_roundtrip(value):
+    return json.loads(json.dumps(value))
+
+
+class BotContext(unittest.TestCase):
+    """data/bot_context.json (V3.4): the engines' summary plus the briefing's triggers, compact."""
+
+    @staticmethod
+    def cell_asset(ticker: str) -> dict:
+        cells = {key: {"v": 1.0} for key in ff.BOT_CONTEXT_CELLS}
+        cells["shock"] = {"ret": -0.01, "z": -0.5, "date": "2026-11-20"}
+        return {"ticker": ticker, "name": ticker, **cells}
+
+    def context(self, tickers=("AAA", "BBB")) -> dict:
+        engine = {"regime": {"state": "normal", "asOf": "2026-11-20"}, "rotation": {"groups": []},
+                  "assets": [self.cell_asset(ticker) for ticker in tickers]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "snapshot.json"
+            path.write_text(json.dumps({"generatedAt": "2026-11-21T22:00:00Z", "assets": [{"ticker": ticker} for ticker in tickers]}), encoding="utf-8")
+            return ff.build_bot_context(path, None, NOW, signals=[], engine=engine)
+
+    def test_a_built_context_meets_its_contract(self):
+        context = self.context()
+        self.assertEqual(list(context), ["schema", "asOf", "builtAt", "source", "notes", "units", "regime", "events", "triggers", "rotation", "assets"])
+        self.assertEqual(ff.validate_bot_context(context, {"generatedAt": "2026-11-21T22:00:00Z", "assets": [{"ticker": "AAA"}, {"ticker": "BBB"}]}), [])
+        self.assertEqual(context["builtAt"], "2026-11-16T12:00:00Z")
+
+    def test_the_contract_catches_what_a_bot_must_never_see(self):
+        def errors(change, snapshot=None):
+            context = self.context()
+            change(context)
+            return ff.validate_bot_context(context, snapshot)
+        self.assertTrue(errors(lambda c: c["regime"].update(history={"dates": []})))                       # no history
+        self.assertTrue(errors(lambda c: c["assets"][0].update(beta=None)))                                # a value or a reason
+        self.assertTrue(errors(lambda c: c["assets"][0].update(beta={"na": " "})))                         # an empty reason
+        self.assertTrue(errors(lambda c: c["assets"][0].update(closes=list(range(250)))))                  # no candle arrays
+        self.assertTrue(errors(lambda c: c["notes"].append("x" * 60_000)))                                 # the size limit
+        self.assertTrue(errors(lambda c: c["triggers"].append({"kind": "rumour"})))
+        self.assertTrue(errors(lambda c: None, {"generatedAt": "2026-11-20T22:00:00Z", "assets": [{"ticker": "AAA"}, {"ticker": "BBB"}]}))   # stale
+        self.assertTrue(errors(lambda c: None, {"generatedAt": "2026-11-21T22:00:00Z", "assets": [{"ticker": "BBB"}, {"ticker": "AAA"}]}))   # order
+        self.assertEqual(errors(lambda c: c["assets"][0].update(beta={"na": "BTC-USD is its own benchmark."})), [])
+
+    def test_floats_are_rounded_and_the_file_is_compact(self):
+        context = self.context()
+        context["assets"][0]["beta"] = {"v": 1.2345678912}
+        rounded = ff._rounded(context)
+        self.assertEqual(rounded["assets"][0]["beta"], {"v": 1.23457})
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "bot_context.json"
+            size = ff.write_bot_context(rounded, path)
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(size, len(text.encode("utf-8")))
+            self.assertNotIn("\n ", text)                                     # one compact line
+            self.assertEqual(json.loads(text), rounded)
+
+    def test_a_failed_build_writes_nothing_and_exits_1(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "bot_context.json"
+            settings = argparse.Namespace(output=Path(folder) / "missing.json", previous=None)
+            with mock.patch.object(ff, "BOT_CONTEXT_PATH", target), self.assertLogs(ff.LOG, level="WARNING"):
+                self.assertEqual(ff.run_bot_context(settings), 1)
+            self.assertFalse(target.exists())
+
+    @unittest.skipIf(shutil.which("node") is None, "Node.js is not installed")
+    def test_the_real_snapshot_through_the_sites_engines(self):
+        snapshot = ff.load_json(SNAPSHOT_PATH)
+        signals = ff.compute_signals(SNAPSHOT_PATH)
+        context = ff.build_bot_context(SNAPSHOT_PATH, None, NOW, signals=signals)
+        self.assertEqual(ff.validate_bot_context(context, snapshot), [])
+        size = len(json.dumps(context, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self.assertLess(size, ff.BOT_CONTEXT_MAX_BYTES)
+        by_ticker = {asset["ticker"]: asset for asset in context["assets"]}
+        for row in signals:                                                  # the same engines, the same answers
+            self.assertEqual(by_ticker[row["ticker"]]["trend"], {"v": row["trend"]}, row["ticker"])
+        self.assertNotIn("history", context["regime"])
+        self.assertRegex(by_ticker["BTC-USD"]["rs1m"]["na"], "relative strength is 0")
+        self.assertEqual(context["triggers"], json_roundtrip(ff._rounded(ff.collect_triggers(snapshot, signals, None, None, NOW, ff.is_weekend_run(NOW)))))
+        self.assertTrue(all(event["date"] >= "2026-11-16" for event in context["events"]))
+        self.assertEqual(len(context["rotation"]["groups"]), 11)
+
+    def test_the_committed_context_meets_its_contract(self):
+        if not ff.BOT_CONTEXT_PATH.exists():
+            self.skipTest("no data/bot_context.json committed yet")
+        context = ff.load_json(ff.BOT_CONTEXT_PATH)
+        snapshot = ff.load_json(SNAPSHOT_PATH)
+        # A failed export step leaves yesterday's file: still valid, just not this snapshot's.
+        self.assertEqual(ff.validate_bot_context(context, snapshot if context["asOf"] == snapshot["generatedAt"] else None), [])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+# Dependencies of scripts/sync_macro_calendar.py only: the monthly calendar sync.
+# The daily pipeline does not need them and does not install them.
+#
+#   pip install -r scripts/requirements.txt -r scripts/requirements-calendar.txt
+#
+# Pinned: it decides which days the US market is closed, and it runs in the same
+# process as the FRED key, so a new release is taken deliberately, not automatically.
+exchange_calendars==4.13.3

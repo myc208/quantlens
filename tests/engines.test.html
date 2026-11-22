@@ -4263,6 +4263,7 @@
         expect(macroEngine.eventTitle(minutes)).toBe('FOMC minutes (8–9 Dec meeting)');
         expect(macroEngine.eventTitle(holiday)).toBe('US markets closed: Thanksgiving Day');
         expect(macroEngine.eventTitle(early)).toMatch(/close at 1:00 p.m./);
+        expect(macroEngine.eventTitle({ ...early, market: 'SG', name: 'Christmas Eve' })).toBe('SGX closes at 12:00 noon (Christmas Eve)');
         expect(macroEngine.eventTitle(calendarAt().events[9])).toMatch(/no policy decision/);
       });
       test('holidays come off the trading-day count: Thanksgiving week has four US sessions', () => {
@@ -4536,13 +4537,15 @@
         const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
         const { dates, close } = snapshot.byTicker['^GSPC'].longSeries;
         for (const window of replays.CRASH_WINDOWS) {
+          const resolved = replays.resolveWindow(window, snapshot.byTicker['^GSPC']);
           const from = dates.indexOf(window.from);
-          const to = window.to ? dates.indexOf(window.to) : dates.length - 1;
+          const to = dates.indexOf(resolved.to);
           expect(from).toBeGreaterThan(-1);
           expect(to).toBeGreaterThan(from);
           const inside = close.slice(from, to + 1);
           expect(close[from]).toBe(Math.max(...inside));
-          if (!window.ongoing) expect(close[to]).toBe(Math.min(...inside));
+          if (!resolved.ongoing) expect(close[to]).toBe(Math.min(...inside));
+          if (resolved.ongoing) expect(to).toBe(dates.length - 1);          // still falling: to the latest close
         }
         expect(replays.REPLAY_METRIC_IDS).toEqual(['replay:bear2022', 'replay:yen2024', 'replay:tariff2025', 'replay:autumn2026']);
         expect(glossary.hasExplainer('replay:bear2022')).toBeTrue();
@@ -4680,6 +4683,108 @@
         const state = storeModule.reduce(storeModule.createInitialState(''), storeModule.actions.setRotationBenchmark('own'));
         expect(state.rotation).toBe('own');
         expect(storeModule.reduce(state, storeModule.actions.setRotationBenchmark('nope'))).toBe(state);
+      });
+    });
+
+    /* ================================================================== */
+    /* 35. V3.4 recent trend states, for the briefing's trend flips         */
+    /* ================================================================== */
+
+    suite('recent trend states: the last three sessions, as the live engine saw them', () => {
+      test('real snapshot: the last state is today\'s label, and every state agrees with its own crossings', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const fromCrossings = (state) => (state.above ? (state.emaUp ? ['Uptrend', 'Extended'] : ['Pullback', 'Extended']) : [state.emaUp ? 'Recovering' : 'Downtrend']);
+        for (const asset of snapshot.assets) {
+          const states = backtest.recentTrendStates(asset, 3);
+          expect(states.length).toBe(3);
+          expect(states.map((state) => state.date)).toEqual(asset.longSeries.dates.slice(-3));
+          expect(states[2].label).toBe(technical.analyzeTechnicals(asset).metrics.trendRegime.value);
+          for (const state of states) expect(fromCrossings(state)).toContain(state.label);
+        }
+      });
+      test('a short history gives as many states as it can, never a guess', () => {
+        const asset = makeAsset({ ticker: 'NEW', closes: Array.from({ length: 260 }, (_, i) => 100 + i * 0.1) });
+        const states = backtest.recentTrendStates(asset, 3);
+        expect(states.length).toBe(1);                                       // only the live window itself
+        expect(states[0].label).toBe(technical.analyzeTechnicals(asset).metrics.trendRegime.value);
+      });
+    });
+
+    /* ================================================================== */
+    /* 36. V3.4 crash-window auto-cap, and the agent-ready export           */
+    /* ================================================================== */
+
+    suite('crash replays: an open window caps itself once the S&P 500 recovers', () => {
+      const D = ['2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09', '2026-10-12'];
+      const index = (closes) => ({ ticker: '^GSPC', currency: 'USD', assetClass: 'index', series: { dates: D.slice(0, closes.length), close: closes }, longSeries: { dates: D.slice(0, closes.length), close: closes } });
+      const OPEN = Object.freeze({ id: 'open', name: 'Open window', short: 'Open', from: D[0], to: null, ongoing: true, context: 'Fixture.' });
+      test('recovered: the end locks at the lowest close before the first close above the high', () => {
+        const resolved = replays.resolveWindow(OPEN, index([100, 95, 90, 93, 101]));
+        expect(resolved).toEqual({ ...OPEN, to: D[2], ongoing: false, recovered: D[4] });
+        expect(replays.windowStatus(resolved)).toMatch(/closed above that high again on 12 Oct 2026, so the window ends at its lowest close before then, 8 Oct 2026/);
+      });
+      test('still falling, or only back to the high: open to the latest close', () => {
+        expect(replays.resolveWindow(OPEN, index([100, 95, 90, 92]))).toEqual({ ...OPEN, to: D[3], ongoing: true, recovered: null });
+        expect(replays.resolveWindow(OPEN, index([100, 90, 100])).ongoing).toBeTrue();     // equal is not above
+        const fixed = { ...OPEN, to: D[2], ongoing: false };
+        expect(replays.resolveWindow(fixed, index([100, 95, 90, 93, 101]))).toEqual({ ...fixed, recovered: null });
+      });
+      test('a capped replay ends at the trough and says why', () => {
+        const spx = index([100, 95, 90, 93, 101]);
+        const holding = { ticker: 'A', weight: 1, asset: { ticker: 'A', currency: 'USD', assetClass: 'equity', series: { dates: D, close: [50, 48, 44, 46, 52] }, longSeries: { dates: D, close: [50, 48, 44, 46, 52] } } };
+        const replay = replays.replayWindow({ holdings: [holding], benchmark: spx, baseCurrency: 'USD', fx: { series: null, rate: null }, window: OPEN });
+        expect(replay.window.to).toBe(D[2]);
+        expect(replay.totalReturn).toBeCloseTo(44 / 50 - 1, 1e-12);
+        expect(replay.benchmark.totalReturn).toBeCloseTo(-0.1, 1e-12);
+        const metric = replays.replayMetric(replay, OPEN, 'USD');
+        expect(tracer.validateTrace(metric)).toEqual([]);
+        expect(metric.trace.interpretation.summary).toMatch(/held to 8 Oct 2026/);
+        expect(metric.trace.steps[0].expression).toMatch(/capped: recovered on 2026-10-12/);
+      });
+    });
+
+    suite('agent-ready export: data/bot_context.json says what the engines say', () => {
+      test('the benchmark of its own market has a relative strength of 0, not a beta of 1', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const btc = snapshot.byTicker['BTC-USD'];
+        const metrics = factors.analyzeFactors({ asset: btc, series: btc.series, benchmark: null, benchmarkSeries: null }).metrics;
+        expect(metrics.relativeStrength3m.naReason).toMatch(/its relative strength is 0 by definition/);
+        expect(metrics.beta.naReason).toMatch(/its beta is 1 by definition/);
+      });
+      test('committed export: same tickers, and every figure equal to the engines\' when it is this snapshot\'s', async () => {
+        const response = await fetch('../data/bot_context.json', { cache: 'no-store' });
+        expect(response.ok).toBeTrue();
+        const context = await response.json();
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        expect(context.schema).toBe('quantlens.bot_context/1');
+        expect(context.assets.map((asset) => asset.ticker)).toEqual(snapshot.assets.map((asset) => asset.ticker));
+        expect(new TextEncoder().encode(JSON.stringify(context)).length).toBeAtMost(50000);
+        if (context.asOf !== raw.generatedAt) return;                        // a failed export left yesterday's file
+        const close = (actual, expected) => expect(actual).toBeCloseTo(expected, Math.abs(expected) * 1e-5 + 1e-12);
+        const rotation = rotations.analyzeRotation({ assets: snapshot.assets, byTicker: snapshot.byTicker, mode: 'spx', fx: { series: snapshot.fx.series, rate: snapshot.fx.rate } });
+        for (const entry of context.assets) {
+          const asset = snapshot.byTicker[entry.ticker];
+          const bench = snapshot.byTicker[factors.benchmarkFor(asset)] ?? null;
+          const tech = technical.analyzeTechnicals(asset).metrics;
+          const factor = factors.analyzeFactors({ asset, series: asset.series, benchmark: bench, benchmarkSeries: bench ? bench.series : null }).metrics;
+          const riskMetrics = risk.analyzeRisk(asset, asset.series).metrics;
+          const liquidity = liquidityEngine.analyzeLiquidity(asset, { fxRate: snapshot.fx.rate }).metrics;
+          const pairs = [['trend', tech.trendRegime], ['rs3m', factor.relativeStrength3m], ['beta', factor.beta], ['ewmaVol', riskMetrics.ewmaVolatility], ['spread', liquidity.spreadEstimate], ['amihud', liquidity.amihud]];
+          for (const [key, metric] of pairs) {
+            if (metric.status !== 'ok') {
+              expect(entry[key].na).toBe(metric.naReason);
+            } else if (typeof metric.value === 'number') {
+              close(entry[key].v, metric.value);
+            } else {
+              expect(entry[key].v).toBe(metric.value);
+            }
+          }
+          const rotated = rotation.byTicker[entry.ticker];
+          if (rotated) expect(entry.rotation.v ?? null).toBe(rotated.point.ok ? rotated.point.quadrant : null);
+        }
       });
     });
 

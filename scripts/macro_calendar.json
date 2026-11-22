@@ -6,15 +6,20 @@
     "fomc2027": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20261112a.htm",
     "cpi": "https://www.bls.gov/schedule/news_release/cpi.htm",
     "us": "https://www.nyse.com/markets/hours-calendars",
-    "sg": "https://www.mom.gov.sg/employment-practices/public-holidays"
+    "sg": "https://www.mom.gov.sg/employment-practices/public-holidays",
+    "sgx": "https://rulebook.sgx.com/node/9371",
+    "fred": "https://fred.stlouisfed.org/releases/calendar?rid=10",
+    "xnys": "https://github.com/gerrymanoim/exchange_calendars",
+    "sgdata": "https://data.gov.sg/collections/691/view"
   },
   "notes": [
-    "Times are New York time with the UTC offset written out, so no daylight-saving arithmetic is needed. The tests check every offset against America/New_York.",
+    "Times are New York time with the UTC offset written out, so no daylight-saving arithmetic is needed. The tests check every offset against America/New_York. SGX half days are Singapore time (+08:00).",
     "FOMC statements are released at 2:00 p.m. and minutes at 2:00 p.m. New York time. FOMC dates are tentative until confirmed at the preceding meeting.",
     "The October 26-27, 2027 meeting is dedicated to monetary policy strategy and has no policy decision (Fed press release, 12 November 2026). The revised 2027 schedule has no December meeting.",
     "projections: true marks a meeting with a Summary of Economic Projections, set only where the Fed's calendar shows it. 2027 meetings are not marked until it does.",
     "2027 minutes dates follow the Fed's published rule (three weeks after the policy decision) and are marked derived until the calendar lists them.",
-    "Market holidays list weekday closures only (Singapore holidays on a weekend need no entry). Early closes are trading days."
+    "Market holidays list weekday closures only (Singapore holidays on a weekend need no entry). Early closes are trading days: 1:00 p.m. New York on US half days; 12:00 noon Singapore on SGX half days, the eves of Chinese New Year, Christmas and New Year when they fall on a trading day.",
+    "Refreshed monthly by scripts/sync_macro_calendar.py: FOMC from the Fed's calendar page, CPI from FRED (kept as it was when no FRED key is set), US closures and half days from exchange_calendars, Singapore holidays from data.gov.sg, and SGX half days by rule. Each refresh arrives as a pull request to review."
   ],
   "events": [
     { "type": "market-holiday", "date": "2026-11-09", "market": "SG", "name": "Deepavali (observed)" },
@@ -24,15 +29,18 @@
     { "type": "market-early-close", "date": "2026-11-27", "at": "2026-11-27T13:00:00-05:00", "market": "US", "name": "Day after Thanksgiving" },
     { "type": "fomc-decision", "date": "2026-12-09", "at": "2026-12-09T14:00:00-05:00", "meeting": "2026-12-08/09", "projections": true },
     { "type": "cpi", "date": "2026-12-10", "at": "2026-12-10T08:30:00-05:00", "period": "2026-11" },
+    { "type": "market-early-close", "date": "2026-12-24", "at": "2026-12-24T12:00:00+08:00", "market": "SG", "name": "Christmas Eve" },
     { "type": "market-early-close", "date": "2026-12-24", "at": "2026-12-24T13:00:00-05:00", "market": "US", "name": "Christmas Eve" },
     { "type": "market-holiday", "date": "2026-12-25", "market": "SG", "name": "Christmas Day" },
     { "type": "market-holiday", "date": "2026-12-25", "market": "US", "name": "Christmas Day" },
     { "type": "fomc-minutes", "date": "2026-12-30", "at": "2026-12-30T14:00:00-05:00", "meeting": "2026-12-08/09" },
+    { "type": "market-early-close", "date": "2026-12-31", "at": "2026-12-31T12:00:00+08:00", "market": "SG", "name": "New Year's Eve" },
     { "type": "market-holiday", "date": "2027-01-01", "market": "SG", "name": "New Year's Day" },
     { "type": "market-holiday", "date": "2027-01-01", "market": "US", "name": "New Year's Day" },
     { "type": "cpi", "date": "2027-01-13", "at": "2027-01-13T08:30:00-05:00", "period": "2026-12" },
     { "type": "market-holiday", "date": "2027-01-18", "market": "US", "name": "Martin Luther King, Jr. Day" },
     { "type": "fomc-decision", "date": "2027-01-27", "at": "2027-01-27T14:00:00-05:00", "meeting": "2027-01-26/27" },
+    { "type": "market-early-close", "date": "2027-02-05", "at": "2027-02-05T12:00:00+08:00", "market": "SG", "name": "Chinese New Year's Eve" },
     { "type": "market-holiday", "date": "2027-02-08", "market": "SG", "name": "Chinese New Year (observed)" },
     { "type": "cpi", "date": "2027-02-11", "at": "2027-02-11T08:30:00-05:00", "period": "2027-01" },
     { "type": "market-holiday", "date": "2027-02-15", "market": "US", "name": "Washington's Birthday" },
@@ -73,6 +81,8 @@
     { "type": "market-early-close", "date": "2027-11-26", "at": "2027-11-26T13:00:00-05:00", "market": "US", "name": "Day after Thanksgiving" },
     { "type": "fomc-minutes", "date": "2027-12-08", "at": "2027-12-08T14:00:00-05:00", "meeting": "2027-11-16/17", "derived": true },
     { "type": "cpi", "date": "2027-12-10", "at": "2027-12-10T08:30:00-05:00", "period": "2027-11" },
-    { "type": "market-holiday", "date": "2027-12-24", "market": "US", "name": "Christmas Day (observed)" }
+    { "type": "market-holiday", "date": "2027-12-24", "market": "US", "name": "Christmas Day (observed)" },
+    { "type": "market-early-close", "date": "2027-12-24", "at": "2027-12-24T12:00:00+08:00", "market": "SG", "name": "Christmas Eve" },
+    { "type": "market-early-close", "date": "2027-12-31", "at": "2027-12-31T12:00:00+08:00", "market": "SG", "name": "New Year's Eve" }
   ]
 }
