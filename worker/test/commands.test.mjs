@@ -221,6 +221,7 @@ test('every committed asset has a card that fits one message, with its date and 
     assert.ok(text.startsWith(`${asset.ticker} · ${asset.name}`));
     assert.match(text, /Snapshot \d{1,2} \w{3} \d{4} · not financial advice/);
     for (const [field, cell] of Object.entries(asset)) {
+      if (field === 'radar') continue; // V5.0's Decision Radar is not shown by these commands yet
       if (cell && typeof cell === 'object' && typeof cell.na === 'string') assert.ok(text.includes(cell.na), `${asset.ticker}.${field} reason shown verbatim`);
     }
     assert.deepEqual(assetCard(asset, COMMITTED, ENV), lines);

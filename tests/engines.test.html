@@ -196,6 +196,8 @@
     import * as trends from '../src/engines/trendRegimeEngine.js';
     import * as replays from '../src/engines/crashReplayEngine.js';
     import * as rotations from '../src/engines/rotationEngine.js';
+    import * as stress from '../src/engines/stressEngine.js';
+    import * as radar from '../src/engines/radarEngine.js';
     import { plotPoints } from '../src/ui/rotationView.js';
     import { rankCommands, scoreCommand } from '../src/ui/commandPalette.js';
     import { sortRows, BOARD_COLUMNS, DEFAULT_SORT, TREND_RANK } from '../src/ui/leaderboardView.js';
@@ -4761,7 +4763,7 @@
         const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
         expect(context.schema).toBe('quantlens.bot_context/1');
         expect(context.assets.map((asset) => asset.ticker)).toEqual(snapshot.assets.map((asset) => asset.ticker));
-        expect(new TextEncoder().encode(JSON.stringify(context)).length).toBeAtMost(50000);
+        expect(new TextEncoder().encode(JSON.stringify(context)).length).toBeAtMost(64000);
         if (context.asOf !== raw.generatedAt) return;                        // a failed export left yesterday's file
         const close = (actual, expected) => expect(actual).toBeCloseTo(expected, Math.abs(expected) * 1e-5 + 1e-12);
         const rotation = rotations.analyzeRotation({ assets: snapshot.assets, byTicker: snapshot.byTicker, mode: 'spx', fx: { series: snapshot.fx.series, rate: snapshot.fx.rate } });
@@ -4785,8 +4787,319 @@
           const rotated = rotation.byTicker[entry.ticker];
           if (rotated) expect(entry.rotation.v ?? null).toBe(rotated.point.ok ? rotated.point.quadrant : null);
         }
+        if (!context.stress) return;                                         // written before V5.0
+        const regime = stress.analyzeStress(snapshot.macro);
+        expect([context.stress.state, context.stress.multiplier, context.stress.flags]).toEqual([regime.state, regime.multiplier, regime.flags]);
+        for (const entry of context.assets) {
+          const asset = snapshot.byTicker[entry.ticker];
+          const events = eventsEngine.analyzeEvents(asset, { now: new Date(context.builtAt) }).metrics;
+          const result = radar.analyzeRadar(asset, { benchmark: radar.radarBenchmark(asset, snapshot), stress: regime, events });
+          if (result.metrics.healthTier.status !== 'ok') {
+            expect(entry.radar.na).toBe(result.metrics.healthTier.naReason);
+            continue;
+          }
+          expect([entry.radar.tier, entry.radar.score, entry.radar.dividendTrap]).toEqual([result.metrics.healthTier.value, result.metrics.healthScore.value, result.metrics.dividendTrap.meta.trap]);
+          for (const horizon of radar.RADAR_HORIZONS) {
+            const meta = result.metrics[radar.RADAR_CONFIG.horizons[horizon].id].meta;
+            close(entry.radar.stops[horizon].init, Number(meta.initPct.toPrecision(4)));
+            expect(entry.radar.stops[horizon].initPrice).toBe(meta.initPrice);
+          }
+        }
       });
     });
+
+    /* ================================================================== */
+    /* V5.0: the three-pillar macro regime and the Decision Radar          */
+    /* ================================================================== */
+
+    function stressPillar(name, flag, { status = 'fresh', value = 0.01, change = null, twoYearChange = null } = {}) {
+      if (flag === null) return { name, status: 'unavailable', flag: null, asOf: null, source: 'fred', series: 'X', value: null, change: null, from: null, twoYearChange: null, note: 'not read' };
+      return { name, status, flag, asOf: '2026-11-20', source: 'fred', series: 'X', value, change, from: '2026-10-23', twoYearChange, note: null };
+    }
+
+    function stressBlock(volatility, credit, rates) {
+      return {
+        status: 'fresh', asOf: '2026-11-20', state: null, flags: null, active: null, multiplier: null,
+        pillars: { volatility: stressPillar('volatility', volatility, { value: 1.1 }), credit: stressPillar('credit', credit, { value: 0.048 }), rates: stressPillar('rates', rates, { value: -0.002 }) },
+        rules: stress.STRESS_CONFIG.rules, multipliers: stress.STRESS_CONFIG.multipliers, note: null,
+      };
+    }
+
+    suite('stress engine: three pillars counted into Calm, Cautious and Stressed', () => {
+      test('0, 1, 2 and 3 flags: Calm ×1.00, Cautious ×1.15, Stressed ×1.35', () => {
+        const expected = [['Calm', 1], ['Cautious', 1.15], ['Stressed', 1.35], ['Stressed', 1.35]];
+        expected.forEach(([state, multiplier], flags) => {
+          const block = stressBlock(flags >= 1, flags >= 2, flags >= 3);
+          const result = stress.analyzeStress({ stress: block });
+          expect([result.state, result.multiplier, result.flags, result.active, result.status]).toEqual([state, multiplier, flags, 3, 'fresh']);
+          expect(tracer.validateTrace(result.metric)).toEqual([]);
+        });
+      });
+      test('pillars that could not be read are left out of the count, and the status says so', () => {
+        expect(stress.composeStress(stressBlock(true, null, null).pillars).status).toBe('vix-only');
+        expect(stress.composeStress(stressBlock(true, true, null).pillars)).toEqual({ state: 'Stressed', flags: 2, active: 2, multiplier: 1.35, status: 'partial' });
+        const none = stress.analyzeStress({ stress: stressBlock(null, null, null) });
+        expect([none.state, none.multiplier, none.metric.status]).toEqual([null, 1, 'na']);
+      });
+      test('without a stress block the VIX curve decides alone, so the most it can say is Cautious', () => {
+        const inverted = stress.analyzeStress({ regime: { status: 'fresh', asOf: '2026-11-20', ratio: 1.0 } });
+        expect([inverted.state, inverted.multiplier, inverted.status, inverted.fallback]).toEqual(['Cautious', 1.15, 'vix-only', true]);
+        expect(stress.analyzeStress({ regime: { status: 'fresh', asOf: '2026-11-20', ratio: 0.9999 } }).state).toBe('Calm');
+        expect(stress.analyzeStress({ regime: { status: 'unavailable', ratio: null } }).state).toBeNull();
+        expect(stress.analyzeStress(null).multiplier).toBe(1);
+      });
+      test('each pillar says which rule it met', () => {
+        const rules = stress.STRESS_CONFIG.rules;
+        expect(stress.pillarText({ ...stressPillar('credit', true, { value: 0.048, change: 0.002 }) }, rules)).toBe('High-yield spread 4.80%, +0.20 points over 20 sessions: at or above 4.50%');
+        expect(stress.pillarText({ ...stressPillar('credit', true, { value: 0.04, change: 0.005 }) }, rules)).toMatch(/at least 0\.50 points wider in 20 sessions$/);
+        expect(stress.pillarText({ ...stressPillar('rates', true, { value: -0.0012 }) }, rules)).toMatch(/^10Y − 2Y spread −0\.12%: inverted$/);
+        expect(stress.pillarText({ ...stressPillar('rates', true, { value: 0.006, change: 0.0035, twoYearChange: -0.004 }) }, rules)).toMatch(/2-year yield −0\.40 points\): a bull steepening/);
+        expect(stress.pillarText({ name: 'volatility', status: 'fresh', flag: true, value: 1.16 }, rules)).toBe('VIX ÷ VIX3M 1.16: at or above 1.00, the curve is inverted');
+        expect(stress.pillarText(stressPillar('rates', null), rules)).toBe('Not read: not read');
+      });
+      test('the snapshot loader keeps a good block and drops a malformed one with a reason', () => {
+        const good = snapshotService.normaliseStress({ ...stressBlock(true, false, false), state: 'Cautious', flags: 1, active: 3, multiplier: 1.15 });
+        expect(good.problem).toBeNull();
+        expect(good.stress.pillars.credit.value).toBe(0.048);
+        const broken = stressBlock(true, false, false);
+        broken.pillars.credit.flag = 'maybe';
+        const result = snapshotService.normaliseStress(broken);
+        expect(result.stress).toBeNull();
+        expect(result.problem).toMatch(/credit pillar/);
+        expect(snapshotService.normaliseStress(undefined)).toEqual({ stress: null, problem: null });
+      });
+      test('committed snapshot: the browser counts the same state as the pipeline', async () => {
+        const raw = await rawSnapshot();
+        const snapshot = snapshotService.normaliseSnapshot(raw, new Date(raw.generatedAt));
+        const result = stress.analyzeStress(snapshot.macro);
+        expect(tracer.validateTrace(result.metric)).toEqual([]);
+        const stored = raw.macro.stress;
+        if (!stored) {
+          expect(result.status).toBe(snapshot.macro.regime.status === 'unavailable' ? 'unavailable' : 'vix-only');
+          return;
+        }
+        expect([result.state, result.multiplier, result.flags, result.active, result.status]).toEqual([stored.state, stored.multiplier, stored.flags, stored.active, stored.status]);
+      });
+    });
+
+    const RADAR_START = '2025-06-01';
+    /** A normalised asset with a long (adjusted) series of `closes`, one per calendar day. */
+    function radarAsset({ closes, ticker = 'RAD', dividends = { dates: [], amounts: [] }, ...overrides } = {}) {
+      const dates = isoDates(closes.length, RADAR_START);
+      const asset = makeAsset({ ticker, closes: closes.slice(-252), dates: dates.slice(-252), ...overrides });
+      return { ...asset, longSeries: { dates, close: closes.slice() }, dividends };
+    }
+    const flatPrices = (count, price = 100) => Array.from({ length: count }, () => price);
+    const linePrices = (count, start, end) => Array.from({ length: count }, (_, i) => start + ((end - start) * i) / (count - 1));
+    const flatBenchmark = (count = 400, price = 100) => ({ ticker: 'BENCH', name: 'BENCH', series: { dates: isoDates(count, RADAR_START), close: flatPrices(count, price) }, totalReturn: true, fallback: false });
+    const CALM = { state: 'Calm', multiplier: 1, asOf: '2026-11-20' };
+
+    suite('decision radar: the health score, point by point', () => {
+      test('a steady climb near its high earns all four points and is Healthy', () => {
+        const asset = radarAsset({ closes: linePrices(400, 100, 140) });
+        const result = radar.analyzeRadar(asset, { benchmark: flatBenchmark(), stress: CALM });
+        expect(result.metrics.healthScore.value).toBe(4);
+        expect(result.metrics.healthScore.meta.points).toEqual({ trend: true, strength: true, momentum: true, drawdown: true });
+        expect(result.metrics.healthTier.value).toBe('Healthy');
+        expect(result.scores).toEqual([4, 4, 4]);
+        for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('a steady slide earns nothing on three sessions running and is Dead Money', () => {
+        const result = radar.analyzeRadar(radarAsset({ closes: linePrices(400, 200, 120) }), { benchmark: flatBenchmark(), stress: CALM });
+        expect(result.scores).toEqual([0, 0, 0]);
+        expect([result.metrics.healthTier.value, result.metrics.healthTier.meta.held]).toEqual(['Dead Money', false]);
+      });
+      test('trend: the close must be above the 50-day average and the 50-day above the 200-day, strictly', () => {
+        const flat = radarAsset({ closes: flatPrices(400) });
+        expect(radar.scoreSession(flat, flat.longSeries, 399, { benchmark: flatBenchmark() }).trend).toBeFalse();
+        const climb = radarAsset({ closes: linePrices(400, 100, 120) });
+        expect(radar.scoreSession(climb, climb.longSeries, 399, { benchmark: flatBenchmark() }).trend).toBeTrue();
+        expect(radar.scoreSession(climb, climb.longSeries, 198, { benchmark: flatBenchmark() })).toBeNull();   // no 200-day average yet
+      });
+      test('strength: ahead of the benchmark over 91 days, never level with it; its own benchmark earns nothing', () => {
+        const asset = radarAsset({ closes: flatPrices(400) });
+        const falling = { ...flatBenchmark(), series: { dates: isoDates(400, RADAR_START), close: linePrices(400, 110, 100) } };
+        expect(radar.scoreSession(asset, asset.longSeries, 399, { benchmark: falling }).ahead).toBeTrue();
+        expect(radar.scoreSession(asset, asset.longSeries, 399, { benchmark: flatBenchmark() }).ahead).toBeFalse();
+        expect(radar.scoreSession(asset, asset.longSeries, 399, { benchmark: { self: true, ticker: 'RAD' } }).ahead).toBeFalse();
+      });
+      test('momentum: a rise over 30 days, or a steady income asset (yield 3.5% or more, volatility under 22%)', () => {
+        const flat = radarAsset({ closes: flatPrices(400) });
+        expect(radar.scoreSession(flat, flat.longSeries, 399, {}).momentum).toBeFalse();               // a 0% month is not a rise
+        const dates = isoDates(400, RADAR_START);
+        const paying = (total) => radarAsset({ closes: flatPrices(400), dividends: { dates: [dates[250], dates[340]], amounts: [total / 2, total / 2] } });
+        const income = radar.scoreSession(paying(3.6), paying(3.6).longSeries, 399, {});
+        expect([income.income, income.steady, income.momentum]).toEqual([true, true, true]);
+        expect(radar.scoreSession(paying(3.4), paying(3.4).longSeries, 399, {}).momentum).toBeFalse();
+        const rising = radarAsset({ closes: [...flatPrices(370), ...linePrices(30, 100, 101)] });
+        expect(radar.scoreSession(rising, rising.longSeries, 399, {}).momentum).toBeTrue();
+      });
+      test('drawdown: less than 12% below the 52-week high', () => {
+        const at = (last) => {
+          const asset = radarAsset({ closes: [...flatPrices(399), last] });
+          return radar.scoreSession(asset, asset.longSeries, 399, {});
+        };
+        expect([at(88.01).contained, at(87.99).contained]).toEqual([true, false]);
+        expect(at(87.99).drawdown).toBeCloseTo(-0.1201, 1e-12);
+        const old = radarAsset({ closes: [150, ...flatPrices(399)] });                                 // a high older than a year is forgotten
+        expect(radar.scoreSession(old, old.longSeries, 399, {}).drawdown).toBe(0);
+      });
+      test('the trailing yield counts ex-dates in the last 365 days only', () => {
+        const dates = isoDates(400, RADAR_START);
+        const dividends = { dates: [dates[399 - 365], dates[399 - 364], dates[399]], amounts: [9, 1, 2] };
+        const result = radar.trailingYield(dividends, dates[399], 100);
+        expect([result.total, result.payments, result.value]).toEqual([3, 2, 0.03]);
+        expect(radar.trailingYield(dividends, dates[399], 0).value).toBeNull();
+      });
+    });
+
+    suite('decision radar: tiers, hysteresis and dividend traps', () => {
+      test('Dead Money needs 0-1 on each of the last three sessions; otherwise it holds at Neutral', () => {
+        const cases = [
+          [[4, 1, 1], 'Healthy', false], [[3, 0, 0], 'Healthy', false], [[2, 0, 0], 'Neutral', false],
+          [[1, 1, 0], 'Dead Money', false], [[0, 0, 0], 'Dead Money', false],
+          [[1, 2, 0], 'Neutral', true], [[0, 0, 2], 'Neutral', true], [[1, 1], 'Neutral', true], [[0], 'Neutral', true],
+        ];
+        for (const [scores, tier, held] of cases) expect([radar.healthTier(scores).tier, radar.healthTier(scores).held]).toEqual([tier, held]);
+        expect(radar.healthTier([]).tier).toBeNull();
+      });
+      test('a high yield with a deep drawdown or a losing year is a dividend trap', () => {
+        const trap = (dividendYield, drawdown, yearReturn) => radar.dividendTrap({ dividendYield, drawdown, yearReturn });
+        expect(trap(0.029, -0.5, -0.5)).toEqual({ trap: false, eligible: false, deep: false, losing: false });
+        expect(trap(0.04, -0.1001, 0.05).trap).toBeTrue();                  // deeper than 2.5 × 4% = 10%
+        expect(trap(0.04, -0.0999, 0.05).trap).toBeFalse();
+        expect(trap(0.04, -0.02, -0.001)).toEqual({ trap: true, eligible: true, deep: false, losing: true });
+        expect(trap(0.03, -0.08, null).trap).toBeTrue();                    // exactly 3% is checked; 8% > 7.5%
+      });
+      test('the trap is reported on the asset, with its reasons', () => {
+        const dates = isoDates(400, RADAR_START);
+        const closes = [...flatPrices(300, 100), ...linePrices(100, 100, 80)];
+        const asset = radarAsset({ closes, dividends: { dates: [dates[300], dates[390]], amounts: [3, 3] } });
+        const result = radar.analyzeRadar(asset, { benchmark: flatBenchmark(), stress: CALM });
+        expect(result.metrics.dividendYield.value).toBeCloseTo(6 / 80, 1e-12);
+        expect(result.metrics.dividendTrap.value).toBe('Dividend trap');
+        expect([result.metrics.dividendTrap.meta.deep, result.metrics.dividendTrap.meta.losing]).toEqual([true, true]);
+      });
+    });
+
+    suite('decision radar: two-stage stops, checked by hand', () => {
+      test('the three horizons from σ = 1% a day in a calm market', () => {
+        const short = radar.horizonStop('short', 0.01, 1);
+        expect(short.initPct).toBeCloseTo(-0.02 * Math.sqrt(5), 1e-12);               // 4.47%
+        expect(short.breakevenPct).toBeCloseTo(1.25 * 0.02 * Math.sqrt(5), 1e-12);
+        expect(short.trailPct).toBeCloseTo(-0.02 * Math.sqrt(5), 1e-12);
+        const medium = radar.horizonStop('medium', 0.01, 1);
+        expect(medium.initPct).toBeCloseTo(-0.02 * Math.sqrt(21), 1e-12);             // 9.17%
+        expect(medium.trailPct).toBeCloseTo(-1.15 * 0.02 * Math.sqrt(21), 1e-12);
+        const long = radar.horizonStop('long', 0.01, 1);                               // 11.46% is under the 12% floor
+        expect([long.initPct, long.floored]).toEqual([-0.12, true]);
+        expect(long.breakevenPct).toBeCloseTo(0.18, 1e-12);
+        expect(long.trailPct).toBeCloseTo(-0.15, 1e-12);
+      });
+      test('the regime multiplier widens every stop; floors and the 25% cap hold', () => {
+        expect(radar.horizonStop('short', 0.01, 1.35).initPct).toBeCloseTo(-0.02 * Math.sqrt(5) * 1.35, 1e-12);
+        const quiet = radar.RADAR_HORIZONS.map((horizon) => radar.horizonStop(horizon, 0.001, 1).initPct);
+        expect(quiet).toEqual([-0.04, -0.07, -0.12]);
+        const wild = radar.horizonStop('medium', 0.05, 1.35);
+        expect([wild.initPct, wild.capped, wild.breakevenPct]).toEqual([-0.25, true, 0.3125]);
+        expect(wild.trailPct).toBeCloseTo(-0.2875, 1e-12);
+      });
+      test('prices round to the tick: stops down, the breakeven trigger up', () => {
+        expect(radar.roundToTick(58.0449, 0.01, 'down')).toBe(58.04);
+        expect(radar.roundToTick(58.0449, 0.01, 'up')).toBe(58.05);
+        expect(radar.roundToTick(58.04, 0.01, 'down')).toBe(58.04);
+        expect(radar.roundToTick(58.04, 0.01, 'up')).toBe(58.04);
+        expect(radar.roundToTick(0.9973, 0.005, 'down')).toBe(0.995);
+        const sgx = { ...makeAsset({ ticker: 'X.SI' }), market: 'SG', currency: 'SGD' };
+        const prices = radar.stopPrices(sgx, 1.05, radar.horizonStop('medium', 0.001, 1));   // a 7% stop crosses below S$1
+        expect([prices.init.price, prices.init.tick, prices.init.modelled]).toEqual([0.975, 0.005, true]);
+        expect([prices.breakeven.price, prices.breakeven.tick]).toEqual([1.15, 0.01]);
+        const london = { ...makeAsset({ ticker: 'X.L' }), market: 'UK' };
+        expect(radar.priceStep(london, 600)).toEqual({ tick: 0.01, modelled: false });
+        expect(radar.priceStep({ ...makeAsset(), assetClass: 'crypto', market: 'CRYPTO' }, 0.5)).toEqual({ tick: 0.0001, modelled: false });
+      });
+      test('a stop uses the daily EWMA volatility and the regime, and is never tighter after rounding', () => {
+        const asset = radarAsset({ closes: randomWalk(400, { sigma: 0.015 }) });
+        const result = radar.analyzeRadar(asset, { benchmark: flatBenchmark(), stress: { state: 'Stressed', multiplier: 1.35 } });
+        const daily = Math.sqrt(risk.ewmaVariance(pm.logReturns(asset.longSeries.close.slice(-252))).next);
+        for (const horizon of radar.RADAR_HORIZONS) {
+          const spec = radar.RADAR_CONFIG.horizons[horizon];
+          const metric = result.metrics[spec.id];
+          expect(tracer.validateTrace(metric)).toEqual([]);
+          expect(metric.meta.sigmaDaily).toBeCloseTo(daily, 1e-12);
+          expect(metric.value).toBeCloseTo(-Math.min(Math.max(spec.k * daily * Math.sqrt(spec.days) * 1.35, spec.floor), 0.25), 1e-12);
+          const close = asset.quote.lastClose;
+          expect(metric.meta.initPrice).toBeAtMost(close * (1 + metric.meta.initPct) + 1e-9);
+          expect(metric.meta.breakevenPrice).toBeAtLeast(close * (1 + metric.meta.breakevenPct) - 1e-9);
+          expect(metric.meta.trailPrice).toBeAtMost(close * (1 + metric.meta.trailPct) + 1e-9);
+        }
+      });
+    });
+
+    suite('decision radar: benchmarks, warnings and what is left out', () => {
+      test('the benchmark: VOO for US and London, ES3.SI for SGX (^STI if it is missing), Bitcoin for crypto', () => {
+        const series = { dates: ['2026-11-20'], close: [1] };
+        const byTicker = { VOO: { ticker: 'VOO', longSeries: series }, '^STI': { ticker: '^STI', longSeries: series }, 'BTC-USD': { ticker: 'BTC-USD', longSeries: series } };
+        const of = (asset, benchmarks = {}) => radar.radarBenchmark(asset, { byTicker, benchmarks });
+        expect(of({ ticker: 'AMD', market: 'US', assetClass: 'equity' }).ticker).toBe('VOO');
+        expect(of({ ticker: 'CSPX.L', market: 'UK', assetClass: 'etf' }).ticker).toBe('VOO');
+        expect(of({ ticker: 'VOO', market: 'US', assetClass: 'etf' })).toEqual({ self: true, ticker: 'VOO' });
+        const withEtf = of({ ticker: 'D05.SI', market: 'SG', assetClass: 'equity' }, { 'ES3.SI': { series } });
+        expect([withEtf.ticker, withEtf.totalReturn, withEtf.fallback]).toEqual(['ES3.SI', true, false]);
+        const withoutEtf = of({ ticker: 'D05.SI', market: 'SG', assetClass: 'equity' });
+        expect([withoutEtf.ticker, withoutEtf.totalReturn, withoutEtf.fallback]).toEqual(['^STI', false, true]);
+        expect(of({ ticker: 'ETH-USD', market: 'CRYPTO', assetClass: 'crypto' }).ticker).toBe('BTC-USD');
+        expect(of({ ticker: '^GSPC', market: 'US', assetClass: 'index' })).toBeNull();
+      });
+      test('ex-dividend within 10 trading days, and an earnings gap larger than a stop within 15', () => {
+        const stops = { short: radar.horizonStop('short', 0.01, 1), medium: radar.horizonStop('medium', 0.01, 1), long: radar.horizonStop('long', 0.01, 1) };
+        const ok = (meta, value = null) => ({ status: 'ok', value, meta });
+        const events = (exDays, earningsDays, typical) => ({
+          nextExDividend: ok({ date: '2026-12-01', tradingDays: exDays, estimated: true, amount: 0.5, dropFraction: 0.005 }),
+          nextEarnings: ok({ date: '2026-12-10', tradingDays: earningsDays }),
+          earningsMove: ok({ worst: -0.15 }, typical),
+        });
+        const asset = makeAsset();
+        const both = radar.radarWarnings(asset, events(10, 15, 0.1), stops);
+        expect(both.map((warning) => warning.kind)).toEqual(['ex-dividend', 'earnings-gap']);
+        expect([both[0].drop, both[0].estimated, both[0].currency]).toEqual([0.005, true, 'USD']);
+        expect(both[1].horizons.map((entry) => entry.horizon)).toEqual(['short', 'medium']);   // 10% is beyond 4.47% and 9.17%, not 12%
+        expect(both[1].worstMove).toBe(-0.15);
+        expect(radar.radarWarnings(asset, events(11, 16, 0.1), stops)).toEqual([]);
+        expect(radar.radarWarnings(asset, events(11, 5, 0.03), stops)).toEqual([]);                // inside every stop
+        expect(radar.radarWarnings(asset, null, stops)).toEqual([]);
+      });
+      test('indices and short histories are not in the radar, with the reason', () => {
+        const index = radar.analyzeRadar({ ...radarAsset({ closes: flatPrices(400) }), assetClass: 'index' }, { stress: CALM });
+        expect(radar.RADAR_METRIC_IDS.every((id) => index.metrics[id].naReason === 'Indices are not in the radar: they cannot be bought.')).toBeTrue();
+        const young = radar.analyzeRadar(radarAsset({ closes: flatPrices(150) }), { stress: CALM });
+        expect(young.metrics.healthTier.naReason).toMatch(/200 daily closes/);
+        for (const metric of [...Object.values(index.metrics), ...Object.values(young.metrics)]) expect(tracer.validateTrace(metric)).toEqual([]);
+      });
+      test('committed snapshot: every tradable asset has a radar that honours its own rules', async () => {
+        const raw = await rawSnapshot();
+        const now = new Date(raw.generatedAt);
+        const snapshot = snapshotService.normaliseSnapshot(raw, now);
+        const regime = stress.analyzeStress(snapshot.macro);
+        for (const asset of snapshot.assets) {
+          const events = eventsEngine.analyzeEvents(asset, { now }).metrics;
+          const result = radar.analyzeRadar(asset, { benchmark: radar.radarBenchmark(asset, snapshot), stress: regime, events });
+          for (const metric of Object.values(result.metrics)) expect(tracer.validateTrace(metric)).toEqual([]);
+          if (asset.assetClass === 'index') continue;
+          const tier = result.metrics.healthTier.value;
+          expect(radar.RADAR_TIERS.includes(tier)).toBeTrue();
+          expect(tier).toBe(radar.healthTier(result.scores).tier);
+          for (const horizon of radar.RADAR_HORIZONS) {
+            const meta = result.metrics[radar.RADAR_CONFIG.horizons[horizon].id].meta;
+            expect(meta.initPct).toBeAtLeast(-0.25);
+            expect(meta.multiplier).toBe(regime.multiplier);
+            expect(meta.initPrice < asset.quote.lastClose && asset.quote.lastClose < meta.breakevenPrice).toBeTrue();
+            if (meta.tickModelled) expect(Math.abs(meta.initPrice / meta.tick - Math.round(meta.initPrice / meta.tick))).toBeAtMost(1e-6);
+          }
+        }
+      });
+    });
+
 
     /* ================================================================== */
     /* Runner and report                                                   */

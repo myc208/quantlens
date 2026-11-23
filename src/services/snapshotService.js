@@ -51,6 +51,13 @@ const REGIME_LEVEL_BOUNDS = Object.freeze({ min: 1, max: 200 });
 export const CALENDAR_TYPES = Object.freeze(['fomc-decision', 'fomc-meeting', 'fomc-minutes', 'cpi', 'market-holiday', 'market-early-close']);
 const TIMED_CALENDAR_TYPES = ['fomc-decision', 'fomc-minutes', 'cpi', 'market-early-close'];
 const OFFSET_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/;
+// V5.0: macro.stress, the three-pillar macro regime (volatility, credit, rates) written by the
+// pipeline's --stress step, and `benchmarks`, total-return benchmarks outside the watchlist.
+export const STRESS_PILLARS = Object.freeze(['volatility', 'credit', 'rates']);
+export const STRESS_STATES = Object.freeze(['Calm', 'Cautious', 'Stressed']);
+const STRESS_STATUSES = ['fresh', 'partial', 'vix-only', 'unavailable'];
+const STRESS_RULE_KEYS = ['volRatio', 'creditLevel', 'creditWidening', 'ratesInverted', 'ratesSteepening', 'window'];
+export const MAX_BENCHMARK_ROWS = 400;
 
 const ASSET_CLASSES = ['equity', 'etf', 'index', 'crypto'];
 const MARKETS = ['US', 'SG', 'UK', 'CRYPTO'];
@@ -447,6 +454,90 @@ export function normaliseRegime(raw) {
   };
 }
 
+/**
+ * The three-pillar macro stress block (V5.0). Never throws: a missing block (a snapshot written
+ * before V5.0, or a run whose --stress step did not finish) is null, and the stress engine then
+ * reads the VIX pillar from the regime alone; a malformed one is null with a problem.
+ * @returns {{ stress: object|null, problem: string|null }}
+ */
+export function normaliseStress(raw) {
+  if (raw === undefined || raw === null) return { stress: null, problem: null };
+  const fail = (why) => ({ stress: null, problem: `the macro stress block is unusable: ${why}` });
+  if (!isPlainObject(raw) || !STRESS_STATUSES.includes(raw.status)) return fail('it is malformed');
+  if (!isPlainObject(raw.rules) || !STRESS_RULE_KEYS.every((key) => isNum(raw.rules[key]))) return fail('its thresholds are missing');
+  if (!isPlainObject(raw.multipliers) || !STRESS_STATES.every((state) => isNum(raw.multipliers[state]) && raw.multipliers[state] >= 1)) {
+    return fail('its multipliers are missing');
+  }
+  if (!isPlainObject(raw.pillars)) return fail('it has no pillars');
+  const pillars = {};
+  for (const name of STRESS_PILLARS) {
+    const pillar = raw.pillars[name];
+    if (!isPlainObject(pillar) || !SECTION_STATUSES.includes(pillar.status)) return fail(`the ${name} pillar is malformed`);
+    const read = pillar.status !== 'unavailable';
+    if (read && (typeof pillar.flag !== 'boolean' || !isNum(pillar.value) || !isIsoDate(pillar.asOf))) return fail(`the ${name} pillar has no reading`);
+    const numberOrNull = (value) => (isNum(value) ? value : null);
+    pillars[name] = Object.freeze({
+      name, status: pillar.status, flag: read ? pillar.flag : null, asOf: read ? pillar.asOf : null,
+      source: textOrNull(pillar.source), series: textOrNull(pillar.series), value: read ? pillar.value : null,
+      change: numberOrNull(pillar.change), from: isIsoDate(pillar.from) ? pillar.from : null,
+      twoYearChange: numberOrNull(pillar.twoYearChange), note: textOrNull(pillar.note),
+    });
+  }
+  return {
+    problem: null,
+    stress: Object.freeze({
+      status: raw.status, asOf: isIsoDate(raw.asOf) ? raw.asOf : null,
+      state: STRESS_STATES.includes(raw.state) ? raw.state : null,
+      flags: Number.isInteger(raw.flags) ? raw.flags : null, active: Number.isInteger(raw.active) ? raw.active : null,
+      multiplier: isNum(raw.multiplier) ? raw.multiplier : null,
+      pillars: Object.freeze(pillars), rules: Object.freeze({ ...raw.rules }), multipliers: Object.freeze({ ...raw.multipliers }),
+      note: textOrNull(raw.note),
+    }),
+  };
+}
+
+/**
+ * Total-return benchmarks outside the watchlist (V5.0), by ticker. A malformed or unavailable
+ * entry is left out, so the radar falls back to the price index.
+ * @returns {{ benchmarks: Record<string, object>, problems: string[] }}
+ */
+export function normaliseBenchmarks(raw) {
+  const benchmarks = {};
+  const problems = [];
+  if (raw === undefined || raw === null) return { benchmarks: Object.freeze(benchmarks), problems };
+  if (!isPlainObject(raw)) return { benchmarks: Object.freeze(benchmarks), problems: ['the benchmarks block is malformed'] };
+  for (const [ticker, block] of Object.entries(raw)) {
+    if (!TICKER_PATTERN.test(ticker) || !isPlainObject(block) || !SECTION_STATUSES.includes(block.status)) {
+      problems.push(`benchmark ${ticker} is malformed`);
+      continue;
+    }
+    if (block.status === 'unavailable') continue;
+    const rows = Array.isArray(block.series) ? block.series : null;
+    const dates = [];
+    const close = [];
+    let ok = rows !== null && rows.length > 0 && rows.length <= MAX_BENCHMARK_ROWS;
+    for (const row of ok ? rows : []) {
+      if (!Array.isArray(row) || row.length !== 2 || !isIsoDate(row[0]) || (dates.length && row[0] <= dates[dates.length - 1]) || !isNum(row[1]) || row[1] <= 0) {
+        ok = false;
+        break;
+      }
+      dates.push(row[0]);
+      close.push(row[1]);
+    }
+    if (!ok) {
+      problems.push(`benchmark ${ticker} has malformed closes`);
+      continue;
+    }
+    benchmarks[ticker] = Object.freeze({
+      ticker, name: textOrNull(block.name) ?? ticker, market: MARKETS.includes(block.market) ? block.market : null,
+      currency: CURRENCY_PATTERN.test(block.currency) ? block.currency : null, status: block.status,
+      asOf: dates[dates.length - 1], note: textOrNull(block.note),
+      series: Object.freeze({ dates: Object.freeze(dates), close: Object.freeze(close) }),
+    });
+  }
+  return { benchmarks: Object.freeze(benchmarks), problems };
+}
+
 function unavailableCalendar(note) {
   return Object.freeze({ status: 'unavailable', updated: null, coverage: null, events: Object.freeze([]), note });
 }
@@ -508,7 +599,9 @@ export function normaliseMacro(raw) {
   if (problem) problems.push(problem);
   const { calendar, problem: calendarProblem } = normaliseCalendar(isPlainObject(raw) ? raw.calendar : undefined);
   if (calendarProblem) problems.push(calendarProblem);
-  return { macro: Object.freeze({ riskFree: Object.freeze(riskFree), regime, calendar }), problems };
+  const { stress, problem: stressProblem } = normaliseStress(isPlainObject(raw) ? raw.stress : undefined);
+  if (stressProblem) problems.push(stressProblem);
+  return { macro: Object.freeze({ riskFree: Object.freeze(riskFree), regime, calendar, stress }), problems };
 }
 
 function normaliseFxSeries(raw) {
@@ -575,6 +668,7 @@ export function validateSnapshot(raw) {
       sectionProblems.push(`forecastFields must be [${FORECAST_FIELDS.join(', ')}]`);
     }
     sectionProblems.push(...normaliseMacro(raw.macro).problems);
+    sectionProblems.push(...normaliseBenchmarks(raw.benchmarks).problems);
     const fxSeries = normaliseFxSeries(isPlainObject(fx) ? fx.series : undefined);
     if (fxSeries.problem) sectionProblems.push(fxSeries.problem);
   }
@@ -811,7 +905,8 @@ export function describeAge(generatedAt, now = new Date()) {
  * The result always has the v2 shape:
  *   { schemaVersion, generatedAt, ageHours, ageDays, freshness,
  *     fx: { base, quote, rate, asOf, series: { dates, rates } },
- *     macro: { riskFree: { USD, SGD }, regime, calendar },
+ *     macro: { riskFree: { USD, SGD }, regime, calendar, stress },
+ *     benchmarks: { [ticker]: { series: { dates, close }, ... } },
  *     assets: [{ ...core, news, forecast }], byTicker, sectors, staleTickers, warnings }
  */
 export function normaliseSnapshot(raw, now = new Date()) {
@@ -854,6 +949,7 @@ export function normaliseSnapshot(raw, now = new Date()) {
       series: normaliseFxSeries(isV2 ? raw.fx.series : undefined).series,
     }),
     macro: normaliseMacro(isV2 ? raw.macro : undefined).macro,
+    benchmarks: normaliseBenchmarks(isV2 ? raw.benchmarks : undefined).benchmarks,
     assets: Object.freeze(assets),
     byTicker: Object.freeze(byTicker),
     sectors: Object.freeze(sectors),

@@ -16,7 +16,9 @@ name: Update market data and deploy
 #            after a successful test on a push to the default branch.
 #
 # One-time setup: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
-# Optional: repository secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID turn on the
+# Optional: repository secret FRED_API_KEY adds the credit and rates pillars of the macro
+# regime (V5.0; without it the VIX pillar decides alone), and is also used by the monthly
+# calendar sync. Repository secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID turn on the
 # daily briefing. TELEGRAM_CHAT_ID may list several chats separated by commas; logs
 # name them only as "recipient k of n". Without the secrets the step does nothing.
 
@@ -85,6 +87,16 @@ jobs:
       - name: Fetch candles, fundamentals, news and macro data
         id: fetch
         run: python scripts/fetch_fundamentals.py
+
+      # V5.0: the credit and rates pillars of the macro regime, from FRED. The key is given to this
+      # step alone, never to the steps that run third-party data code. It never fails: without the
+      # key, or when FRED is down, the snapshot keeps the VIX pillar (and yesterday's FRED readings,
+      # for up to five days), and a block that would not validate is not written at all.
+      - name: Add the macro stress pillars (FRED)
+        id: stress
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python scripts/fetch_fundamentals.py --stress --previous "$RUNNER_TEMP/previous_snapshot.json"
 
       - name: Validate the snapshot schema
         id: validate

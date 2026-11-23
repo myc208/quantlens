@@ -13,6 +13,12 @@
  * ex-dividend dates. A value is { "v": ... } or { "na": "<the engine's own reason>" }.
  * Plus the market regime (without its five-year history) and the rotation group medians.
  *
+ * V5.0 adds the three-pillar macro regime (`stress`: volatility, credit and rates, with the
+ * multiplier that widens every stop) and, per tradable asset, the Decision Radar (`radar`): its
+ * health tier and score on total return, the dividend-trap check, two-stage stops for three
+ * horizons as fractions and tick-rounded prices at the last close, and ex-dividend and
+ * earnings-gap warnings. Indices carry { "na": reason } instead.
+ *
  * fetch_fundamentals.py --bot-context adds the triggers (the same rules as the Telegram
  * briefing) and the next 30 days of events, checks the size, and writes the file.
  *
@@ -31,6 +37,8 @@ import { analyzeLiquidity } from '../src/engines/liquidityEngine.js';
 import { analyzeEvents } from '../src/engines/eventEngine.js';
 import { holidaysFor } from '../src/engines/macroCalendarEngine.js';
 import { analyzeRotation } from '../src/engines/rotationEngine.js';
+import { analyzeStress } from '../src/engines/stressEngine.js';
+import { analyzeRadar, radarBenchmark, RADAR_CONFIG, RADAR_HORIZONS } from '../src/engines/radarEngine.js';
 
 /** Rounded for size: about seven significant figures is far beyond what the inputs support. */
 function round(value, digits = 6) {
@@ -48,12 +56,52 @@ export function cell(metric) {
   return { v: typeof metric.value === 'number' ? round(metric.value) : metric.value };
 }
 
+/** The three-pillar macro regime, as the engine counted it (the VIX pillar alone without FRED data). */
+export function stressCell(stress) {
+  const pillars = {};
+  for (const [name, pillar] of Object.entries(stress.pillars)) {
+    pillars[name] = pillar.status === 'unavailable'
+      ? { status: 'unavailable', note: pillar.note }
+      : { status: pillar.status, flag: pillar.flag, value: round(pillar.value), change: round(pillar.change), from: pillar.from,
+        twoYearChange: round(pillar.twoYearChange), asOf: pillar.asOf, series: pillar.series };
+  }
+  return {
+    state: stress.state, multiplier: stress.multiplier, flags: stress.flags, active: stress.active, status: stress.status,
+    pillars, rules: stress.rules, note: stress.note,
+  };
+}
+
+/** One asset's Decision Radar: values and reference prices, never the derivation. */
+export function radarCell(radar) {
+  const { metrics } = radar;
+  if (metrics.healthTier.status !== 'ok') return { na: metrics.healthTier.naReason };
+  const score = metrics.healthScore.meta;
+  const stops = {};
+  for (const horizon of RADAR_HORIZONS) {
+    const metric = metrics[RADAR_CONFIG.horizons[horizon].id];
+    stops[horizon] = metric.status !== 'ok' ? { na: metric.naReason } : {
+      init: round(metric.meta.initPct, 4), breakeven: round(metric.meta.breakevenPct, 4), trail: round(metric.meta.trailPct, 4),
+      initPrice: metric.meta.initPrice, breakevenPrice: metric.meta.breakevenPrice, trailPrice: metric.meta.trailPrice,
+    };
+  }
+  const priced = metrics.stopMedium.status === 'ok' ? metrics.stopMedium.meta : null;
+  return {
+    tier: metrics.healthTier.value, score: metrics.healthScore.value, scores: radar.scores, held: metrics.healthTier.meta.held,
+    points: score.points, vs: radar.benchmark, vsTotalReturn: radar.benchmark ? !radar.benchmarkFallback : null,
+    dividendYield: round(metrics.dividendYield.value, 4), dividendTrap: metrics.dividendTrap.meta.trap === true,
+    drawdown: round(score.drawdown, 4), sigmaDaily: priced ? round(priced.sigmaDaily, 4) : null,
+    tick: priced ? priced.tick : null, stops,
+    warnings: radar.warnings.map((warning) => Object.fromEntries(Object.entries(warning).map(([key, value]) => [key, typeof value === 'number' ? round(value, 4) : value]))),
+  };
+}
+
 export function buildEngineContext(raw) {
   const now = new Date(raw.generatedAt);
   const snapshot = normaliseSnapshot(raw, now);
   const calendar = snapshot.macro ? snapshot.macro.calendar : null;
   const holidays = { US: holidaysFor(calendar, 'US'), SG: holidaysFor(calendar, 'SG') };
   const rotation = analyzeRotation({ assets: snapshot.assets, byTicker: snapshot.byTicker, mode: 'spx', fx: { series: snapshot.fx.series, rate: snapshot.fx.rate } });
+  const stress = analyzeStress(snapshot.macro);
 
   const assets = snapshot.assets.map((asset) => {
     const technical = analyzeTechnicals(asset).metrics;
@@ -66,6 +114,7 @@ export function buildEngineContext(raw) {
     const shock = latestShock(asset.longSeries.close, asset.longSeries.dates);
     const rotated = rotation.byTicker[asset.ticker];
     const traded = cell(liquidity.dollarVolume);
+    const radar = analyzeRadar(asset, { benchmark: radarBenchmark(asset, snapshot), stress, events });
     return {
       ticker: asset.ticker, name: asset.name, class: asset.assetClass, market: asset.market, ccy: asset.currency,
       status: asset.status, close: round(asset.quote.lastClose), asOf: asset.quote.asOf,
@@ -83,6 +132,7 @@ export function buildEngineContext(raw) {
       nextExDividend: events.nextExDividend && events.nextExDividend.status === 'ok'
         ? { date: events.nextExDividend.meta.date, estimated: Boolean(events.nextExDividend.meta.estimated) }
         : { na: events.nextExDividend ? events.nextExDividend.naReason : 'No dividend history.' },
+      radar: radarCell(radar),
     };
   });
 
@@ -91,6 +141,7 @@ export function buildEngineContext(raw) {
   return {
     asOf: raw.generatedAt,
     regime,
+    stress: stressCell(stress),
     rotation: {
       benchmark: 'the S&P 500 in USD (SGD prices converted at each day\'s USD/SGD rate)',
       asOf: rotation.asOf,
