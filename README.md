@@ -10,7 +10,9 @@
 
 > QuantLens is an educational tool. Its trend regimes, scores, position sizes, risk figures and portfolio statistics come from fixed, published rules so that they can be checked. They describe the past, do not predict returns, and are not financial advice.
 
-**What V4.0 adds:** a Telegram agent you can ask. A Cloudflare Worker in `worker/`, separate from the pipeline and the site, answers `/check D05`, `/regime`, `/triggers`, `/rotation` and `/upcoming` by code from `data/bot_context.json`, and plain-English questions through Gemini, which reads only a digest of that file under eight rules (no outside facts, no arithmetic, no advice, untracked assets said as such, N/A reasons word for word). A number check marks any figure the snapshot does not contain, and every reply ends with the snapshot's date. It checks Telegram's secret header, answers only the chats you list, logs no token, chat id or message, and stores nothing. Zero cost, and the daily workflow is unchanged. See [Telegram agent](#telegram-agent) and [`worker/README.md`](worker/README.md).
+**What V5.0 adds: the Decision Radar.** Three questions about every holding, answered from data and never as an instruction: how healthy has it been, is its yield a trap, and where would a volatility-sized stop sit for the horizon it is held? A health score of 0 to 4 on total return (trend, strength against VOO, the STI ETF or Bitcoin, momentum, drawdown) places each asset in a tier: Healthy, Neutral, or Dead Money once it has scored 0-1 on three sessions running. A dividend-trap check flags a high yield that comes from a falling price. Two-stage stops for a short, medium and long hold (an initial stop from EWMA volatility, a breakeven trigger, then a trail) are shown as percentages and as prices rounded to the exchange's tick, with ex-dividend and earnings-gap warnings. Every stop is widened by a three-pillar macro regime (volatility from the VIX curve, credit and rates from FRED): Calm ×1.00, Cautious ×1.15 or Stressed ×1.35. On the site: a Macro reading with three pillar pills in the top bar, a radar filter and badges in the screener, and a stop planner in Compare. In the Telegram agent (V4.1): `/radar`, a richer `/check`, and Gemini answering "what's a good stop-loss for D05 if I hold for 6 months?" by quoting the precomputed stops. Still stateless, still zero cost, still no forecast. See [Decision Radar](#decision-radar).
+
+**V4.0 added** a Telegram agent you can ask. A Cloudflare Worker in `worker/`, separate from the pipeline and the site, answers `/check D05`, `/regime`, `/triggers`, `/rotation` and `/upcoming` by code from `data/bot_context.json`, and plain-English questions through Gemini, which reads only a digest of that file under eight rules (no outside facts, no arithmetic, no advice, untracked assets said as such, N/A reasons word for word). A number check marks any figure the snapshot does not contain, and every reply ends with the snapshot's date. It checks Telegram's secret header, answers only the chats you list, logs no token, chat id or message, and stores nothing. Zero cost, and the daily workflow is unchanged. See [Telegram agent](#telegram-agent) and [`worker/README.md`](worker/README.md).
 
 **V3.4 added** less hand upkeep and sharper alerts. A monthly workflow refreshes the macro calendar from the Fed's FOMC page, FRED's CPI dates, `exchange_calendars` and data.gov.sg, and proposes the result as a pull request after both test gates; SGX half days (12:00 noon on the eves of Chinese New Year, Christmas and New Year) end the Singapore session early, like US half days. The briefing's big-move trigger also fires on a 10% day (15% crypto, 5% ETFs), so a crash cannot hide behind a sell-off's inflated volatility, and a new trigger reports trend flips across the 200-day average or the 20/50-day EMA cross once they have held for a second close. The ongoing crash replay caps itself when the S&P 500 recovers. And every run now publishes `data/bot_context.json`, a 29 KB summary of the snapshot from the site's own engines and trigger rules, the groundwork for a question-answering bot. No new requests in the daily run.
 
@@ -38,27 +40,28 @@
 8. [The risk model](#the-risk-model)
 9. [Event risk](#event-risk)
 10. [The market regime](#the-market-regime)
-11. [Market sensitivity and crowding](#market-sensitivity-and-crowding)
-12. [Liquidity and tradability](#liquidity-and-tradability)
-13. [Trend regimes and their track record](#trend-regimes-and-their-track-record)
-14. [Crash replays](#crash-replays)
-15. [Sector rotation](#sector-rotation)
-16. [News de-duplication and headline tone](#news-de-duplication-and-headline-tone)
-17. [Prophet forecasting and its limits](#prophet-forecasting-and-its-limits)
-18. [CI/CD and the testing gates](#cicd-and-the-testing-gates)
-19. [Daily Telegram briefing](#daily-telegram-briefing)
-20. [Agent-ready export](#agent-ready-export)
-21. [Telegram agent](#telegram-agent)
-22. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
-23. [The Derivation Tracer](#the-derivation-tracer)
-24. [The mathematics](#the-mathematics)
-25. [Numerical safety](#numerical-safety)
-26. [Testing](#testing)
-27. [Accessibility and responsive design](#accessibility-and-responsive-design)
-28. [Deployment](#deployment)
-29. [Changing the watchlist](#changing-the-watchlist)
-30. [Design decisions and known limitations](#design-decisions-and-known-limitations)
-31. [Interview talking points](#interview-talking-points)
+11. [Decision Radar](#decision-radar)
+12. [Market sensitivity and crowding](#market-sensitivity-and-crowding)
+13. [Liquidity and tradability](#liquidity-and-tradability)
+14. [Trend regimes and their track record](#trend-regimes-and-their-track-record)
+15. [Crash replays](#crash-replays)
+16. [Sector rotation](#sector-rotation)
+17. [News de-duplication and headline tone](#news-de-duplication-and-headline-tone)
+18. [Prophet forecasting and its limits](#prophet-forecasting-and-its-limits)
+19. [CI/CD and the testing gates](#cicd-and-the-testing-gates)
+20. [Daily Telegram briefing](#daily-telegram-briefing)
+21. [Agent-ready export](#agent-ready-export)
+22. [Telegram agent](#telegram-agent)
+23. [Live feeds and their fallbacks](#live-feeds-and-their-fallbacks)
+24. [The Derivation Tracer](#the-derivation-tracer)
+25. [The mathematics](#the-mathematics)
+26. [Numerical safety](#numerical-safety)
+27. [Testing](#testing)
+28. [Accessibility and responsive design](#accessibility-and-responsive-design)
+29. [Deployment](#deployment)
+30. [Changing the watchlist](#changing-the-watchlist)
+31. [Design decisions and known limitations](#design-decisions-and-known-limitations)
+32. [Interview talking points](#interview-talking-points)
 
 ---
 
@@ -71,21 +74,22 @@
 | **Portfolio sandbox** | Up to eight assets with weight sliders. Annualised return, volatility, Sharpe ratio and diversification ratio, beta to the S&P 500, concentration and the effective number of bets, who carries the risk, and where the mix sits among 2,000 alternative mixes. A banner names holdings that are one crowded bet. **Crash replays** buy the mix at four S&P 500 highs and hold it to the lows, in your currency, against the index. |
 | **Rotation** | The 26 tradable assets, or 11 groups at their median member, plotted by 3-month (across) and 1-month (up) relative strength: Leading, Weakening, Lagging or Improving. Against the S&P 500 in USD by default, or each asset's own market; a table twin lists every value. |
 | **Market regime** | Normal, elevated or stressed, read from the VIX term structure, in the top bar and, while the curve is inverted, as a banner over every view. Context only: it changes no score, trend regime or position size. |
+| **Decision Radar** | V5.0. A three-pillar macro regime (volatility, credit, rates) in the top bar; each asset's health tier (Healthy, Neutral, Dead Money) and 0-4 score on total return, and a dividend-trap check, in the screener and in Compare; and a Two-Stage Stop Planner for a short, medium or long hold: the initial stop, the breakeven trigger and the trail as percentages and tick-rounded prices, widened by the regime, with ex-dividend and earnings-gap warnings. Descriptions and risk boundaries, not forecasts or advice. |
 | **Market sensitivity** | Beta, R², idiosyncratic volatility, and 1- and 3-month relative strength against each asset's benchmark: `^GSPC` for US and London listings, `^STI` for Singapore, `BTC-USD` for other coins. |
 | **Liquidity** | 20-day average volume and traded value, Amihud illiquidity, and the spread floor set by the exchange's tick size. Position sizing caps a position at 5% of daily volume, flags anything above 1%, and shows the round-trip spread cost. |
 | **Time range** | `1M` `3M` `6M` `1Y` `5Y`. Slices the series behind the charts, period statistics, tail risk, correlation, the simulation and the portfolio maths. It never changes the trend regime or the scores. |
 | **Risk** | EWMA volatility next to the equal-weighted figure, and historical-simulation VaR and CVaR at 95% and 99%, one day and ten days, read straight from the asset's own worst days. |
 | **Events** | The next earnings date and how many trading days away it is, the stock's typical and worst earnings-day move, the next ex-dividend date, and the loss a sized position would take if the price gapped by that worst move. |
 | **Command palette** | `Ctrl/Cmd + K` finds any asset by ticker, name or sector and runs any command: switch view, change range, currency or mode, open the risk sandbox, copy the share link. |
-| **Screener** | Filter by asset class, market, sector and trend regime; tick up to three assets. No market data is ever typed in. |
+| **Screener** | Filter by Decision Radar tier, asset class, market, sector and trend regime; each row shows its tier, score and any dividend trap. Tick up to three assets. No market data is ever typed in. |
 | **Sector-aware scoring** | Corporates, financial companies and REITs are each scored on the measures that apply to them. A bank is never judged on EV/EBITDA. ETFs, indices and crypto have no accounts, so they have a trend regime and a Technical score but no Fundamental score. |
 | **Derivation drawer** | Click any value to see its formula, raw inputs, numbered arithmetic and thresholds, then drill into the numbers it is built from. |
 | **Guided and Pro modes** | Guided explains every metric in plain language. Pro is the same data at higher density, with extra rows (99% CVaR, the ten-day tail, the risk budget). |
 | **News and forecast** | Three recent, de-duplicated headlines per asset with the tone of their wording, and a 30-day trend projection with its measured miss rate. Context only: neither moves a score. |
 | **Risk sandbox** | Change account size, risk per trade, stop distance and position cap, and watch the position and a Monte Carlo fan respond. The fan resamples the asset's real days at today's volatility, and warns when an earnings release falls inside it. |
-| **Telemetry bar** | Live crypto ticks, the market regime, USD/SGD, the US and Singapore 10-year yields and the age of the daily data, each labelled with its source and fallback state. |
+| **Telemetry bar** | Live crypto ticks, the macro regime with its three pillars, the market regime, USD/SGD, the US and Singapore 10-year yields and the age of the daily data, each labelled with its source and fallback state. |
 | **Daily briefing** | Optional. After each scheduled refresh, a short Telegram message to one chat or several: the market regime, a ⚡ block only when something happened, each bucket's trend-regime tally with its Uptrend and Downtrend names by 3-month relative strength, the next 30 days, and whether the run passed its checks. |
-| **Agent-ready export** | `data/bot_context.json` on every run: each asset's trend regime, scores, relative strength, beta, EWMA volatility, latest move in σ, spread and Amihud, the regime, the next 30 days and the day's triggers, under 50 KB, every number from the site's engines and every gap with its reason. |
+| **Agent-ready export** | `data/bot_context.json` on every run: each asset's trend regime, scores, relative strength, beta, EWMA volatility, latest move in σ, spread and Amihud, its Decision Radar (tier, score, trap, three horizons of stops), the regime and the three-pillar macro regime, the next 30 days and the day's triggers, under 64 KB, every number from the site's engines and every gap with its reason. |
 
 The watchlist (30 assets):
 
@@ -205,11 +209,13 @@ scripts/macro_calendar.json                FOMC decisions and minutes, US CPI re
 scripts/sync_macro_calendar.py             the monthly calendar sync (Fed page, FRED, exchange_calendars, data.gov.sg)
 scripts/fetch_fundamentals.py              prices, history, dividends, events, statements, news, yields,
                                            forecasts -> validated JSON; --notify sends the Telegram briefing;
-                                           --bot-context writes data/bot_context.json
+                                           --bot-context writes data/bot_context.json; --stress adds the
+                                           FRED pillars of the macro regime (V5.0)
 scripts/signals.mjs                        runs the site's engines in Node.js for the briefing's signals
 scripts/bot_context.mjs                    runs the site's engines in Node.js for the agent-ready export
 scripts/test_fetch_fundamentals.py         176 unit tests for the pipeline (Gate 1)
 scripts/test_sync_macro_calendar.py        26 unit tests for the calendar sync, offline (Gate 1)
+scripts/test_decision_radar.py             30 unit tests for the FRED pillars, ES3.SI and the radar export (Gate 1)
 scripts/run_browser_tests.py               headless Chrome/Edge runner for the test page (Gate 2)
 scripts/requirements.txt                   yfinance, vaderSentiment, prophet (pipeline only)
 scripts/requirements-calendar.txt          exchange_calendars, pinned (the monthly sync only)
@@ -225,14 +231,14 @@ src/engines/   technicalEngine.js  trendRegimeEngine.js  fundamentalEngine.js  c
                positionSizerEngine.js  monteCarloEngine.js  portfolioEngine.js  crashReplayEngine.js
                riskEngine.js  eventEngine.js  backtestEngine.js  macroCalendarEngine.js
                regimeEngine.js  factorEngine.js  liquidityEngine.js  rotationEngine.js
-               sentimentEngine.js  forecastEngine.js
+               sentimentEngine.js  forecastEngine.js  stressEngine.js  radarEngine.js
 src/ui/        telemetryBar.js  appTabs.js  commandPalette.js  screenerPanel.js
                comparisonMatrix.js  leaderboardView.js  portfolioSandbox.js  rotationView.js
                derivationDrawer.js  riskSandboxModal.js  regimeBanner.js
-tests/engines.test.html                    376 browser-run tests in 55 suites, zero dependencies
-worker/                                    the Telegram agent: a Cloudflare Worker, deployed by hand (V4.0)
-  wrangler.toml  src/index.js  telegram.js  context.js  commands.js  tickers.js  format.js
-  digest.js  prompt.js  gemini.js  numbers.js  answer.js   test/  87 node --test tests, no dependencies
+tests/engines.test.html                    402 browser-run tests in 60 suites, zero dependencies
+worker/                                    the Telegram agent: a Cloudflare Worker, deployed by hand (V4.1)
+  wrangler.toml  src/index.js  telegram.js  context.js  commands.js  radar.js  tickers.js  format.js
+  digest.js  prompt.js  gemini.js  numbers.js  answer.js   test/  103 node --test tests, no dependencies
 ```
 
 ---
@@ -271,6 +277,7 @@ That one decision buys clean first loads, links that reproduce a view exactly, c
 | `mkt` | Market filter | `US` `SG` `UK` `CRYPTO` | all |
 | `sector` | Sector filter | any sector in the snapshot | all |
 | `trend` | Trend-regime filter | `uptrend` `extended` `pullback` `recovering` `downtrend` | all |
+| `radar` | Decision Radar tier filter (V5.0) | `healthy` `neutral` `dead-money` | all |
 | `rs` | Rotation benchmark | `spx` (the S&P 500 in USD) `own` (each asset's own market) | `spx` |
 
 A link from before V3.3 may carry `verdict=buy`: it is ignored, and the rest of the view loads as it was.
@@ -390,13 +397,15 @@ flowchart TD
   CARRY --> EV
   EV --> NEWS["RSS headlines: de-duplicate, score tone"]
   NEWS --> MACRO["US 10Y, SG 10Y, five years of USD/SGD, five years of VIX9D, VIX and VIX3M"]
-  MACRO --> FC["Prophet: projection and 30-day backtest, in a process pool"]
+  MACRO --> BENCH["ES3.SI: a year of the STI ETF, the radar's SGX benchmark (V5.0)"]
+  BENCH --> FC["Prophet: projection and 30-day backtest, in a process pool"]
   FC --> HALF{"more than half the watchlist not fresh?"}
   HALF -->|"yes"| ABORT["exit 1: nothing written"]
   HALF -->|"no"| VALID{"schema v3 valid?"}
   VALID -->|"no"| ABORT
   VALID -->|"yes"| WRITE["atomic write of market_snapshot.json"]
-  WRITE --> G["two test gates, then commit and deploy"]
+  WRITE --> STRESS["--stress: credit and rates pillars from FRED (V5.0), never fails the run"]
+  STRESS --> G["two test gates, then commit and deploy"]
   ABORT --> KEEP["site keeps serving yesterday's snapshot"]
 ```
 
@@ -461,7 +470,22 @@ A full run for the 30-asset watchlist takes about two minutes, most of it networ
       "historyFields": ["date", "vix9d", "vix", "vix3m"],
       "history": [["2021-11-22", 16.06, 19.17, 22.63]],   // five years of daily closes, about 1,255 rows
       "note": null
+    },
+    "stress": {                          // V5.0, optional: the three-pillar macro regime (the --stress step)
+      "status": "fresh",                 // fresh | partial | vix-only | unavailable
+      "state": "Cautious", "flags": 1, "active": 3, "multiplier": 1.15,
+      "pillars": {
+        "volatility": { "status": "fresh", "flag": true, "value": 1.16, "source": "yahoo", "series": "^VIX / ^VIX3M", … },
+        "credit": { "status": "fresh", "flag": false, "value": 0.0312, "change": 0.0021, "from": "2026-10-22", "series": "BAMLH0A0HYM2", … },
+        "rates": { "status": "fresh", "flag": false, "value": 0.0055, "change": 0.0012, "twoYearChange": -0.0008, "series": "T10Y2Y", … }
+      },
+      "rules": { "volRatio": 1.0, "creditLevel": 0.045, "creditWidening": 0.005, "ratesInverted": 0.0, "ratesSteepening": 0.0035, "window": 20 },
+      "multipliers": { "Calm": 1.0, "Cautious": 1.15, "Stressed": 1.35 }, "note": null
     }
+  },
+  "benchmarks": {                        // V5.0, optional: benchmarks that are not in the watchlist
+    "ES3.SI": { "name": "SPDR Straits Times Index ETF", "market": "SG", "currency": "SGD", "status": "fresh",
+                "asOf": "2026-11-20", "series": [["2025-11-21", 4.92]] }   // a year of adjusted closes
   },
   "candleFields": ["date", "open", "high", "low", "close", "volume"],
   "historyFields": ["date", "close"],
@@ -528,6 +552,7 @@ Rules, enforced by the script and re-checked in the browser by `snapshotService.
 - Dividends are ascending `[exDate, amount]` pairs with positive amounts. Event dates are ISO dates; `timing` is one of the four classes above.
 - The browser accepts schema v1, v2 and v3. An older file simply has no history, dividends, events, news, forecast, yields or FX history (depending on its version), and everything that needs them reports `N/A` with the reason.
 - `macro.regime` is an optional V3.1 block, so a snapshot written before it still validates. When present it must add up: the ratios must follow from the levels, the history must end with them, and the state must be what the stored rules give for those levels.
+- `macro.stress` and `benchmarks` are optional V5.0 blocks. The validator recounts the stress state from the pillars' flags and the stored rules, and rejects a benchmark series that is not ascending, unique and positive. FRED values are stored as fractions (`0.045` is 4.5%).
 - An invalid asset is dropped with a visible warning and the rest still load. A malformed `history`, `dividends`, `events`, `news`, `forecast` or `macro` block is treated as unavailable without dropping the asset. An invalid document as a whole shows an error with a retry button.
 
 ---
@@ -706,7 +731,68 @@ Normally the curve slopes up (contango): more time, more uncertainty. When the 3
 - **One rule, two readers.** The pipeline classifies the regime for the Telegram briefing and stores the thresholds in the block. The browser applies the same rules to the same stored levels for its explanation views, and a test checks that the two agree on the committed snapshot.
 - **What it shows.** A pill in the top bar opens the derivation: the state, VIX with the daily move it implies (`VIX ÷ √252`) and where it ranks in the last year and in five years, `VIX ÷ VIX3M` with the run of inverted sessions, and `VIX9D ÷ VIX` for the front of the curve. While the curve is inverted a banner over every view says what that means, and can be hidden until the next visit.
 - **Context only.** The regime is not an input to any score, trend regime or position size. V3.3 uses the five years of stored history to split the backtest by regime (see [Trend regimes and their track record](#trend-regimes-and-their-track-record)): no regime turned the score into a forecast, so gating anything on it would be curve-fitting.
+- **One pillar of three since V5.0.** The VIX curve is the volatility pillar of the [Decision Radar's](#decision-radar) macro regime, whose multiplier widens the radar's stops (not the position sizer's, and no score). That is sizing room for larger daily swings, not a prediction.
 - **On 21 November 2026** the regime was stressed: VIX 35.89 above VIX3M 30.94 (a ratio of 1.16), the 4th inverted session in a row, with VIX at its highest close of the year and VIX9D at 40.72.
+
+## Decision Radar
+
+V5.0 asks three things of every holding: how healthy has it been on a total-return basis, is its yield a trap, and where would a volatility-sized stop sit for the horizon it is held? Two engines answer them, `stressEngine.js` and `radarEngine.js`, run in the browser and, with the same code, in the export the Telegram agent quotes. Every figure has its derivation. None is a forecast, and none says to buy or sell: the trend-regime research found that price-based readouts like these did not predict 21- or 63-day returns on this watchlist.
+
+### The macro regime: three pillars
+
+| Pillar | Flagged when | Source |
+|---|---|---|
+| **Volatility** | VIX ÷ VIX3M at 1.00 or above: the curve is inverted | Yahoo, the [market regime](#the-market-regime) |
+| **Credit** | the US high-yield option-adjusted spread (`BAMLH0A0HYM2`) at 4.50% or more, or at least 0.50 points wider than 20 observations before | FRED |
+| **Rates** | the 10-year minus 2-year Treasury spread (`T10Y2Y`) below zero, or a bull steepening: at least 0.35 points steeper over 20 observations while the 2-year yield (`DGS2`) fell | FRED |
+
+The flags are counted over the pillars that could be read: 0 is **Calm** (×1.00), 1 **Cautious** (×1.15), 2 or 3 **Stressed** (×1.35). The multiplier widens every radar stop, so that a stressed market's larger daily swings are less likely to reach it. It changes no score and no tier.
+
+- **A step that never fails.** `fetch_fundamentals.py --stress` runs after the snapshot is written and reads the three series with the `FRED_API_KEY` repository secret, the one the monthly calendar sync already uses. Without the key, or when FRED does not answer, a pillar keeps its previous reading for up to five days, and then the regime falls back to the VIX pillar alone (Cautious at most) and says so. The key never reaches a message, a log or the file.
+- **Two readers, one count.** The site recounts the state from the stored flags and rules, and Gate 1 checks that the pipeline and the engine agree on the committed snapshot.
+- **On screen.** A *Macro* reading in the top bar shows the state, the multiplier and three pills, *Vol*, *Credit* and *Rates*: marked when flagged, struck through when not read. It opens the derivation.
+
+### Health score and tiers
+
+One point each, on dividend-adjusted closes, so the score is about total return:
+
+| Point | Earned when |
+|---|---|
+| **Trend** | the close is above its 50-day average, and the 50-day is above the 200-day |
+| **Strength** | the 3-month total return is ahead of the benchmark: VOO for US and London listings, the SPDR STI ETF `ES3.SI` for Singapore, Bitcoin for other coins. VOO and Bitcoin are their own benchmarks, so they earn it with a positive 3-month total return |
+| **Momentum** | a positive 1-month total return, or, for an income asset (a trailing yield of 3.5% or more), annualised EWMA volatility below 22% |
+| **Drawdown** | the close is less than 12% below its 52-week high |
+
+- **Tiers.** 3-4 is **Healthy**, 2 **Neutral**, and 0-1 **Dead Money**, but only when the score was 0-1 on each of the last three sessions; until then it is held at Neutral, so one bad day cannot flip the label. Nothing is stored: the three scores are recomputed from the price history every time.
+- **The SGX benchmark.** `ES3.SI` is downloaded each day since V5.0 (a year of adjusted closes, in the snapshot's `benchmarks` block). Until it is in a snapshot, `^STI` stands in and the derivation says it is a price index, which flatters dividend payers slightly.
+- **Indices are left out**: they cannot be bought.
+
+### Dividend trap
+
+A trailing yield of 3% or more, with **either** the price more than 2.5 times the yield below its 52-week high **or** a negative one-year total return. The drawdown is today's, not the deepest of the year, so a stock that fell and fully recovered is not flagged. A falling price pushes the yield up; the check flags a yield that may be high for that reason. It is a screen, not a verdict on the payout.
+
+### Two-stage stops
+
+σ is the daily EWMA volatility over the last year (λ 0.94) and M the regime's multiplier.
+
+| Horizon | Holding | Stage 1: initial stop below the last close | Breakeven trigger | Stage 2: trail |
+|---|---|---|---|---|
+| **Short** | 2 weeks to 1 month | −min(max(2.0 σ √5 M, 4%), 25%) | +1.25 × the distance | 1.00 × the distance |
+| **Medium** | 3 to 6 months | −min(max(2.0 σ √21 M, 7%), 25%) | +1.25 × | 1.15 × |
+| **Long** | 1 year or more | −min(max(2.5 σ √21 M, 12%), 25%) | +1.50 × | 1.25 × |
+
+Once the price has risen by the breakeven distance, stage two raises the stop to the entry and then trails it the trail distance below the highest close. Prices are at the last close, rounded to the exchange's tick (SGX's tiers, a cent in the US; London and crypto, which have no modelled tick, round to a cent, or a hundredth of a cent below 1): stops round down and the trigger up, so a rounded level is never tighter than the computed one.
+
+- **Warnings.** An ex-dividend date within 10 trading days, with the mechanical drop at the open (the last dividend over the close); an earnings release within 15 trading days whose typical earnings-day move is larger than a horizon's stop, with the worst move on record.
+- **What a stop cannot do.** A gap (earnings, ex-dividend, news) can open beyond any stop, and an order can fill below it. The planner's stops are separate from the position sizer's ATR stop, which is unchanged.
+
+### Where it shows
+
+- **Screener.** A *Decision Radar* filter (All, Healthy, Neutral, Dead Money, with counts) and, on each row, the tier with its score and a *Div trap* flag. The filter is in the URL as `radar=`.
+- **Compare.** A Decision Radar section under Trend: the tier (with the last three scores), the score with its four points, the trap check, and the **Two-Stage Stop Planner** with a Short, Medium and Long switch: each stage as a percentage and a tick price in the asset's own currency, with its warnings. Every value opens its derivation; a stop's derivation links to the macro regime.
+- **Telegram.** `/radar` lists the regime, the tiers (the weakest as "Weakest · Dead Money") and the traps; `/check` adds the tier, score, trap and medium stop. See [Telegram agent](#telegram-agent).
+
+**On 23 November 2026**, in a sell-off with the VIX curve inverted (and the VIX pillar alone until the first FRED run: Cautious, ×1.15), 6 of the 26 tradable assets were Healthy, 5 Neutral and 15 Dead Money; 5 were dividend traps (`BHP`, `D05.SI`, `U11.SI`, `AJBU.SI`, `A17U.SI`, with yields of 4.5% to 7.1%); and many medium and long stops of the coins and the chip makers sat at the 25% cap. DBS's medium stop was −12.2% (SGD 58.04), with the breakeven trigger at +15.3% (SGD 76.20).
 
 ## Market sensitivity and crowding
 
@@ -1017,7 +1103,7 @@ flowchart LR
   D --> REF
   P --> TEST["test"]
   PR --> TEST
-  REF --> V["validate snapshot"] --> BCX["agent context, never blocks"] --> G1["Gate 1: 202 pipeline unit tests"] --> G2["Gate 2: 376 browser tests in headless Chrome"] --> C["commit snapshot and context"]
+  REF --> FRED["FRED stress pillars, never blocks"] --> V["validate snapshot"] --> BCX["agent context, never blocks"] --> G1["Gate 1: 232 pipeline unit tests"] --> G2["Gate 2: 402 browser tests in headless Chrome"] --> C["commit snapshot and context"]
   C --> TG["Telegram briefing, always runs, never fails the job"]
   V -.->|"any failure"| TG
   TEST --> V2["validate, Gate 1, Gate 2"]
@@ -1027,11 +1113,11 @@ flowchart LR
 
 | Job | Runs on | What it does |
 |---|---|---|
-| `refresh` | schedule, manual dispatch | Fetch → validate the schema → build `data/bot_context.json` (allowed to fail) → **Gate 1** → **Gate 2 against the new data** → commit → Telegram briefing. If any check fails, nothing is committed; the briefing still runs and reports the failure. |
+| `refresh` | schedule, manual dispatch | Fetch → add the FRED stress pillars (V5.0; never fails, falls back to the VIX pillar) → validate the schema → build `data/bot_context.json` (allowed to fail) → **Gate 1** → **Gate 2 against the new data** → commit → Telegram briefing. If any check fails, nothing is committed; the briefing still runs and reports the failure. |
 | `test` | every push and pull request | Validate the committed snapshot → Gate 1 → Gate 2. |
 | `deploy` | after a successful `refresh` or `test`, never on a pull request | Publish the static site to GitHub Pages. |
 
-**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 202 tests of the Python side: number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), US and SGX half-day cutoffs (a 1:15 p.m. New York candle dropped and a 1:25 p.m. one kept; 12:15 against 12:25 in Singapore), the monthly calendar sync against offline fixtures of every source (a full sync must reproduce the committed file, a failed source keeps its entries, the FRED key never reaches a message), the agent-ready export's contract, snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, a 10% day against 9.99%, 5 trading days against 6, exactly 48 hours, a trend flip after one close against two), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, the trend-regime tally and the Uptrend and Downtrend lines with no BUY, HOLD or SELL left in any edition, and a failed step moved to the top.
+**Gate 1: pipeline unit tests** (`python -m unittest discover -s scripts -p "test_*.py"`). 232 tests of the Python side, 30 of them for V5.0 (FRED parsing and every pillar rule at its boundary, the stale carry-over and the VIX-only fallback with no request made, the key kept out of every message, the ES3.SI benchmark, the radar's export contract and the Python and JavaScript states agreeing): number sanitisation, the trailing-twelve-month guards, de-duplication boundaries, RSS parsing, the MAS table parser, the risk-free fallback chain, deadlines and retries, forecast helpers including a real Prophet fit on a synthetic trend, the five-year history split and its join check, dividends, earnings timing against each exchange's hours, the events block, the market regime (its rules at their boundaries, today's intraday value dropped, the fallback to a recent reading, validation that rejects a reading that does not add up), the macro calendar (offsets against New York's daylight-saving rules, meeting days, derived minutes, coverage), US and SGX half-day cutoffs (a 1:15 p.m. New York candle dropped and a 1:25 p.m. one kept; 12:15 against 12:25 in Singapore), the monthly calendar sync against offline fixtures of every source (a full sync must reproduce the committed file, a failed source keeps its entries, the FRED key never reaches a message), the agent-ready export's contract, snapshot validation, the asset-class and market rules (including the London close), the Price-to-Book check, and the whole Telegram briefing against a fake API: several recipients, every trigger at its boundary (2.50σ against 2.51σ, a 10% day against 9.99%, 5 trading days against 6, exactly 48 hours, a trend flip after one close against two), triggers not repeated at weekends, the week-ahead edition, a quiet day with no ⚡ block and no filler, the trend-regime tally and the Uptrend and Downtrend lines with no BUY, HOLD or SELL left in any edition, and a failed step moved to the top.
 
 **Gate 2: the browser suite, headless** (`python scripts/run_browser_tests.py --min-tests 100`). The runner starts a local web server, launches headless Chrome or Edge at `tests/engines.test.html`, and waits for the page to report its results to a one-time same-origin URL. It uses only the Python standard library.
 
@@ -1207,22 +1293,29 @@ Every daily run publishes `data/bot_context.json` (served at `/data/bot_context.
   "events":  [ { "date": "2026-12-09", "kind": "fomc-decision", "label": "FOMC rate decision (+ projections)", "at": "…" }, … ],
   "triggers":[ { "kind": "move", "ticker": "AMD", "dailyReturn": -0.132, "zScore": -2.09, "rule": "size", "threshold": 0.1 }, … ],
   "rotation":{ "benchmark": "the S&P 500 in USD …", "groups": [ { "group": "Defensives", "quadrant": "Leading", "rs1m": 0.205, "rs3m": 0.282, "members": [ "WMT", "LLY" ] }, … ] },
+  "stress":  { "state": "Cautious", "multiplier": 1.15, "flags": 1, "active": 1, "status": "vix-only", "pillars": {…}, "rules": {…} },   // V5.0
   "assets":  [ { "ticker": "D05.SI", "trend": { "v": "Pullback" }, "rs1m": { "v": -0.0208, "vs": "^STI" }, "beta": { "v": 1.099 },
                  "ewmaVol": { "v": 0.184 }, "shock": { "ret": -0.0183, "z": -1.68, "date": "2026-11-20" }, "spread": { "v": 0.000151 },
-                 "amihud": { "v": 0.238 }, "fundamental": { "v": 65.2 }, "nextEarnings": { "date": "2027-02-15", "tradingDays": 58 }, … },
+                 "amihud": { "v": 0.238 }, "fundamental": { "v": 65.2 }, "nextEarnings": { "date": "2027-02-15", "tradingDays": 58 },
+                 "radar": { "tier": "Neutral", "score": 2, "scores": [2, 2, 2], "held": false, "vs": "^STI", "dividendTrap": true,
+                            "dividendYield": 0.049, "drawdown": -0.1497, "yearReturn": 0.2909, "tick": 0.01,
+                            "stops": { "medium": { "init": -0.122, "breakeven": 0.1526, "trail": -0.1403,
+                                                   "initPrice": 58.04, "breakevenPrice": 76.2, "trailPrice": 56.83 }, … },
+                            "warnings": [] }, … },
                { "ticker": "BTC-USD", "beta": { "na": "BTC-USD is the benchmark for crypto: measured against itself its beta is 1 by definition." }, … } ]
 }
 ```
 
 - **The engines, not a copy of them.** `scripts/bot_context.mjs` runs the site's own engines over the snapshot (trend regime, scores, relative strength against each asset's benchmark, its rotation quadrant against the S&P 500 in USD, beta, EWMA volatility and one-day VaR over the last year, the latest move in σ, the tick-floor spread, Amihud, traded value, the next earnings and ex-dividend dates). The triggers come from `collect_triggers`, the same function the Telegram message is rendered from, against the same previous snapshot, so the export and the message cannot disagree.
 - **Every gap has its reason.** A value is `{"v": …}` or `{"na": "<the engine's own reason>"}`; nothing is filled in.
-- **Small enough to read whole.** About 29 KB for 30 assets, against a 50 KB limit the validator enforces, with no candle or history arrays (no list may hold more than 64 items) and floats rounded to six significant figures.
-- **Checked twice.** Gate 1 builds it from the committed snapshot through Node and validates its contract; Gate 2 recomputes the trend regime, relative strength, beta, EWMA volatility, spread, Amihud and rotation quadrant of every asset in the browser and requires the committed file to match.
+- **Small enough to read whole.** About 49 KB for 30 assets since V5.0 (29 KB before), against a 64 KB limit the validator enforces, with no candle or history arrays (no list may hold more than 64 items) and floats rounded to six significant figures, the radar's fractions to four. Tick-rounded stop prices keep every digit: Bitcoin's stop at 51,716.14 must not become 51,716.1.
+- **The Decision Radar (V5.0).** `stress` is the macro regime as the engine counted it; each tradable asset's `radar` holds its tier, score and points, its benchmark (`vs`, or `"self"` for VOO and Bitcoin), the trap check with its yield, drawdown and one-year return, three horizons of stops as fractions of the last close and as tick prices, and its warnings. Indices carry `{"na": reason}`. The schema name is unchanged, so a bot that does not know the new fields keeps working.
+- **Checked twice.** Gate 1 builds it from the committed snapshot through Node and validates its contract; Gate 2 recomputes the trend regime, relative strength, beta, EWMA volatility, spread, Amihud, rotation quadrant, macro regime and Decision Radar of every asset in the browser and requires the committed file to match.
 - **It never blocks the data.** The build step is allowed to fail; the snapshot is still committed, and the previous export stays, with its own `asOf` showing it is a day old.
 
 ## Telegram agent
 
-V4.0 adds a bot you can ask about the watchlist, built so that it can only repeat QuantLens's own numbers. It is a Cloudflare Worker in [`worker/`](worker/README.md), deployed by hand with `wrangler`; the daily workflow, the snapshot and the site do not depend on it.
+V4.0 adds a bot you can ask about the watchlist, built so that it can only repeat QuantLens's own numbers; V4.1 (with V5.0) teaches it the Decision Radar. It is a Cloudflare Worker in [`worker/`](worker/README.md), deployed by hand with `wrangler`; the daily workflow, the snapshot and the site do not depend on it.
 
 ```mermaid
 flowchart LR
@@ -1231,16 +1324,16 @@ flowchart LR
   W --> C["bot_context.json from Pages, 5-minute edge cache"]
   C --> CMD["slash command: answered by code"]
   C --> D["facts digest: the commands' own lines + rankings"]
-  D --> G["Gemini, eight rules"] --> N["number check + snapshot footer"]
+  D --> G["Gemini, ten rules"] --> N["number check + snapshot footer"]
   CMD --> R["reply: MarkdownV2, split at 4,096"]
   N --> R2["reply: plain text"]
 ```
 
-- **Commands by code.** `/check <ticker>` (tickers, short codes and names: `D05`, `DBS`, `BTC`, `SPX`, `BRK.B`), `/regime` (the VIX curve and its inverted streak, the next FOMC decision and CPI release in New York and Singapore time), `/triggers` (the briefing's rules), `/rotation`, `/upcoming`. A missing figure carries the export's own reason, word for word.
-- **Questions through Gemini, held to the snapshot.** Gemini never sees raw JSON: it reads a digest made of the same lines the commands print, plus rankings, so comparisons need no arithmetic. Its rules forbid outside facts, calculation, advice and predictions; an untracked asset is said to be untracked. Every decimal or percentage in the answer must appear in the digest or the question, or it is listed under the answer as not in the snapshot. Follow-ups work by replying to the bot, with no stored conversation.
+- **Commands by code.** `/check <ticker>` (tickers, short codes and names: `D05`, `DBS`, `BTC`, `SPX`, `BRK.B`; with the radar tier, score, trap and medium stop since V4.1), `/radar` (the three-pillar macro regime, the tiers with the weakest labelled "Weakest · Dead Money", and the dividend traps), `/regime` (the VIX curve and its inverted streak, the next FOMC decision and CPI release in New York and Singapore time), `/triggers` (the briefing's rules), `/rotation`, `/upcoming`. A missing figure carries the export's own reason, word for word.
+- **Questions through Gemini, held to the snapshot.** Gemini never sees raw JSON: it reads a digest made of the same lines the commands print, plus rankings, so comparisons need no arithmetic, and since V4.1 every asset's stops for all three horizons, so "what's a good stop-loss for D05 if I hold for 6 months?" is answered by quoting the medium stop, not by computing one. Its rules forbid outside facts, calculation, advice and predictions; an untracked asset is said to be untracked. Every decimal or percentage in the answer must appear in the digest or the question, or it is listed under the answer as not in the snapshot. Follow-ups work by replying to the bot, with no stored conversation.
 - **Locked to its owner.** Telegram's `secret_token` header, compared in constant time; replies only to the chats in the Worker's `TELEGRAM_CHAT_ID`; logs that name the event and outcome, never a token, a chat id or a message.
 - **Degrades in words.** GitHub Pages down, a stale snapshot, no Gemini key, a spent free quota, a blocked or empty answer, a timeout or a retired model: each gets its own reply, and the commands keep working without the model.
-- **Tested without a network.** 87 `node --test` tests fake Telegram, GitHub Pages and Gemini, and run every command over both a frozen export and the committed one, so a change to the export that would break a reply fails the `Worker tests` workflow.
+- **Tested without a network.** 103 `node --test` tests fake Telegram, GitHub Pages and Gemini, and run every command over a frozen export from before V5.0, a frozen V5.0 one and the committed one, so a change to the export that would break a reply fails the `Worker tests` workflow.
 
 Setup (about fifteen minutes: a free Cloudflare account, an optional free Gemini key, four Worker secrets, one `setWebhook` call), operation, key rotation and troubleshooting are in [`worker/README.md`](worker/README.md).
 
@@ -1472,11 +1565,11 @@ Pearson correlation of log returns, computed only on dates when both assets trad
 
 Two suites run in CI as deployment gates, and a third covers the Telegram agent.
 
-**`tests/engines.test.html`: 376 tests in 55 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
+**`tests/engines.test.html`: 402 tests in 60 suites**, a zero-dependency test page. Open it in a browser and it runs in about fifteen seconds, reporting through the page, the tab title and a small report object that the headless runner collects.
 
-**`scripts/test_fetch_fundamentals.py` and `scripts/test_sync_macro_calendar.py`: 202 tests** of the Python side, standard-library `unittest`; the calendar sync's tests run offline against fixtures shaped like each source.
+**`scripts/test_fetch_fundamentals.py`, `scripts/test_sync_macro_calendar.py` and `scripts/test_decision_radar.py`: 232 tests** of the Python side, standard-library `unittest`; the calendar sync's tests run offline against fixtures shaped like each source.
 
-**`worker/test/*.test.mjs`: 87 tests** of the Telegram agent, `node --test` with no dependencies and no network (see [Telegram agent](#telegram-agent)). They are not a deployment gate, since the Worker is deployed by hand, but the `Worker tests` workflow runs them on every change to `worker/` or to the export.
+**`worker/test/*.test.mjs`: 103 tests** of the Telegram agent, `node --test` with no dependencies and no network (see [Telegram agent](#telegram-agent)). They are not a deployment gate, since the Worker is deployed by hand, but the `Worker tests` workflow runs them on every change to `worker/` or to the export.
 
 Every formula is verified against an independent source of truth:
 
@@ -1528,7 +1621,7 @@ The leaderboard and the portfolio sandbox adapt to **their own width** with CSS 
 2. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
 3. Run the workflow once from the Actions tab (or push to `main`). From then on it refreshes the data, runs both gates and redeploys every day.
 
-No secrets, tokens or environment variables are needed for the site. Optional: the two Telegram secrets (see [Daily Telegram briefing](#daily-telegram-briefing)), `FRED_API_KEY` plus the *Allow GitHub Actions to create and approve pull requests* setting for [the monthly calendar sync](#the-monthly-calendar-sync), and the [Telegram agent](worker/README.md), a separate Cloudflare Worker with its own four secrets.
+No secrets, tokens or environment variables are needed for the site. Optional: the two Telegram secrets (see [Daily Telegram briefing](#daily-telegram-briefing)), `FRED_API_KEY` plus the *Allow GitHub Actions to create and approve pull requests* setting for [the monthly calendar sync](#the-monthly-calendar-sync) (since V5.0 the daily run also reads the credit and rates pillars of the [macro regime](#decision-radar) with it; without it the regime uses the VIX pillar alone), and the [Telegram agent](worker/README.md), a separate Cloudflare Worker with its own four secrets.
 
 ---
 
@@ -1559,6 +1652,8 @@ Stated plainly, because knowing where a model stops is part of the engineering.
 | **No BUY, HOLD or SELL.** | A recommendation implies an edge. Over November 2022 to October 2026 neither the Technical score nor the 200-day trend, 12-1 momentum or volatility-adjusted momentum predicted 21- or 63-day returns on this watchlist, in any VIX regime, so the site describes the trend and publishes what followed. The project's claim is transparency and correctness of calculation, not predictive power. |
 | **The scores are heuristics.** | Weights and thresholds are reasoned rules of thumb, kept as readouts of the chart and the business. The Technical score's mean rank IC with 21-day returns was −0.08; it is shown beside the score in Pro mode. |
 | **The market regime is context, not a signal.** | VIX is priced from S&P 500 options: a gauge of the US market, and a statement of what protection costs, not of what happens next. It is shown and explained, and kept out of every score until a test shows it helps. |
+| **The Decision Radar describes; it does not predict.** | Its tiers are price-based readouts of the last year, the kind the trend-regime research found had no edge over 21 or 63 days here, so "Dead Money" is a description, labelled factually, never a sell list. Its stops are risk boundaries sized from volatility: they say how much room a normal day needs, not where the price is going, and a gap can open beyond them. |
+| **The macro regime's thresholds are conventions.** | 4.5% for high-yield spreads, an inverted 10Y − 2Y curve and an inverted VIX curve are common stress markers, not fitted values, and the multipliers (×1.15, ×1.35) are judgement. Without FRED the count can only understate stress, and the VIX pillar alone tops out at Cautious. |
 | **Spreads use the tick floor, not a range-based estimate.** | Corwin–Schultz overstated liquid stocks' spreads up to 800 times in a volatile month. The tick floor is exact but is a minimum; London and crypto, whose price grids are not modelled, get no spread figure rather than a misleading one. |
 | **The volume cap rarely binds at retail size.** | Even the thinnest REIT trades about US$14.5 million a day. The cap is there for large hypothetical accounts; for small ones the spread is the liquidity cost that matters, and the sizing table shows it. |
 | **Crowding is measured on the sample covariance.** | Portfolio volatility uses the shrunk matrix to tame noise, but shrinkage would hide which holdings move together. The trace says which matrix each figure uses. |

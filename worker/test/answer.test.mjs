@@ -90,7 +90,7 @@ test('when Gemini cannot answer, the reply says why and lists the commands', asy
     const { result, text } = await ask('how is DBS doing?', { gemini });
     assert.equal(result.answer, reason);
     assert.ok(text.startsWith(words), `${reason}: ${text}`);
-    assert.ok(text.endsWith('/check D05 · /regime · /triggers · /rotation · /upcoming · /help'));
+    assert.ok(text.endsWith('/check D05 · /radar · /regime · /triggers · /rotation · /upcoming · /help'));
   }
   assert.equal(fallbackLines('something new', GEMINI_ENV)[0], 'Gemini could not answer.');
 });

@@ -764,6 +764,64 @@ const ENTRIES = {
     healthy: 'A fresh value from today\'s data.',
     risky: 'A value marked "proxy" is another country\'s yield standing in because the real one could not be fetched; the Sharpe ratio is then approximate.',
   },
+
+  /* ---------------- V5.0: the macro regime and the Decision Radar ---------------- */
+  macroStress: {
+    term: 'Macro regime (three pillars)',
+    what: 'Three stress checks counted together. Volatility: the VIX at or above the 3-month VIX (an inverted curve). Credit: the US high-yield spread at or above 4.5%, or 0.5 points wider in 20 sessions. Rates: the 10-year minus 2-year Treasury spread below zero, or 0.35 points steeper in 20 sessions while the 2-year yield fell (a bull steepening).',
+    why: 'Markets swing more under stress. The Decision Radar widens every stop by the regime\'s multiplier, ×1.00 when Calm (no flag), ×1.15 when Cautious (one) and ×1.35 when Stressed (two or three), so that ordinary noise is less likely to reach it.',
+    healthy: 'Calm: no pillar flagged.',
+    risky: 'Stressed: two or three pillars flagged. When the credit and rates data (FRED) cannot be read, only the VIX pillar counts, which can understate stress.',
+  },
+  healthScore: {
+    term: 'Health score (0-4)',
+    what: 'One point each, on dividend-adjusted closes: trend (the close above its 50-day average, and the 50-day above the 200-day), strength (a 3-month total return ahead of the benchmark: VOO, the STI ETF ES3.SI or Bitcoin; VOO and Bitcoin themselves need a positive 3-month return), momentum (a positive 1-month return, or volatility below 22% for an income asset yielding 3.5% or more) and drawdown (less than 12% below the 52-week high).',
+    why: 'Four checks you can verify, dividends included, that sum up how a holding has behaved over the last year.',
+    healthy: '3 or 4.',
+    risky: '0 or 1. It describes the past: price-based readouts like this did not predict returns on this watchlist.',
+  },
+  healthTier: {
+    term: 'Health tier',
+    what: 'Healthy for a score of 3-4, Neutral for 2, and Dead Money for 0-1 on each of the last three sessions. A low score that has not lasted three sessions is held at Neutral.',
+    why: 'The three-session rule stops a single bad day from changing the label. Nothing is stored: the three scores are recomputed from the price history.',
+    healthy: 'Healthy: trend, strength and momentum mostly in its favour.',
+    risky: 'Dead Money: weak on all four checks for three sessions running. A description of the past year, not an instruction to sell.',
+  },
+  trailingYield: {
+    term: 'Trailing dividend yield',
+    what: 'Dividends with an ex-date in the last 365 days, divided by the last close.',
+    why: 'It decides the income exception of the momentum point and whether the dividend-trap check applies.',
+    healthy: 'A yield the price did not have to fall to create.',
+    risky: 'A yield that is high because the price fell: see the dividend trap.',
+  },
+  dividendTrap: {
+    term: 'Dividend trap',
+    what: 'A trailing yield of 3% or more, with the price more than 2.5 times the yield below its 52-week high, or a negative one-year total return.',
+    why: 'A falling price pushes the yield up, so a high yield on its own can hide a losing holding.',
+    healthy: 'No trap, or a yield below 3% (not checked).',
+    risky: 'Flagged: the yield may be high because the price fell, not because the payout grew. A screen, not a verdict on the dividend.',
+  },
+  stopShort: {
+    term: 'Two-stage stop, short horizon',
+    what: 'For a hold of 2 weeks to a month: an initial stop 2 × the daily EWMA volatility × √5 × the macro multiplier below the last close (at least 4%, at most 25%). After a rise of 1.25 × that distance, the stop moves to the entry and then trails 1.0 × the distance below the highest close.',
+    why: 'Sized from the asset\'s own volatility, so a calm stock gets a tight stop and a volatile one gets room for its normal swings.',
+    healthy: 'A stop well clear of the asset\'s typical earnings-day move.',
+    risky: 'A gap (earnings, ex-dividend, news) can open beyond any stop, and an order can fill below it. A risk boundary, not a prediction or advice.',
+  },
+  stopMedium: {
+    term: 'Two-stage stop, medium horizon',
+    what: 'For a hold of 3 to 6 months: an initial stop 2 × the daily EWMA volatility × √21 × the macro multiplier below the last close (at least 7%, at most 25%). After a rise of 1.25 × that distance, the stop moves to the entry and then trails 1.15 × the distance below the highest close.',
+    why: 'Sized from the asset\'s own volatility over a month of trading, so the stop survives the noise of a multi-month hold.',
+    healthy: 'A stop well clear of the asset\'s typical earnings-day move.',
+    risky: 'A gap (earnings, ex-dividend, news) can open beyond any stop, and an order can fill below it. A risk boundary, not a prediction or advice.',
+  },
+  stopLong: {
+    term: 'Two-stage stop, long horizon',
+    what: 'For a hold of a year or more: an initial stop 2.5 × the daily EWMA volatility × √21 × the macro multiplier below the last close (at least 12%, at most 25%). After a rise of 1.5 × that distance, the stop moves to the entry and then trails 1.25 × the distance below the highest close.',
+    why: 'The widest of the three, so a long hold is not stopped out by an ordinary correction.',
+    healthy: 'A stop well clear of the asset\'s typical earnings-day move.',
+    risky: 'A gap (earnings, ex-dividend, news) can open beyond any stop, and an order can fill below it. A risk boundary, not a prediction or advice.',
+  },
 };
 
 const FALLBACK = Object.freeze({

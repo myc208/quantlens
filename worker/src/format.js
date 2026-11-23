@@ -51,6 +51,19 @@ export function price(value) {
   return value.toFixed(Math.abs(value) < 1 ? 4 : 2);
 }
 
+/**
+ * A price with exactly the decimals of its tick (V5.0 stop prices, already rounded to it):
+ * 58.04 at a 0.01 tick, 0.975 at 0.005, 51,716.14 for Bitcoin.
+ */
+export function tickPrice(value, tick) {
+  if (!finite(value)) return 'N/A';
+  const text = String(finite(tick) && tick > 0 ? tick : 0.01);
+  const decimals = text.includes('e-') ? Number(text.split('e-')[1]) : (text.split('.')[1] ?? '').length;
+  const [whole, fraction] = Math.abs(value).toFixed(Math.min(decimals, 8)).split('.');
+  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return `${value < 0 ? MINUS : ''}${grouped}${fraction ? `.${fraction}` : ''}`;
+}
+
 /** 428657629 → "428.7M". */
 export function compact(value) {
   if (!finite(value)) return 'N/A';

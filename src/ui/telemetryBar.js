@@ -1,7 +1,7 @@
 /**
  * telemetryBar.js: the sticky bar at the top of the page.
  *
- *   [brand] [BTC live] [ETH live] [feed status] [regime] [next macro] [USD/SGD] [US 10Y] [SG 10Y] [data age]   [USD|SGD] [Guided|Pro]
+ *   [brand] [BTC live] [ETH live] [feed status] [macro regime] [VIX regime] [next macro] [USD/SGD] [US 10Y] [SG 10Y] [data age]   [USD|SGD] [Guided|Pro]
  *
  * It tells the user, at all times, where every number is coming from: which
  * feed is live, which has fallen back, how old the daily snapshot is and which
@@ -31,6 +31,9 @@ const FEED_TITLES = Object.freeze({
 });
 
 const MODE_LABELS = Object.freeze({ guided: 'Guided', pro: 'Pro' });
+// V5.0: the three pillars of the macro regime, as short pill labels.
+const STRESS_PILLS = Object.freeze([['volatility', 'Vol'], ['credit', 'Credit'], ['rates', 'Rates']]);
+const STRESS_TONES = Object.freeze({ Calm: 'healthy', Cautious: 'caution', Stressed: 'risky' });
 
 export function mountTelemetryBar(root, app) {
   const { store, actions, h } = app;
@@ -184,6 +187,40 @@ export function mountTelemetryBar(root, app) {
       </button>`;
   }
 
+  /**
+   * The three-pillar macro regime (V5.0): Calm, Cautious or Stressed, the multiplier it applies to
+   * the Decision Radar's stops, and one pill per pillar (flagged, clear or not read). A button: it
+   * opens the derivation.
+   */
+  function stressTick() {
+    const stress = app.stress();
+    if (!stress.state) {
+      return `
+        <span class="tick" title="${h.esc(stress.metric.naReason ?? 'The macro regime could not be read.')}">
+          <span class="tick__label">Macro</span>
+          <span class="tick__price">N/A</span>
+        </span>`;
+    }
+    const pills = STRESS_PILLS.map(([name, short]) => {
+      const pillar = stress.pillars[name];
+      const flag = pillar.status === 'unavailable' ? 'unread' : pillar.flag ? 'flagged' : 'clear';
+      const word = { unread: 'not read', flagged: 'flagged', clear: 'clear' }[flag];
+      return `<span class="pillar" data-flag="${flag}" title="${h.esc(`${pillar.label}: ${pillar.text}`)}">${h.esc(short)}<span class="sr-only"> ${word}</span></span>`;
+    }).join('');
+    const multiplier = `×${formatNumber(stress.multiplier, 2)}`;
+    const pillarWords = STRESS_PILLS.map(([name]) => `${stress.pillars[name].label}: ${stress.pillars[name].text}`).join('. ');
+    const title = `Macro regime: ${stress.state}, ${stress.flags} of ${stress.active} pillar${stress.active === 1 ? '' : 's'} flagged, so the Decision Radar's stops are widened ${multiplier}. ${pillarWords}.${stress.fallback || stress.active < 3 ? ` ${stress.note ?? ''}` : ''} Select to see how it is read.`;
+    return `
+      <button type="button" class="tick tick--button tick--stress" data-trace="macroStress" data-key="telemetry:macroStress" data-stress="${h.esc(stress.state)}"
+        aria-label="${h.esc(title)}" title="${h.esc(title)}">
+        ${h.toneMark(STRESS_TONES[stress.state])}
+        <span class="tick__label">Macro</span>
+        <span class="tick__price">${h.esc(stress.state)}</span>
+        <span class="tick__meta">${multiplier}</span>
+        <span class="pillars" aria-hidden="true">${pills}</span>
+      </button>`;
+  }
+
   /** The next FOMC decision or CPI release, amber within 48 hours. A button: it opens the derivation. */
   function macroTick() {
     const macro = app.describeMacro();
@@ -237,6 +274,7 @@ export function mountTelemetryBar(root, app) {
     strip.innerHTML = [
       ...crypto.map((asset) => cryptoTick(state, asset)),
       crypto.length ? feedMarkup(state) : '',
+      stressTick(),
       regimeTick(),
       macroTick(),
       fxTick(state),

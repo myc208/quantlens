@@ -8,8 +8,11 @@ import { fileURLToPath } from 'node:url';
 
 const read = (relative) => JSON.parse(readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8'));
 
-/** A frozen copy of bot_context.json (asOf 2026-11-22): exact-text tests run against it. */
+/** A frozen copy of bot_context.json (asOf 2026-11-22): exact-text tests run against it. It was
+ * published before V5.0, so it also proves the bot still reads a summary without the radar. */
 export const FIXTURE = read('./fixtures/bot_context.json');
+/** A frozen V5.0 summary (asOf 2026-11-23): the macro regime (VIX pillar only) and the Decision Radar. */
+export const FIXTURE_V5 = read('./fixtures/bot_context_v5.json');
 /** The file the daily pipeline commits: shape and size tests run against whatever it holds today. */
 export const COMMITTED = read('../../data/bot_context.json');
 

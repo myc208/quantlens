@@ -240,6 +240,47 @@ REGIME_HISTORY_MAX_ROWS = 1400   # five years of sessions is about 1,255
 REGIME_STALE_LIMIT_DAYS = 5      # an older reading is not carried over
 REGIME_LEVEL_BOUNDS = (1.0, 200.0)
 
+# Macro stress (V5.0): three pillars, each flagged or not, counted into one state.
+#   volatility  VIX / VIX3M at or above 1.00: the curve is inverted (from macro.regime)
+#   credit      the US high-yield option-adjusted spread (FRED BAMLH0A0HYM2) at or above 4.50%,
+#               or 0.50 points wider than 20 observations before
+#   rates       the 10-year minus 2-year Treasury spread (FRED T10Y2Y) below zero (inverted), or a
+#               bull steepening: 0.35 points steeper than 20 observations before while the 2-year
+#               yield (FRED DGS2) fell over the same dates
+# 0 flags is Calm, 1 Cautious, 2 or 3 Stressed. The state's multiplier widens every stop the
+# Decision Radar computes. FRED values are percent; they are stored as fractions (4.5% -> 0.045).
+# Without FRED_API_KEY, or when FRED fails, the volatility pillar alone decides (so at most Cautious).
+STRESS_SERIES = {"credit": "BAMLH0A0HYM2", "rates": "T10Y2Y", "twoYear": "DGS2"}
+STRESS_RULES = {
+    "volRatio": 1.0,            # VIX / VIX3M at or above this: the volatility flag
+    "creditLevel": 0.045,       # HY OAS at or above 4.50%
+    "creditWidening": 0.005,    # or at least 0.50 points wider over the window
+    "ratesInverted": 0.0,       # 10Y - 2Y below this: inverted
+    "ratesSteepening": 0.0035,  # or at least 0.35 points steeper over the window, with the 2Y lower
+    "window": 20,               # observations (trading days) for the changes
+}
+STRESS_MULTIPLIERS = {"Calm": 1.0, "Cautious": 1.15, "Stressed": 1.35}
+STRESS_PILLARS = ["volatility", "credit", "rates"]
+STRESS_PILLAR_STATUSES = {"fresh", "stale", "unavailable"}
+STRESS_STATUSES = {"fresh", "partial", "vix-only", "unavailable"}
+STRESS_KEYS = ["status", "asOf", "state", "flags", "active", "multiplier", "pillars", "rules", "multipliers", "note"]
+STRESS_PILLAR_KEYS = ["status", "flag", "asOf", "source", "series", "value", "change", "from", "twoYearChange", "note"]
+STRESS_LOOKBACK_DAYS = 120       # calendar days of observations requested: well over 20 sessions
+STRESS_STALE_LIMIT_DAYS = 5      # an older pillar reading is not carried over
+STRESS_VALUE_BOUND = 0.5         # |fraction|: any FRED value beyond 50% is not a spread or a yield
+FRED_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_MAX_BYTES = 2_000_000
+
+# Total-return benchmarks (V5.0) that are not in the watchlist, downloaded once a day for the
+# Decision Radar's relative-strength point: SGX assets are measured against the SPDR Straits Times
+# Index ETF (dividend-adjusted, unlike ^STI). US and London assets use VOO, already in the watchlist.
+BENCHMARK_SYMBOLS = {"ES3.SI": {"name": "SPDR Straits Times Index ETF", "market": "SG", "currency": "SGD"}}
+BENCHMARK_KEYS = ["name", "market", "currency", "status", "asOf", "source", "note", "series"]
+BENCHMARK_PERIOD = "1y"
+BENCHMARK_MIN_ROWS = 100
+BENCHMARK_MAX_ROWS = 400
+BENCHMARK_STALE_LIMIT_DAYS = 5
+
 # Macro calendar (V3.2): FOMC decisions and minutes, US CPI releases and market holidays, kept by
 # hand in scripts/macro_calendar.json and copied into macro.calendar on every run.
 CALENDAR_TYPES = {
@@ -300,7 +341,7 @@ SIGNALS_SCRIPT = REPO_ROOT / "scripts" / "signals.mjs"
 BOT_CONTEXT_SCRIPT = REPO_ROOT / "scripts" / "bot_context.mjs"
 BOT_CONTEXT_PATH = REPO_ROOT / "data" / "bot_context.json"
 BOT_CONTEXT_SCHEMA = "quantlens.bot_context/1"
-BOT_CONTEXT_MAX_BYTES = 50_000
+BOT_CONTEXT_MAX_BYTES = 64_000   # V5.0: the Decision Radar adds about 15 KB; still parsed in well under a millisecond
 BOT_CONTEXT_EVENT_DAYS = 30
 BOT_CONTEXT_MAX_LIST = 64        # no candle or history arrays: no list may be longer than this
 BOT_CONTEXT_CELLS = ("trend", "technical", "fundamental", "rs1m", "rs3m", "rotation", "beta", "ewmaVol", "var95",
@@ -319,7 +360,18 @@ BOT_CONTEXT_UNITS = {
     "spread": "fraction of the price: one tick, the minimum round-trip spread",
     "amihud": "basis points of price move per US$1 million traded, last 20 sessions",
     "adv": "average daily traded value over 20 sessions, in 'ccy'",
+    "stress": ("three-pillar macro regime: volatility (VIX / VIX3M >= 1.00), credit (US high-yield spread >= 4.5% or 0.5 points "
+               "wider in 20 sessions), rates (10Y - 2Y < 0, or 0.35 points steeper in 20 sessions with the 2Y lower); "
+               "0 flags Calm x1.00, 1 Cautious x1.15, 2-3 Stressed x1.35; pillar values are fractions (0.045 = 4.5%)"),
+    "radar": ("Decision Radar: tier Healthy (score 3-4), Neutral (2, or 0-1 not yet on three sessions) or Dead Money (0-1 on "
+              "three sessions); score points on total return: trend, strength vs 'vs' over 3 months ('self': the asset is "
+              "its own benchmark and needs a positive 3-month return), momentum (1-month "
+              "return, or volatility < 22% for a yield >= 3.5%), drawdown < 12% from the 52-week high; stops are fractions "
+              "of the last close (init below, breakeven above, trail below the highest close) with tick-rounded prices in 'ccy'"),
 }
+BOT_CONTEXT_TIERS = {"Healthy", "Neutral", "Dead Money"}
+BOT_CONTEXT_STRESS_STATES = {"Calm", "Cautious", "Stressed", None}
+BOT_CONTEXT_STOP_KEYS = ["init", "breakeven", "trail", "initPrice", "breakevenPrice", "trailPrice"]
 # A Telegram chat id: a user or group number (groups and channels are negative), or a public @channel.
 CHAT_ID_RE = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$")
 SIGNALS_TIMEOUT = 60.0
@@ -1761,6 +1813,359 @@ def build_regime(previous: dict[str, Any] | None, settings: argparse.Namespace, 
 
 
 # --------------------------------------------------------------------------- #
+# Macro stress (V5.0): volatility, credit and rates pillars
+# --------------------------------------------------------------------------- #
+
+def parse_fred_observations(data: bytes | str, series_id: str) -> list[tuple[str, float]]:
+    """FRED's observations as ascending (date, fraction) pairs. Missing days (".") are skipped;
+    FRED's percent values are divided by 100. Raises FetchError if nothing usable is left."""
+    try:
+        payload = json.loads(data)
+    except (TypeError, ValueError) as exc:
+        raise FetchError(f"FRED {series_id}: the response is not JSON") from exc
+    rows = payload.get("observations") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise FetchError(f"FRED {series_id}: the response has no observations")
+    observations: list[tuple[str, float]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not is_iso_date(row.get("date")):
+            continue
+        try:
+            value = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue  # "." marks a day without a value
+        fraction = clean_number(value / 100, digits=6)
+        if fraction is None or abs(fraction) > STRESS_VALUE_BOUND:
+            continue
+        if observations and row["date"] <= observations[-1][0]:
+            raise FetchError(f"FRED {series_id}: observations are not in ascending date order")
+        observations.append((row["date"], fraction))
+    if not observations:
+        raise FetchError(f"FRED {series_id}: no usable observations")
+    return observations
+
+
+def fred_observations(series_id: str, api_key: str, start: str, timeout: float, opener: Any = None) -> list[tuple[str, float]]:
+    """One FRED series from `start`. The key travels in the query string, so no error message
+    carries the URL: only the series and the HTTP status or the exception's type."""
+    query = urllib.parse.urlencode({"series_id": series_id, "api_key": api_key, "file_type": "json",
+                                    "observation_start": start, "sort_order": "asc"})
+    try:
+        data = http_get(f"{FRED_OBSERVATIONS_URL}?{query}", timeout, FRED_MAX_BYTES, opener)
+    except urllib.error.HTTPError as exc:
+        raise FetchError(f"FRED {series_id}: HTTP {exc.code}", rate_limited=exc.code == 429) from None
+    except Exception as exc:  # noqa: BLE001
+        raise FetchError(f"FRED {series_id}: {type(exc).__name__}") from None
+    return parse_fred_observations(data, series_id)
+
+
+def window_change(observations: list[tuple[str, float]], window: int) -> tuple[float, str] | None:
+    """The latest value minus the one `window` observations before it, and that earlier date."""
+    if len(observations) <= window:
+        return None
+    start_date, start_value = observations[-1 - window]
+    return clean_number(observations[-1][1] - start_value, digits=6), start_date
+
+
+def value_on_or_before(observations: list[tuple[str, float]], day: str) -> float | None:
+    found = None
+    for when, value in observations:
+        if when > day:
+            break
+        found = value
+    return found
+
+
+def stress_pillar(status: str, flag: bool | None, as_of: str | None, source: str, series: str, value: float | None = None,
+                  change: float | None = None, start: str | None = None, two_year_change: float | None = None,
+                  note: str | None = None) -> dict[str, Any]:
+    return {"status": status, "flag": flag, "asOf": as_of, "source": source, "series": series, "value": value,
+            "change": change, "from": start, "twoYearChange": two_year_change, "note": note}
+
+
+def volatility_pillar(regime: Any, rules: dict[str, float] = STRESS_RULES) -> dict[str, Any]:
+    """The VIX curve from macro.regime: flagged when VIX / VIX3M is at or above 1.00."""
+    usable = isinstance(regime, dict) and regime.get("status") in {"fresh", "stale"} and is_finite_number(regime.get("ratio"))
+    if not usable:
+        return stress_pillar("unavailable", None, None, "yahoo", "^VIX / ^VIX3M", note="The VIX curve could not be read in this run.")
+    ratio = regime["ratio"]
+    return stress_pillar(regime["status"], ratio >= rules["volRatio"], regime.get("asOf"), "yahoo", "^VIX / ^VIX3M", value=ratio,
+                         note=regime.get("note") if regime["status"] == "stale" else None)
+
+
+def credit_pillar(observations: list[tuple[str, float]], rules: dict[str, float] = STRESS_RULES) -> dict[str, Any]:
+    """High-yield spreads: flagged at or above 4.50%, or 0.50 points wider than 20 observations before."""
+    as_of, level = observations[-1]
+    changed = window_change(observations, int(rules["window"]))
+    widening, start = changed if changed else (None, None)
+    flag = level >= rules["creditLevel"] or (widening is not None and widening >= rules["creditWidening"])
+    note = None if changed else f"Fewer than {int(rules['window']) + 1} observations: the widening is not judged."
+    return stress_pillar("fresh", flag, as_of, "fred", STRESS_SERIES["credit"], level, widening, start, note=note)
+
+
+def rates_pillar(spread: list[tuple[str, float]], two_year: list[tuple[str, float]] | None,
+                 rules: dict[str, float] = STRESS_RULES) -> dict[str, Any]:
+    """The 10Y - 2Y curve: flagged when inverted, or after a bull steepening (0.35 points steeper
+    over 20 observations while the 2-year yield fell over the same dates)."""
+    as_of, level = spread[-1]
+    changed = window_change(spread, int(rules["window"]))
+    steepening, start = changed if changed else (None, None)
+    two_change = None
+    if changed and two_year:
+        end_two, start_two = value_on_or_before(two_year, as_of), value_on_or_before(two_year, start)
+        if end_two is not None and start_two is not None:
+            two_change = clean_number(end_two - start_two, digits=6)
+    note = None
+    if not changed:
+        note = f"Fewer than {int(rules['window']) + 1} observations: a steepening is not judged."
+    elif two_change is None:
+        note = "The 2-year yield (DGS2) could not be read, so a steepening is not judged."
+    bull = steepening is not None and two_change is not None and steepening >= rules["ratesSteepening"] and two_change < 0
+    return stress_pillar("fresh", level < rules["ratesInverted"] or bull, as_of, "fred", STRESS_SERIES["rates"],
+                         level, steepening, start, two_change, note)
+
+
+def stress_state(flags: int) -> str:
+    return "Calm" if flags == 0 else "Cautious" if flags == 1 else "Stressed"
+
+
+def stress_block(pillars: dict[str, dict[str, Any]], note: str | None = None) -> dict[str, Any]:
+    """The composite: flagged pillars among those that could be read, counted into a state."""
+    active = [name for name in STRESS_PILLARS if pillars[name]["status"] in {"fresh", "stale"}]
+    flags = sum(1 for name in active if pillars[name]["flag"])
+    if not active:
+        status, state = "unavailable", None
+    elif active == ["volatility"]:
+        status, state = "vix-only", stress_state(flags)
+    elif len(active) == len(STRESS_PILLARS) and all(pillars[name]["status"] == "fresh" for name in active):
+        status, state = "fresh", stress_state(flags)
+    else:
+        status, state = "partial", stress_state(flags)
+    dates = [pillars[name]["asOf"] for name in active if pillars[name]["asOf"]]
+    return {"status": status, "asOf": max(dates) if dates else None, "state": state, "flags": flags, "active": len(active),
+            "multiplier": STRESS_MULTIPLIERS[state] if state else 1.0, "pillars": {name: pillars[name] for name in STRESS_PILLARS},
+            "rules": dict(STRESS_RULES), "multipliers": dict(STRESS_MULTIPLIERS), "note": note}
+
+
+def previous_pillar(previous: Any, name: str, now_utc: datetime) -> dict[str, Any] | None:
+    """Yesterday's reading of a FRED pillar, if it is valid and at most five days old."""
+    macro = previous.get("macro") if isinstance(previous, dict) else None
+    block = macro.get("stress") if isinstance(macro, dict) else None
+    old = block.get("pillars", {}).get(name) if isinstance(block, dict) and isinstance(block.get("pillars"), dict) else None
+    if not isinstance(old, dict) or validate_stress_pillar(old, name) or old["status"] == "unavailable":
+        return None
+    if (now_utc.date() - date.fromisoformat(old["asOf"])).days > STRESS_STALE_LIMIT_DAYS:
+        return None
+    return {**old, "status": "stale", "note": "FRED could not be refreshed in this run; this is the previous reading."}
+
+
+def scrub_key(text: str, key: str) -> str:
+    return text.replace(key, "***") if key else text
+
+
+def build_stress(snapshot: dict[str, Any], previous: dict[str, Any] | None, env: dict[str, str], settings: argparse.Namespace,
+                 now_utc: datetime, fetcher: Callable[[str], list[tuple[str, float]]] | None = None) -> dict[str, Any]:
+    """macro.stress for the snapshot. Never raises: a pillar FRED cannot give is carried over from
+    the previous snapshot (stale, at most five days old) or left out, and the state is counted over
+    the pillars that remain. Without FRED_API_KEY nothing is requested."""
+    regime = snapshot.get("macro", {}).get("regime") if isinstance(snapshot.get("macro"), dict) else None
+    pillars = {"volatility": volatility_pillar(regime)}
+    key = (env.get("FRED_API_KEY") or "").strip()
+    if not key:
+        missing = "FRED_API_KEY is not set, so only the VIX pillar is used."
+        pillars["credit"] = stress_pillar("unavailable", None, None, "fred", STRESS_SERIES["credit"], note=missing)
+        pillars["rates"] = stress_pillar("unavailable", None, None, "fred", STRESS_SERIES["rates"], note=missing)
+        return stress_block(pillars, missing)
+    start = (now_utc.date() - timedelta(days=STRESS_LOOKBACK_DAYS)).isoformat()
+    deadline = time.monotonic() + settings.macro_timeout
+
+    def fetch(series_id: str) -> list[tuple[str, float]]:
+        if fetcher is not None:
+            return fetcher(series_id)
+        return with_retry(f"FRED {series_id}", lambda: fred_observations(series_id, key, start, settings.request_timeout),
+                          settings.max_retries, settings.retry_delay, deadline)
+
+    def failed(name: str, exc: BaseException) -> dict[str, Any]:
+        warn(scrub_key(f"macro stress: the {name} pillar could not be read ({type(exc).__name__}: {str(exc)[:160]})", key))
+        carried = previous_pillar(previous, name, now_utc)
+        if carried:
+            return carried
+        return stress_pillar("unavailable", None, None, "fred", STRESS_SERIES[name], note="FRED could not be read in this run.")
+
+    try:
+        pillars["credit"] = credit_pillar(fetch(STRESS_SERIES["credit"]))
+    except Exception as exc:  # noqa: BLE001
+        pillars["credit"] = failed("credit", exc)
+    try:
+        spread = fetch(STRESS_SERIES["rates"])
+        try:
+            two_year = fetch(STRESS_SERIES["twoYear"])
+        except Exception as exc:  # noqa: BLE001
+            warn(scrub_key(f"macro stress: the 2-year yield could not be read ({type(exc).__name__}); steepening is not judged", key))
+            two_year = None
+        pillars["rates"] = rates_pillar(spread, two_year)
+    except Exception as exc:  # noqa: BLE001
+        pillars["rates"] = failed("rates", exc)
+    unread = [name for name in ("credit", "rates") if pillars[name]["status"] != "fresh"]
+    note = f"Not refreshed from FRED in this run: {', '.join(unread)}." if unread else None
+    return stress_block(pillars, note)
+
+
+def validate_stress_pillar(pillar: Any, name: str) -> list[str]:
+    where = f"macro.stress.pillars.{name}"
+    if not isinstance(pillar, dict) or list(pillar) != STRESS_PILLAR_KEYS:
+        return [f"{where} must contain exactly {STRESS_PILLAR_KEYS}, in that order"]
+    errors: list[str] = []
+    if pillar["status"] not in STRESS_PILLAR_STATUSES:
+        errors.append(f"{where}.status must be one of {sorted(STRESS_PILLAR_STATUSES)}")
+    elif pillar["status"] == "unavailable":
+        if pillar["flag"] is not None or pillar["value"] is not None:
+            errors.append(f"{where} must have no flag and no value when unavailable")
+    else:
+        if not isinstance(pillar["flag"], bool):
+            errors.append(f"{where}.flag must be true or false")
+        if not is_iso_date(pillar["asOf"]):
+            errors.append(f"{where}.asOf must be an ISO date")
+        if not is_finite_number(pillar["value"]):
+            errors.append(f"{where}.value must be a number")
+    for key in ("change", "twoYearChange"):
+        if pillar[key] is not None and not is_finite_number(pillar[key]):
+            errors.append(f"{where}.{key} must be a number or null")
+    if pillar["from"] is not None and not is_iso_date(pillar["from"]):
+        errors.append(f"{where}.from must be an ISO date or null")
+    return errors
+
+
+def validate_stress(block: Any) -> list[str]:
+    """The composite must be the count of its own pillars' flags under its own rules."""
+    if not isinstance(block, dict) or list(block) != STRESS_KEYS:
+        return [f"macro.stress must contain exactly {STRESS_KEYS}, in that order"]
+    if not isinstance(block["pillars"], dict) or list(block["pillars"]) != STRESS_PILLARS:
+        return [f"macro.stress.pillars must be exactly {STRESS_PILLARS}"]
+    errors = [error for name in STRESS_PILLARS for error in validate_stress_pillar(block["pillars"][name], name)]
+    if errors:
+        return errors
+    if block["status"] not in STRESS_STATUSES:
+        errors.append(f"macro.stress.status must be one of {sorted(STRESS_STATUSES)}")
+    expected = stress_block(block["pillars"], block["note"])
+    for key in ("status", "state", "flags", "active", "multiplier", "asOf"):
+        if block[key] != expected[key]:
+            errors.append(f"macro.stress.{key} is {block[key]!r}; its pillars give {expected[key]!r}")
+    if block["rules"] != STRESS_RULES or block["multipliers"] != STRESS_MULTIPLIERS:
+        errors.append("macro.stress must carry the documented rules and multipliers")
+    return errors
+
+
+def stress_summary(block: dict[str, Any]) -> str:
+    if block["state"] is None:
+        return "unavailable"
+    flagged = [name for name in STRESS_PILLARS if block["pillars"][name]["flag"]]
+    return (f"{block['state']} (x{block['multiplier']:.2f}), {block['flags']} of {block['active']} pillars flagged"
+            f"{': ' + ', '.join(flagged) if flagged else ''} [{block['status']}]")
+
+
+def run_stress(settings: argparse.Namespace) -> int:
+    """Entry point for --stress: add macro.stress to the snapshot at --output. Always exits 0, and
+    never writes a snapshot that fails validation: without the block the site and the bot fall
+    back to the VIX pillar alone. The workflow gives FRED_API_KEY to this step only."""
+    key = (os.environ.get("FRED_API_KEY") or "").strip()
+    try:
+        snapshot = load_json(settings.output)
+        previous = load_previous(settings.previous) if settings.previous is not None else None
+        block = build_stress(snapshot, previous, dict(os.environ), settings, datetime.now(timezone.utc))
+        snapshot["macro"]["stress"] = block
+        errors = validate_snapshot(snapshot)
+        if errors:
+            warn(scrub_key(f"macro stress was not added: the snapshot would not validate ({errors[0]})", key))
+            return 0
+        write_snapshot(snapshot, settings.output)
+        LOG.info("macro stress: %s", stress_summary(block))
+    except Exception as exc:  # noqa: BLE001 - this step must never block the data
+        warn(scrub_key(f"macro stress was not added: {type(exc).__name__}: {str(exc)[:200]}", key))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# Total-return benchmarks outside the watchlist (V5.0)
+# --------------------------------------------------------------------------- #
+
+def unavailable_benchmark(spec: dict[str, str], note: str) -> dict[str, Any]:
+    return {"name": spec["name"], "market": spec["market"], "currency": spec["currency"], "status": "unavailable",
+            "asOf": None, "source": None, "note": note, "series": []}
+
+
+def fetch_benchmark(symbol: str, spec: dict[str, str], settings: argparse.Namespace, now_utc: datetime) -> dict[str, Any]:
+    """A year of completed, dividend-adjusted daily closes: one request."""
+    deadline = time.monotonic() + settings.macro_timeout
+    frame = with_retry(f"{symbol} benchmark", lambda: fetch_history(symbol, BENCHMARK_PERIOD, "1d", settings.request_timeout),
+                       settings.max_retries, settings.retry_delay, deadline)
+    early = getattr(settings, "early_closes", {}).get(spec["market"], frozenset())
+    series = [[row[0], row[4]] for row in build_candles(frame, spec["market"], now_utc, early)][-BENCHMARK_MAX_ROWS:]
+    if len(series) < BENCHMARK_MIN_ROWS:
+        raise FetchError(f"{symbol} has only {len(series)} completed sessions")
+    return {"name": spec["name"], "market": spec["market"], "currency": spec["currency"], "status": "fresh",
+            "asOf": series[-1][0], "source": "yahoo", "note": None, "series": series}
+
+
+def build_benchmarks(previous: dict[str, Any] | None, settings: argparse.Namespace, now_utc: datetime,
+                     fetcher: Callable[..., dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Every benchmark in BENCHMARK_SYMBOLS. Never raises: fresh -> the previous one (stale, at most
+    five days old) -> unavailable, in which case the radar measures SGX assets against ^STI."""
+    old_all = previous.get("benchmarks") if isinstance(previous, dict) and isinstance(previous.get("benchmarks"), dict) else {}
+    blocks: dict[str, Any] = {}
+    for symbol, spec in BENCHMARK_SYMBOLS.items():
+        try:
+            block = (fetcher or fetch_benchmark)(symbol, spec, settings, now_utc)
+            errors = validate_benchmark(symbol, block)
+            if errors:
+                raise FetchError("; ".join(errors[:2]))
+            blocks[symbol] = block
+            continue
+        except Exception as exc:  # noqa: BLE001
+            warn(f"benchmark {symbol} unavailable ({type(exc).__name__}: {str(exc)[:160]})")
+        old = old_all.get(symbol)
+        if isinstance(old, dict) and not validate_benchmark(symbol, old) and old["status"] != "unavailable" \
+                and (now_utc.date() - date.fromisoformat(old["asOf"])).days <= BENCHMARK_STALE_LIMIT_DAYS:
+            blocks[symbol] = {**old, "status": "stale", "note": "Not refreshed in this run; these are the previous closes."}
+        else:
+            blocks[symbol] = unavailable_benchmark(spec, "Could not be downloaded in this run.")
+    return blocks
+
+
+def validate_benchmark(symbol: str, block: Any) -> list[str]:
+    where = f"benchmarks.{symbol}"
+    if not isinstance(block, dict) or list(block) != BENCHMARK_KEYS:
+        return [f"{where} must contain exactly {BENCHMARK_KEYS}, in that order"]
+    errors: list[str] = []
+    if block["status"] not in {"fresh", "stale", "unavailable"}:
+        errors.append(f"{where}.status must be fresh, stale or unavailable")
+    series = block["series"]
+    if not isinstance(series, list) or len(series) > BENCHMARK_MAX_ROWS:
+        return errors + [f"{where}.series must be a list of at most {BENCHMARK_MAX_ROWS} rows"]
+    if block["status"] == "unavailable":
+        if series or block["asOf"] is not None:
+            errors.append(f"{where} must have no closes when unavailable")
+        return errors
+    previous_day = ""
+    for row in series:
+        if not (isinstance(row, list) and len(row) == 2 and is_iso_date(row[0]) and row[0] > previous_day
+                and is_finite_number(row[1]) and row[1] > 0):
+            return errors + [f"{where}.series rows must be [date, close], ascending, with positive closes"]
+        previous_day = row[0]
+    if len(series) < BENCHMARK_MIN_ROWS:
+        errors.append(f"{where} needs at least {BENCHMARK_MIN_ROWS} closes")
+    elif block["asOf"] != series[-1][0]:
+        errors.append(f"{where}.asOf must be the date of its last close")
+    return errors
+
+
+def validate_benchmarks(blocks: Any) -> list[str]:
+    if not isinstance(blocks, dict):
+        return ["benchmarks must be an object"]
+    return [error for symbol, block in blocks.items() for error in validate_benchmark(symbol, block)]
+
+
+# --------------------------------------------------------------------------- #
 # Macro calendar: FOMC, CPI and market holidays (kept by hand, copied every run)
 # --------------------------------------------------------------------------- #
 
@@ -2298,6 +2703,9 @@ def validate_macro(macro: Any) -> list[str]:
     # Likewise the macro calendar (V3.2).
     if "calendar" in macro:
         errors.extend(validate_calendar_block(macro["calendar"]))
+    # And the three-pillar macro stress block (V5.0), added by the --stress step.
+    if "stress" in macro:
+        errors.extend(validate_stress(macro["stress"]))
     return errors
 
 
@@ -2410,6 +2818,8 @@ def validate_snapshot(snapshot: Any) -> list[str]:
                 previous_date = row[0]
 
     errors.extend(validate_macro(snapshot["macro"]))
+    if "benchmarks" in snapshot:  # V5.0; optional so that older snapshots still validate
+        errors.extend(validate_benchmarks(snapshot["benchmarks"]))
 
     assets = snapshot["assets"]
     if not isinstance(assets, list) or not assets:
@@ -2494,6 +2904,9 @@ def render_snapshot(snapshot: dict[str, Any]) -> str:
     calendar = clone["macro"].get("calendar")
     if isinstance(calendar, dict) and isinstance(calendar.get("events"), list):
         calendar["events"] = compact(calendar["events"], 6, "calendar")
+    for index, block in enumerate((clone.get("benchmarks") or {}).values()):
+        if isinstance(block, dict) and isinstance(block.get("series"), list):
+            block["series"] = compact(block["series"], 6, f"benchmark_{index}")
     for index, asset in enumerate(clone["assets"]):
         asset["candles"] = compact(asset["candles"], 6, f"candles_{index}")
         asset["history"] = compact(asset["history"], 6, f"history_{index}")
@@ -3516,12 +3929,19 @@ def bot_context_events(snapshot: dict[str, Any], signals: list[dict[str, Any]], 
     return sorted(events, key=lambda event: (event["date"], event["kind"], event.get("ticker", "")))
 
 
+# Prices already rounded to an exchange tick by the engine: six significant figures would turn
+# Bitcoin's 51,716.14 into 51,716.1, a level the bot would then quote. They are kept as they are.
+BOT_CONTEXT_EXACT_KEYS = {"initPrice", "breakevenPrice", "trailPrice", "tick"}
+
+
 def _rounded(value: Any) -> Any:
-    """Six significant figures for every float, recursively: plenty for anything quoted."""
+    """Six significant figures for every float, recursively: plenty for anything quoted (tick-rounded
+    prices excepted)."""
     if isinstance(value, float):
         return float(f"{value:.6g}") if math.isfinite(value) else None
     if isinstance(value, dict):
-        return {key: _rounded(item) for key, item in value.items()}
+        return {key: (item if key in BOT_CONTEXT_EXACT_KEYS and isinstance(item, (int, float)) and math.isfinite(item) else _rounded(item))
+                for key, item in value.items()}
     if isinstance(value, list):
         return [_rounded(item) for item in value]
     return value
@@ -3551,9 +3971,12 @@ def build_bot_context(snapshot_path: Path, previous: dict[str, Any] | None, now:
             "A value is {\"v\": ...} or {\"na\": \"<the reason it is not available>\"}. Never fill a gap with a guess.",
             "Trend regimes and relative strength describe the past and do not predict returns. Nothing here is financial advice.",
             "Triggers use the Telegram briefing's rules against the previous snapshot; an empty list means a quiet day.",
+            "Decision Radar tiers describe the last year on total return, and its stops are volatility-sized risk boundaries "
+            "at the last close: neither is a forecast or a recommendation.",
         ],
         "units": BOT_CONTEXT_UNITS,
         "regime": engine.get("regime"),
+        "stress": engine.get("stress"),
         "events": bot_context_events(snapshot, signals, now),
         "triggers": triggers,
         "rotation": engine.get("rotation"),
@@ -3567,8 +3990,11 @@ def validate_bot_context(context: Any, snapshot: dict[str, Any] | None = None) -
     if not isinstance(context, dict):
         return ["the agent context must be an object"]
     errors: list[str] = []
-    expected = ["schema", "asOf", "builtAt", "source", "notes", "units", "regime", "events", "triggers", "rotation", "assets"]
-    if list(context) != expected:
+    expected = ["schema", "asOf", "builtAt", "source", "notes", "units", "regime", "stress", "events", "triggers", "rotation", "assets"]
+    # A file written before V5.0 (no macro stress, no radar) stays valid until the next run replaces it;
+    # every file built from now on has both.
+    legacy = "stress" not in context and list(context) == [key for key in expected if key != "stress"]
+    if list(context) != expected and not legacy:
         return [f"the agent context must have exactly {expected}, in that order"]
     if context["schema"] != BOT_CONTEXT_SCHEMA:
         errors.append(f"schema must be {BOT_CONTEXT_SCHEMA}")
@@ -3604,6 +4030,12 @@ def validate_bot_context(context: Any, snapshot: dict[str, Any] | None = None) -
                                                  or ("v" in value) or ("date" in value) or ("ret" in value))
             if not good:
                 errors.append(f"{ticker}.{key} must hold a value or an N/A reason")
+        if not legacy or "radar" in asset:
+            errors.extend(validate_radar_cell(asset.get("radar"), ticker))
+    stress = context.get("stress")
+    if not legacy and not (isinstance(stress, dict) and stress.get("state") in BOT_CONTEXT_STRESS_STATES and is_finite_number(stress.get("multiplier"))
+            and isinstance(stress.get("pillars"), dict) and list(stress["pillars"]) == STRESS_PILLARS):
+        errors.append("stress must hold a state, a multiplier and the three pillars")
     if not all(isinstance(trigger, dict) and trigger.get("kind") in {"macro", "vix", "move", "flip", "earnings", "tone"}
                for trigger in context["triggers"]):
         errors.append("every trigger needs a known kind")
@@ -3613,6 +4045,35 @@ def validate_bot_context(context: Any, snapshot: dict[str, Any] | None = None) -
         tickers = [asset.get("ticker") for asset in snapshot.get("assets", []) if isinstance(asset, dict)]
         if [asset.get("ticker") for asset in context["assets"] if isinstance(asset, dict)] != tickers:
             errors.append("the agent context must list the snapshot's assets in the same order")
+    return errors
+
+
+def validate_radar_cell(radar: Any, ticker: str) -> list[str]:
+    """An asset's Decision Radar: an N/A reason, or a tier, its score and three horizons of stops whose
+    distances are ordered (breakeven above the close, stops below it, no initial stop beyond 25%)."""
+    where = f"{ticker}.radar"
+    if isinstance(radar, dict) and set(radar) == {"na"}:
+        return [] if isinstance(radar["na"], str) and radar["na"].strip() else [f"{where} needs an N/A reason"]
+    if not isinstance(radar, dict) or radar.get("tier") not in BOT_CONTEXT_TIERS:
+        return [f"{where} must hold a tier or an N/A reason"]
+    errors: list[str] = []
+    score = radar.get("score")
+    if not (isinstance(score, int) and 0 <= score <= 4):
+        errors.append(f"{where}.score must be a whole number from 0 to 4")
+    if not isinstance(radar.get("dividendTrap"), bool):
+        errors.append(f"{where}.dividendTrap must be true or false")
+    stops = radar.get("stops")
+    if not isinstance(stops, dict) or list(stops) != ["short", "medium", "long"]:
+        return errors + [f"{where}.stops must hold short, medium and long"]
+    for horizon, stop in stops.items():
+        if isinstance(stop, dict) and set(stop) == {"na"}:
+            continue
+        if not isinstance(stop, dict) or list(stop) != BOT_CONTEXT_STOP_KEYS or not all(is_finite_number(stop[key]) for key in BOT_CONTEXT_STOP_KEYS):
+            errors.append(f"{where}.stops.{horizon} must hold {BOT_CONTEXT_STOP_KEYS}")
+        elif not (-0.25 - 1e-9 <= stop["init"] < 0 < stop["breakeven"] and stop["trail"] < 0 and stop["initPrice"] < stop["breakevenPrice"]):
+            errors.append(f"{where}.stops.{horizon} is out of order or beyond the 25% cap")
+    if not isinstance(radar.get("warnings"), list):
+        errors.append(f"{where}.warnings must be a list")
     return errors
 
 
@@ -3694,8 +4155,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="the hand-kept macro calendar (FOMC, CPI, market holidays) copied into the snapshot")
     parser.add_argument("--bot-context", action="store_true",
                         help="write data/bot_context.json, the agent-ready summary of the snapshot at --output, and exit")
+    parser.add_argument("--stress", action="store_true",
+                        help="add macro.stress (the three-pillar macro regime) to the snapshot at --output and exit (never fails; "
+                             "reads FRED_API_KEY, and without it uses the VIX pillar alone)")
     parser.add_argument("--previous", type=Path, default=None,
-                        help="with --notify or --bot-context: the snapshot before this run, to tell new sessions and tone shifts")
+                        help="with --notify, --bot-context or --stress: the snapshot before this run (new sessions, tone shifts, "
+                             "and FRED readings to carry over)")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args(argv)
 
@@ -3735,6 +4200,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_notify(settings)
     if settings.bot_context:
         return run_bot_context(settings)
+    if settings.stress:
+        return run_stress(settings)
 
     try:
         watchlist = load_json(settings.watchlist)
@@ -3785,6 +4252,9 @@ def main(argv: list[str] | None = None) -> int:
     macro["calendar"] = calendar
     LOG.info("macro calendar: %s, %d events, %d US and %d SGX half days", calendar_summary(calendar, now_utc), len(calendar["events"]),
              len(settings.early_closes["US"]), len(settings.early_closes["SG"]))
+    benchmarks = build_benchmarks(previous, settings, now_utc)
+    for symbol, block in benchmarks.items():
+        LOG.info("benchmark %s: %s, %d closes%s", symbol, block["status"], len(block["series"]), f" to {block['asOf']}" if block["asOf"] else "")
 
     assets: list[dict[str, Any]] = []
     refreshed: list[dict[str, Any]] = []
@@ -3884,6 +4354,7 @@ def main(argv: list[str] | None = None) -> int:
         "generatedAt": iso_timestamp(now_utc),
         "fx": fx,
         "macro": macro,
+        "benchmarks": benchmarks,
         "candleFields": CANDLE_FIELDS,
         "historyFields": HISTORY_FIELDS,
         "forecastFields": FORECAST_FIELDS,

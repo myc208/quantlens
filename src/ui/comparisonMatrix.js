@@ -2,8 +2,14 @@
  * comparisonMatrix.js: the side-by-side comparison of up to three assets.
  *
  * Layout: one table with a sticky metric-label column and one column per
- * asset, in sections (Trend, Price, Period, Technical, Fundamental, News and
- * forecast), then the correlation card, then the position-sizing table.
+ * asset, in sections (Trend, Decision Radar, Price, Period, Technical, Fundamental,
+ * News and forecast), then the correlation card, then the position-sizing table.
+ *
+ * Decision Radar (V5.0): the health tier, its score and the dividend-trap check, then the
+ * Two-Stage Stop Planner for the horizon picked in the section header (short, medium or
+ * long): the initial stop, the breakeven trigger and the trail, each as a percentage of
+ * the last close and as a price rounded to the exchange's tick, with ex-dividend and
+ * earnings-gap warnings under it. The horizon is page state only: nothing is stored.
  *
  * Time range: the price chart, the Period rows and the correlation card use
  * the series sliced to the selected range (1M / 3M / 6M / 1Y). The trend regime,
@@ -27,7 +33,8 @@
  */
 
 import { MAX_SELECTED, selectFx } from '../core/store.js';
-import { isNum, safeDiv } from '../core/precisionMath.js';
+import { isNum, safeDiv, decimalsOf } from '../core/precisionMath.js';
+import { RADAR_CONFIG } from '../engines/radarEngine.js';
 import { pairId } from '../engines/correlationEngine.js';
 
 const SECTIONS = Object.freeze([
@@ -39,6 +46,18 @@ const SECTIONS = Object.freeze([
       { id: 'trendRegime', lead: true },
       { id: 'regimeRecord', label: 'What followed (backtest)' },
       { id: 'scoreBacktest', label: 'Technical score track record', pro: true },
+    ],
+  },
+  {
+    id: 'radar',
+    title: 'Decision Radar',
+    note: 'The last year on total return, and volatility-sized stops at the last close: neither is a forecast or advice',
+    rows: [
+      { id: 'healthTier', lead: true },
+      { id: 'healthScore' },
+      { id: 'dividendTrap' },
+      { id: 'trailingYield', pro: true },
+      { id: 'stopPlanner', kind: 'planner' },
     ],
   },
   {
@@ -195,12 +214,23 @@ const SIZING_SECTION = Object.freeze({
 const PROFILE_CHIPS = Object.freeze({ CORPORATE: 'Corporate', FINANCIAL: 'Financial', REIT: 'REIT', ETF: 'ETF', INDEX: 'Index', CRYPTO: 'Crypto' });
 const PROFILE_NAMES = Object.freeze({ CORPORATE: 'corporates', FINANCIAL: 'financial companies', REIT: 'REITs', ETF: 'ETFs', INDEX: 'indices', CRYPTO: 'crypto' });
 const STORY_TONES = Object.freeze({ positive: 'healthy', neutral: 'neutral', negative: 'caution' });
+// V5.0: the stop planner's three holding horizons (the radar engine's stop metrics).
+const HORIZON_CHOICES = Object.freeze([
+  Object.freeze({ id: 'short', metric: 'stopShort', label: 'Short', hint: '2 weeks to 1 month' }),
+  Object.freeze({ id: 'medium', metric: 'stopMedium', label: 'Medium', hint: '3 to 6 months' }),
+  Object.freeze({ id: 'long', metric: 'stopLong', label: 'Long', hint: '1 year or more' }),
+]);
+const POINT_NAMES = Object.freeze([['trend', 'Trend'], ['strength', 'Strength'], ['momentum', 'Momentum'], ['drawdown', 'Drawdown']]);
 const DAY_MS = 86400000;
 const dayOf = (isoDate) => Date.parse(`${isoDate}T00:00:00Z`);
 
 export function mountComparisonMatrix(root, app) {
   const { store, actions, h } = app;
   const { esc } = h;
+
+  // The stop planner's horizon: page state only, medium by default (V5.0).
+  let horizon = 'medium';
+  const horizonChoice = () => HORIZON_CHOICES.find((choice) => choice.id === horizon) ?? HORIZON_CHOICES[1];
 
   // Explainers default to open on desktop and collapsed on phones (tap "i" to open one).
   const explainers = {
@@ -218,6 +248,7 @@ export function mountComparisonMatrix(root, app) {
 
   function rowLabel(row) {
     if (row.kind === 'chart') return `Price, last ${h.rangeInfo().label}`;
+    if (row.kind === 'planner') return `Two-stage stop, ${horizonChoice().label.toLowerCase()} horizon`;
     return row.label ?? app.explain(row.id).term;
   }
 
@@ -277,6 +308,18 @@ export function mountComparisonMatrix(root, app) {
         return `<span class="cell__sub">${deltaMarkup(meta.changePct)} ${meta.live ? 'live' : `close ${esc(h.shortDate(asset.quote.asOf))}`}</span>`;
       case 'fundamentalScore':
         return sub(`${meta.profileLabel} profile${meta.period ? ` · ${meta.period}` : ''}`);
+      case 'healthTier':
+        return sub(`Last three sessions ${meta.scores.join(', ')} (newest first)${meta.held ? ' · held at Neutral until 0-1 lasts three sessions' : ''}`);
+      case 'healthScore': {
+        const points = POINT_NAMES.map(([key, name]) => `${meta.points[key] ? '✓' : '✗'} ${name}`).join(' · ');
+        const versus = meta.selfBenchmark ? 'its own 3-month return' : meta.benchmark ? `vs ${meta.benchmark}${meta.benchmarkFallback ? ' (price only)' : ''}` : 'no benchmark';
+        return sub(`${points} · strength: ${versus}`);
+      }
+      case 'dividendTrap':
+        if (!meta.eligible) return sub(isNum(meta.dividendYield) && meta.dividendYield > 0 ? `Yield ${h.formatPercent(meta.dividendYield, 1)}: below 3%, not checked` : 'No dividend in the last year: not checked');
+        return sub(`Yield ${h.formatPercent(meta.dividendYield, 1)} · ${h.formatPercent(Math.abs(meta.drawdown), 1)} below the high (a trap beyond ${h.formatPercent(RADAR_CONFIG.trapMultiple * meta.dividendYield, 1)})${isNum(meta.yearReturn) ? ` · 1-year ${h.signedPercent(meta.yearReturn, 1)}` : ''}`);
+      case 'trailingYield':
+        return sub(`${meta.payments} payment${meta.payments === 1 ? '' : 's'} in 365 days`);
       case 'macd':
         return sub(`Line ${meta.line > meta.signal ? 'above' : 'below'} signal`);
       case 'roe':
@@ -379,8 +422,11 @@ export function mountComparisonMatrix(root, app) {
 
   function mainValue(metric) {
     if (metric.status !== 'ok') return '<span class="badge badge--na">N/A</span>';
-    if (metric.id === 'trendRegime') {
+    if (metric.id === 'trendRegime' || metric.id === 'healthTier') {
       return `<span class="badge badge--trend badge--${metric.tone}">${h.toneMark(metric.tone)}${esc(metric.value)}</span>`;
+    }
+    if (metric.id === 'healthScore') {
+      return `${h.toneMark(metric.tone)}<span class="cell__value">${whole(metric.value)} <span class="cell__unit">of 4</span></span>`;
     }
     if (metric.id === 'headlineTone') {
       const word = String(metric.meta.label ?? '');
@@ -556,6 +602,128 @@ export function mountComparisonMatrix(root, app) {
   }
 
   /* ------------------------------------------------------------------ */
+  /* Two-stage stop planner (V5.0)                                        */
+  /* ------------------------------------------------------------------ */
+
+  /** A price in the asset's own currency, with exactly the decimals of its tick. */
+  function tickPrice(value, tick, currency) {
+    const digits = decimalsOf(tick);
+    return `${currency} ${value.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+  }
+
+  /** The radar's ex-dividend warning, and its earnings-gap warning when it concerns this horizon. */
+  function plannerWarnings(asset, choice) {
+    const analysis = app.analysis(asset.ticker);
+    const warnings = analysis && analysis.radar ? analysis.radar.warnings : [];
+    const items = [];
+    for (const warning of warnings) {
+      if (warning.kind === 'ex-dividend') {
+        const amount = isNum(warning.amount) ? ` (${esc(warning.currency)} ${esc(h.formatAmount(warning.amount))})` : '';
+        const drop = isNum(warning.drop) ? `the price drops by about ${h.formatPercent(warning.drop, 1)}${amount} at the open, mechanically, toward the stop` : 'the price drops by the dividend at the open';
+        items.push(`Ex-dividend ${esc(h.shortDate(warning.date))}${warning.estimated ? ' (estimated)' : ''}, in ${warning.tradingDays} trading day${warning.tradingDays === 1 ? '' : 's'}: ${drop}.`);
+      } else if (warning.kind === 'earnings-gap') {
+        const hit = warning.horizons.find((entry) => entry.horizon === choice.id);
+        if (!hit) continue;
+        items.push(`Earnings ~${esc(h.shortDate(warning.date))}, in ${warning.tradingDays} trading days: the typical earnings-day move, ${h.formatPercent(warning.typicalMove, 1)}, is larger than this ${h.formatPercent(Math.abs(hit.stop), 1)} stop${isNum(warning.worstMove) ? ` (the worst was ${h.signedPercent(warning.worstMove, 1)})` : ''}. A gap can open beyond it.`);
+      }
+    }
+    if (!items.length) return '';
+    return `<ul class="planner__warnings">${items.map((item) => `<li>${h.toneMark('caution')}<span>${item}</span></li>`).join('')}</ul>`;
+  }
+
+  function plannerCell(asset, state) {
+    const choice = horizonChoice();
+    const metric = app.trace(asset.ticker, choice.metric);
+    const key = `radar|${asset.ticker}|stopPlanner`;
+    if (!metric) return '<td><div class="cell cell--static cell--na"><span class="cell__value">–</span></div></td>';
+    if (metric.status !== 'ok') {
+      return `
+        <td>
+          <button type="button" class="cell cell--na" data-action="trace" data-ticker="${esc(asset.ticker)}" data-trace="${esc(metric.id)}" data-key="${esc(key)}"
+            title="${esc(metric.naReason)}" aria-label="${esc(`${choice.label} horizon stop for ${asset.ticker}: not available. ${metric.naReason}`)}">
+            <span class="cell__main"><span class="badge badge--na">N/A</span></span>
+            ${state.mode === 'guided' ? `<span class="cell__sub cell__sub--reason">${esc(metric.naReason)}</span>` : ''}
+          </button>
+        </td>`;
+    }
+    const meta = metric.meta;
+    const price = (value) => tickPrice(value, meta.tick, meta.currency);
+    const stages = [
+      { label: 'Stage 1 · initial stop', pct: meta.initPct, price: meta.initPrice, note: 'below the last close' },
+      { label: 'Breakeven trigger', pct: meta.breakevenPct, price: meta.breakevenPrice, note: 'then raise the stop to the entry' },
+      { label: 'Stage 2 · trail', pct: meta.trailPct, price: meta.trailPrice, note: 'below the highest close (from today)' },
+    ];
+    const spec = RADAR_CONFIG.horizons[choice.id];
+    let bounds = '';
+    if (meta.capped) bounds = ` · at the ${h.formatPercent(RADAR_CONFIG.cap, 0)} cap`;
+    else if (meta.floored) bounds = ` · at the ${h.formatPercent(spec.floor, 0)} floor`;
+    const spoken = stages.map((stage) => `${stage.label} ${h.signedPercent(stage.pct, 1)}, ${price(stage.price)}`).join('; ');
+    return `
+      <td>
+        <button type="button" class="cell planner" data-action="trace" data-ticker="${esc(asset.ticker)}" data-trace="${esc(metric.id)}" data-key="${esc(key)}"
+          aria-label="${esc(`${choice.label} horizon stop for ${asset.ticker}: ${spoken}. Show how it is calculated.`)}">
+          ${stages.map((stage) => `
+            <span class="planner__stage">
+              <span class="planner__label">${esc(stage.label)}</span>
+              <span class="planner__pct">${esc(h.signedPercent(stage.pct, 1))}</span>
+              <span class="planner__price">${esc(price(stage.price))}</span>
+              <span class="planner__note">${esc(stage.note)}</span>
+            </span>`).join('')}
+          ${sub(`${choice.hint} · σ ${h.formatPercent(meta.sigmaDaily, 2)} a day · ${meta.state} ×${h.formatNumber(meta.multiplier, 2)}${bounds} · tick ${meta.tick}${meta.tickModelled ? '' : ' (no exchange tick modelled)'}`)}
+        </button>
+        ${plannerWarnings(asset, choice)}
+      </td>`;
+  }
+
+  function plannerRow(section, row, assets, state) {
+    const key = `${section.id}:${row.id}`;
+    const label = rowLabel(row);
+    const open = explainerOpen(key, state);
+    return `
+      <tr class="metric-row metric-row--planner" data-rowkey="${esc(key)}">
+        <th scope="row">
+          <div class="metric-label">
+            <span class="metric-term">${esc(label)}</span>
+            <button type="button" class="info-btn" data-action="explain" data-explain="${esc(key)}" data-key="${esc(`info|${key}`)}"
+              aria-expanded="${open}" aria-controls="${domId(key)}" aria-label="${esc(`${open ? 'Hide' : 'Show'} the explanation of ${label}`)}">i</button>
+          </div>
+          <p class="planner__legend">Percentages of the last close. Prices are in each asset's own currency, rounded to its tick: stops down, the trigger up.</p>
+        </th>
+        ${assets.map((asset) => plannerCell(asset, state)).join('')}
+      </tr>`;
+  }
+
+  /** The horizon switch in the Decision Radar's header row. */
+  function horizonToggle() {
+    return `
+      <fieldset class="segmented horizon-toggle">
+        <legend class="sr-only">Holding horizon of the stop planner</legend>
+        ${HORIZON_CHOICES.map((choice) => `
+          <label title="${esc(choice.hint)}">
+            <input type="radio" name="radar-horizon" value="${choice.id}" data-key="horizon|${choice.id}"${choice.id === horizon ? ' checked' : ''}>
+            <span>${esc(choice.label)}</span>
+          </label>`).join('')}
+      </fieldset>`;
+  }
+
+  /** Re-draw only the planner (and its explainer) after the horizon changes. */
+  function refreshPlanner() {
+    const state = store.getState();
+    const comparison = app.comparison();
+    if (!comparison.assets.length) return;
+    const section = SECTIONS.find((entry) => entry.id === 'radar');
+    const row = section.rows.find((entry) => entry.kind === 'planner');
+    const span = comparison.assets.length + 1;
+    withFocus(() => {
+      const current = root.querySelector('tr[data-rowkey="radar:stopPlanner"]');
+      if (current) current.outerHTML = plannerRow(section, row, comparison.assets, state);
+      const explained = root.querySelector('[data-explainer="radar:stopPlanner"]');
+      if (explained) explained.outerHTML = explainerRow(section, row, comparison.assets, state, span);
+    });
+    markCurrent();
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Rows                                                                */
   /* ------------------------------------------------------------------ */
 
@@ -580,6 +748,7 @@ export function mountComparisonMatrix(root, app) {
           ${cells}
         </tr>`;
     }
+    if (row.kind === 'planner') return plannerRow(section, row, assets, state);
     if (row.kind === 'news') {
       return `
         <tr class="metric-row" data-rowkey="${esc(key)}">
@@ -602,9 +771,10 @@ export function mountComparisonMatrix(root, app) {
   }
 
   function explainerRow(section, row, assets, state, span) {
-    if (row.kind) return ''; // charts and headline lists explain themselves
+    if (row.kind && row.kind !== 'planner') return ''; // charts and headline lists explain themselves
     const key = `${section.id}:${row.id}`;
-    const base = app.explain(row.id);
+    // The planner explains the stop of the horizon on screen.
+    const base = app.explain(row.kind === 'planner' ? horizonChoice().metric : row.id);
     const notes = new Map(); // note text -> tickers it applies to
     for (const asset of assets) {
       const { note } = app.explain(row.id, asset.scoringProfile);
@@ -641,7 +811,11 @@ export function mountComparisonMatrix(root, app) {
       <tbody data-section="${esc(section.id)}">
         <tr class="section-row">
           <th colspan="${span}" scope="rowgroup">
-            <span class="section-row__title">${esc(section.title)}</span><span class="section-row__note">${esc(sectionNote(section, state))}</span>
+            ${section.id === 'radar' ? `
+              <div class="section-row__inner">
+                <span><span class="section-row__title">${esc(section.title)}</span><span class="section-row__note">${esc(sectionNote(section, state))}</span></span>
+                ${horizonToggle()}
+              </div>` : `<span class="section-row__title">${esc(section.title)}</span><span class="section-row__note">${esc(sectionNote(section, state))}</span>`}
           </th>
         </tr>
         ${rows.map((row) => metricRow(section, row, assets, state, comparison) + explainerRow(section, row, assets, state, span)).join('')}
@@ -1013,6 +1187,13 @@ export function mountComparisonMatrix(root, app) {
       default:
         break;
     }
+  });
+
+  root.addEventListener('change', (event) => {
+    const control = event.target;
+    if (!(control instanceof HTMLInputElement) || control.name !== 'radar-horizon' || !control.checked) return;
+    horizon = control.value;
+    refreshPlanner();
   });
 
   // Chart hover: a vertical hairline snaps to the nearest day and the readout shows its date and

@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseCommand, runCommand, assetCard, COMMANDS } from '../src/commands.js';
 import { renderLine, groupLines, chunk, TELEGRAM_LIMIT } from '../src/format.js';
-import { FIXTURE, COMMITTED, ENV, clone, markdownProblem } from './helpers.mjs';
+import { FIXTURE, FIXTURE_V5, COMMITTED, ENV, clone, markdownProblem } from './helpers.mjs';
 
 const loadedOf = (context, extra = {}) => ({ ok: true, context, ageHours: 5, stale: false, ...extra });
 const reply = (text, context = FIXTURE, env = ENV, extra = {}) => runCommand(parseCommand(text), loadedOf(context, extra), env);
@@ -212,23 +212,37 @@ function assertSendable(lines, label) {
   for (const raw of ['undefined', 'NaN', '[object Object]', 'null']) assert.ok(!text.includes(raw), `${label} shows "${raw}"`);
 }
 
-test('every committed asset has a card that fits one message, with its date and every N/A reason', () => {
-  for (const asset of COMMITTED.assets) {
-    const lines = reply(`/check ${asset.ticker}`, COMMITTED);
-    assertSendable(lines, asset.ticker);
-    assert.equal(chunk(lines).length, 1, `${asset.ticker} fits one message`);
-    const text = plainText(lines);
-    assert.ok(text.startsWith(`${asset.ticker} · ${asset.name}`));
-    assert.match(text, /Snapshot \d{1,2} \w{3} \d{4} · not financial advice/);
-    for (const [field, cell] of Object.entries(asset)) {
-      if (cell && typeof cell === 'object' && typeof cell.na === 'string') assert.ok(text.includes(cell.na), `${asset.ticker}.${field} reason shown verbatim`);
+/** Every N/A reason of an asset, the radar's own and its stops' included. */
+function reasons(asset) {
+  const found = [];
+  for (const cell of Object.values(asset)) {
+    if (cell && typeof cell === 'object' && typeof cell.na === 'string') found.push(cell.na);
+  }
+  if (asset.radar && asset.radar.stops) {
+    for (const stop of Object.values(asset.radar.stops)) if (typeof stop.na === 'string') found.push(stop.na);
+  }
+  return found;
+}
+
+test('every asset has a card that fits one message, with its date and every N/A reason (committed file and V5.0 fixture)', () => {
+  for (const context of [COMMITTED, FIXTURE_V5]) {
+    for (const asset of context.assets) {
+      const lines = reply(`/check ${asset.ticker}`, context);
+      assertSendable(lines, asset.ticker);
+      assert.equal(chunk(lines).length, 1, `${asset.ticker} fits one message`);
+      const text = plainText(lines);
+      assert.ok(text.startsWith(`${asset.ticker} · ${asset.name}`));
+      assert.match(text, /Snapshot \d{1,2} \w{3} \d{4} · not financial advice/);
+      for (const reason of reasons(asset)) assert.ok(text.includes(reason), `${asset.ticker}: "${reason}" shown verbatim`);
+      assert.deepEqual(assetCard(asset, context, ENV), lines);
     }
-    assert.deepEqual(assetCard(asset, COMMITTED, ENV), lines);
   }
 });
 
-test('every command on the committed file is sendable', () => {
-  for (const text of ['/help', '/start', '/check', '/check AAPL', '/check amdd', '/regime', '/triggers', '/rotation', '/upcoming', '/nope']) {
-    assertSendable(reply(text, COMMITTED), text);
+test('every command on the committed file and the V5.0 fixture is sendable', () => {
+  for (const context of [COMMITTED, FIXTURE_V5]) {
+    for (const text of ['/help', '/start', '/check', '/check AAPL', '/check amdd', '/radar', '/regime', '/triggers', '/rotation', '/upcoming', '/nope']) {
+      assertSendable(reply(text, context), text);
+    }
   }
 });

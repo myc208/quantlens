@@ -10,12 +10,12 @@ import { rules, systemPrompt, userPrompt } from '../src/prompt.js';
 import { numberKeys, unsupportedNumbers } from '../src/numbers.js';
 import { assetCard, regimeLines, upcomingLines, footer } from '../src/commands.js';
 import { renderLine } from '../src/format.js';
-import { FIXTURE, COMMITTED, clone } from './helpers.mjs';
+import { FIXTURE, FIXTURE_V5, COMMITTED, clone } from './helpers.mjs';
 
 const lines = (built) => built.map((line) => renderLine(line, false));
 
 test('the digest holds every card line /check prints, without footers or links', () => {
-  for (const context of [FIXTURE, COMMITTED]) {
+  for (const context of [FIXTURE, COMMITTED, FIXTURE_V5]) {
     const digest = factsDigest(context);
     for (const asset of context.assets) {
       for (const line of lines(assetCard(asset, context, {})).filter((line) => line !== footer(context))) {
@@ -33,9 +33,12 @@ test('the digest names the snapshot date, the watchlist, and every N/A reason wo
   assert.ok(digest.startsWith('QuantLens snapshot of 22 Nov 2026 (asOf 2026-11-22T02:32:27Z).'));
   assert.ok(digest.includes('The watchlist has 30 assets. Anything not listed here is not tracked:'));
   assert.ok(digest.includes('Indices: ^IXIC ^GSPC ^DJI ^STI'));
-  for (const asset of COMMITTED.assets) {
-    for (const cell of Object.values(asset)) {
-      if (cell && typeof cell === 'object' && typeof cell.na === 'string') assert.ok(factsDigest(COMMITTED).includes(cell.na), cell.na);
+  for (const context of [COMMITTED, FIXTURE_V5]) {
+    const facts = factsDigest(context);
+    for (const asset of context.assets) {
+      for (const cell of Object.values(asset)) {
+        if (cell && typeof cell === 'object' && typeof cell.na === 'string') assert.ok(facts.includes(cell.na), cell.na);
+      }
     }
   }
 });
@@ -65,7 +68,8 @@ test('rankings order each figure highest first and leave out assets without it',
 });
 
 test('the digest stays small enough to send with every question', () => {
-  assert.ok(factsDigest(COMMITTED).length < 40000, `${factsDigest(COMMITTED).length} characters`);
+  // About 24,000 characters before V5.0 and 43,000 with the Decision Radar and its stops (V4.1).
+  for (const context of [COMMITTED, FIXTURE_V5]) assert.ok(factsDigest(context).length < 48000, `${factsDigest(context).length} characters`);
   const quiet = clone(FIXTURE);
   quiet.triggers = [];
   quiet.events = [];

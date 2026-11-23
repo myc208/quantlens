@@ -1941,10 +1941,12 @@ class BotContext(unittest.TestCase):
     def cell_asset(ticker: str) -> dict:
         cells = {key: {"v": 1.0} for key in ff.BOT_CONTEXT_CELLS}
         cells["shock"] = {"ret": -0.01, "z": -0.5, "date": "2026-11-20"}
-        return {"ticker": ticker, "name": ticker, **cells}
+        return {"ticker": ticker, "name": ticker, **cells, "radar": {"na": "Indices are not in the radar: they cannot be bought."}}
 
     def context(self, tickers=("AAA", "BBB")) -> dict:
-        engine = {"regime": {"state": "normal", "asOf": "2026-11-20"}, "rotation": {"groups": []},
+        stress = {"state": "Calm", "multiplier": 1.0, "flags": 0, "active": 1, "status": "vix-only",
+                  "pillars": {"volatility": {"status": "fresh", "flag": False}, "credit": {"status": "unavailable"}, "rates": {"status": "unavailable"}}}
+        engine = {"regime": {"state": "normal", "asOf": "2026-11-20"}, "stress": stress, "rotation": {"groups": []},
                   "assets": [self.cell_asset(ticker) for ticker in tickers]}
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "snapshot.json"
@@ -1953,7 +1955,7 @@ class BotContext(unittest.TestCase):
 
     def test_a_built_context_meets_its_contract(self):
         context = self.context()
-        self.assertEqual(list(context), ["schema", "asOf", "builtAt", "source", "notes", "units", "regime", "events", "triggers", "rotation", "assets"])
+        self.assertEqual(list(context), ["schema", "asOf", "builtAt", "source", "notes", "units", "regime", "stress", "events", "triggers", "rotation", "assets"])
         self.assertEqual(ff.validate_bot_context(context, {"generatedAt": "2026-11-21T22:00:00Z", "assets": [{"ticker": "AAA"}, {"ticker": "BBB"}]}), [])
         self.assertEqual(context["builtAt"], "2026-11-16T12:00:00Z")
 
@@ -1966,7 +1968,9 @@ class BotContext(unittest.TestCase):
         self.assertTrue(errors(lambda c: c["assets"][0].update(beta=None)))                                # a value or a reason
         self.assertTrue(errors(lambda c: c["assets"][0].update(beta={"na": " "})))                         # an empty reason
         self.assertTrue(errors(lambda c: c["assets"][0].update(closes=list(range(250)))))                  # no candle arrays
-        self.assertTrue(errors(lambda c: c["notes"].append("x" * 60_000)))                                 # the size limit
+        self.assertTrue(errors(lambda c: c["notes"].append("x" * 70_000)))                                 # the size limit
+        self.assertTrue(errors(lambda c: c.update(stress=None)))                                           # V5.0: the macro regime
+        self.assertTrue(errors(lambda c: c["assets"][0].update(radar={"tier": "Strong Buy"})))             # V5.0: a known tier
         self.assertTrue(errors(lambda c: c["triggers"].append({"kind": "rumour"})))
         self.assertTrue(errors(lambda c: None, {"generatedAt": "2026-11-20T22:00:00Z", "assets": [{"ticker": "AAA"}, {"ticker": "BBB"}]}))   # stale
         self.assertTrue(errors(lambda c: None, {"generatedAt": "2026-11-21T22:00:00Z", "assets": [{"ticker": "BBB"}, {"ticker": "AAA"}]}))   # order

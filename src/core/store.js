@@ -34,9 +34,11 @@ export const FILTER_OPTIONS = Object.freeze({
   market: Object.freeze(['all', 'US', 'SG', 'UK', 'CRYPTO']),
   // V3.3: the trend regime replaces the old verdict filter; a shared `verdict=` link is ignored.
   trend: Object.freeze(['all', 'uptrend', 'extended', 'pullback', 'recovering', 'downtrend']),
+  // V5.0: the Decision Radar's health tier.
+  radar: Object.freeze(['all', 'healthy', 'neutral', 'dead-money']),
 });
 
-export const DEFAULT_FILTERS = Object.freeze({ assetClass: 'all', market: 'all', sector: 'all', trend: 'all' });
+export const DEFAULT_FILTERS = Object.freeze({ assetClass: 'all', market: 'all', sector: 'all', trend: 'all', radar: 'all' });
 export const DEFAULT_ACCOUNT = Object.freeze({ equity: 10000, riskPct: 1, atrMultiple: 2, maxPositionPct: 25 });
 
 /** Bounds for the personal risk inputs. Guided mode keeps risk per trade conservative. */
@@ -49,7 +51,7 @@ export const ACCOUNT_LIMITS = Object.freeze({
 
 const URL_KEYS = Object.freeze({
   selected: 't', currency: 'ccy', mode: 'mode',
-  assetClass: 'class', market: 'mkt', sector: 'sector', trend: 'trend',
+  assetClass: 'class', market: 'mkt', sector: 'sector', trend: 'trend', radar: 'radar',
   view: 'view', range: 'range', portfolio: 'p', rotation: 'rs',
 });
 // Yahoo symbols: AMD, BRK-B, D05.SI, CSPX.L, BTC-USD, and indices with a leading caret (^GSPC).
@@ -130,6 +132,7 @@ export function parseUrlState(search = '') {
       market: matchOption(FILTER_OPTIONS.market, params.get(URL_KEYS.market)) ?? 'all',
       sector: rawSector && rawSector.trim() && rawSector.trim().length <= 60 ? rawSector.trim() : 'all',
       trend: matchOption(FILTER_OPTIONS.trend, params.get(URL_KEYS.trend)) ?? 'all',
+      radar: matchOption(FILTER_OPTIONS.radar, params.get(URL_KEYS.radar)) ?? 'all',
     },
   };
 }
@@ -155,6 +158,7 @@ export function serializeUrlState(state) {
   if (filters.market !== 'all') add(URL_KEYS.market, filters.market);
   if (filters.sector !== 'all') add(URL_KEYS.sector, encodeURIComponent(filters.sector).replace(/%20/g, '+'));
   if (filters.trend !== 'all') add(URL_KEYS.trend, filters.trend);
+  if (filters.radar !== 'all') add(URL_KEYS.radar, filters.radar);
   if (state.view && state.view !== DEFAULT_VIEW) add(URL_KEYS.view, state.view);
   if (state.range && state.range !== DEFAULT_RANGE) add(URL_KEYS.range, state.range);
   if (state.rotation && state.rotation !== DEFAULT_ROTATION) add(URL_KEYS.rotation, state.rotation);
@@ -641,8 +645,9 @@ export function selectSelectedAssets(state) {
  * @param {object[]} assets normalised assets
  * @param {object} filters state.filters
  * @param {Record<string, string|null>} [trendByTicker] e.g. { AAPL: 'Uptrend' }
+ * @param {Record<string, string|null>} [tierByTicker] the Decision Radar tier, e.g. { AAPL: 'Dead Money' }
  */
-export function filterAssets(assets, filters, trendByTicker = {}) {
+export function filterAssets(assets, filters, trendByTicker = {}, tierByTicker = {}) {
   return assets.filter((asset) => {
     if (filters.assetClass !== 'all' && asset.assetClass !== filters.assetClass) return false;
     if (filters.market !== 'all' && asset.market !== filters.market) return false;
@@ -650,6 +655,10 @@ export function filterAssets(assets, filters, trendByTicker = {}) {
     if (filters.trend !== 'all') {
       const trend = trendByTicker[asset.ticker];
       if (typeof trend !== 'string' || trend.toLowerCase() !== filters.trend) return false;
+    }
+    if (filters.radar && filters.radar !== 'all') {
+      const tier = tierByTicker[asset.ticker];
+      if (typeof tier !== 'string' || tier.toLowerCase().replace(/ /g, '-') !== filters.radar) return false;
     }
     return true;
   });
