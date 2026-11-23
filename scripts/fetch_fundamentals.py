@@ -364,7 +364,8 @@ BOT_CONTEXT_UNITS = {
                "wider in 20 sessions), rates (10Y - 2Y < 0, or 0.35 points steeper in 20 sessions with the 2Y lower); "
                "0 flags Calm x1.00, 1 Cautious x1.15, 2-3 Stressed x1.35; pillar values are fractions (0.045 = 4.5%)"),
     "radar": ("Decision Radar: tier Healthy (score 3-4), Neutral (2, or 0-1 not yet on three sessions) or Dead Money (0-1 on "
-              "three sessions); score points on total return: trend, strength vs 'vs' over 3 months, momentum (1-month "
+              "three sessions); score points on total return: trend, strength vs 'vs' over 3 months ('self': the asset is "
+              "its own benchmark and needs a positive 3-month return), momentum (1-month "
               "return, or volatility < 22% for a yield >= 3.5%), drawdown < 12% from the 52-week high; stops are fractions "
               "of the last close (init below, breakeven above, trail below the highest close) with tick-rounded prices in 'ccy'"),
 }

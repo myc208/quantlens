@@ -1337,6 +1337,24 @@
         expect(pick({ sector: 'Technology', trend: 'pullback' })).toEqual([]);
         expect(storeModule.FILTER_OPTIONS.trend).toEqual(['all', ...trends.TREND_REGIMES.map((label) => label.toLowerCase())]);
       });
+      test('the Decision Radar filter (V5.0): its URL key, its tiers, and a bad value ignored', () => {
+        expect(storeModule.FILTER_OPTIONS.radar).toEqual(['all', 'healthy', 'neutral', 'dead-money']);
+        const view = parseUrlState('?radar=Dead-Money&mkt=SG');
+        expect([view.filters.radar, view.filters.market]).toEqual(['dead-money', 'SG']);
+        expect(serializeUrlState(view)).toBe('?mkt=SG&radar=dead-money');
+        expect(parseUrlState('?radar=sell').filters.radar).toBe('all');
+        const assets = [{ ticker: 'A', assetClass: 'equity', market: 'US' }, { ticker: 'B', assetClass: 'equity', market: 'SG' }, { ticker: '^I', assetClass: 'index', market: 'US' }];
+        const tiers = { A: 'Healthy', B: 'Dead Money', '^I': null };
+        const pick = (radarTier) => storeModule.filterAssets(assets, { ...storeModule.DEFAULT_FILTERS, radar: radarTier }, {}, tiers).map((asset) => asset.ticker);
+        expect(pick('all')).toEqual(['A', 'B', '^I']);
+        expect(pick('dead-money')).toEqual(['B']);
+        expect(pick('healthy')).toEqual(['A']);
+        expect(pick('neutral')).toEqual([]);
+        expect(storeModule.hasActiveFilters({ ...storeModule.DEFAULT_FILTERS, radar: 'healthy' })).toBeTrue();
+        const state = reduce(createInitialState(''), actions.setFilter('radar', 'neutral'));
+        expect(state.filters.radar).toBe('neutral');
+        expect(reduce(state, actions.setFilter('radar', 'cut')).filters.radar).toBe('all');
+      });
       test('this test page stored nothing in the browser', () => {
         expect(window.localStorage.length).toBe(0);
         expect(window.sessionStorage.length).toBe(0);
@@ -1841,6 +1859,9 @@
         macroEngine.MACRO_METRIC_IDS.forEach((id) => ids.add(id));
         // V3.3: the crash replays of the portfolio sandbox.
         replays.REPLAY_METRIC_IDS.forEach((id) => ids.add(id));
+        // V5.0: the macro regime and the Decision Radar.
+        ids.add(stress.analyzeStress(null).metric.id);
+        radar.RADAR_METRIC_IDS.forEach((id) => ids.add(id));
         for (const id of ids) if (!glossary.hasExplainer(id)) fail(`no explainer for "${id}"`);
       });
       test('each asset is scored with the profile that matches its sector', async () => {
@@ -4799,6 +4820,8 @@
             continue;
           }
           expect([entry.radar.tier, entry.radar.score, entry.radar.dividendTrap]).toEqual([result.metrics.healthTier.value, result.metrics.healthScore.value, result.metrics.dividendTrap.meta.trap]);
+          expect(entry.radar.vs).toBe(result.selfBenchmark ? 'self' : result.benchmark);
+          if (typeof result.metrics.dividendTrap.meta.yearReturn === 'number') close(entry.radar.yearReturn, Number(result.metrics.dividendTrap.meta.yearReturn.toPrecision(4)));
           for (const horizon of radar.RADAR_HORIZONS) {
             const meta = result.metrics[radar.RADAR_CONFIG.horizons[horizon].id].meta;
             close(entry.radar.stops[horizon].init, Number(meta.initPct.toPrecision(4)));
@@ -4916,12 +4939,27 @@
         expect(radar.scoreSession(climb, climb.longSeries, 399, { benchmark: flatBenchmark() }).trend).toBeTrue();
         expect(radar.scoreSession(climb, climb.longSeries, 198, { benchmark: flatBenchmark() })).toBeNull();   // no 200-day average yet
       });
-      test('strength: ahead of the benchmark over 91 days, never level with it; its own benchmark earns nothing', () => {
+      test('strength: ahead of the benchmark over 91 days, never level with it', () => {
         const asset = radarAsset({ closes: flatPrices(400) });
         const falling = { ...flatBenchmark(), series: { dates: isoDates(400, RADAR_START), close: linePrices(400, 110, 100) } };
         expect(radar.scoreSession(asset, asset.longSeries, 399, { benchmark: falling }).ahead).toBeTrue();
         expect(radar.scoreSession(asset, asset.longSeries, 399, { benchmark: flatBenchmark() }).ahead).toBeFalse();
-        expect(radar.scoreSession(asset, asset.longSeries, 399, { benchmark: { self: true, ticker: 'RAD' } }).ahead).toBeFalse();
+      });
+      test('strength for a benchmark itself (VOO, Bitcoin): a positive 3-month total return, never a flat one', () => {
+        const own = { benchmark: { self: true, ticker: 'RAD' } };
+        const flat = radarAsset({ closes: flatPrices(400) });
+        const level = radar.scoreSession(flat, flat.longSeries, 399, own);
+        expect([level.self, level.ownReturn, level.ahead]).toEqual([true, 0, false]);
+        const dip = radarAsset({ closes: [...flatPrices(399), 99.9] });
+        expect(radar.scoreSession(dip, dip.longSeries, 399, own).ahead).toBeFalse();
+        const lift = radarAsset({ closes: [...flatPrices(399), 100.1] });
+        const up = radar.scoreSession(lift, lift.longSeries, 399, own);
+        expect(up.ownReturn).toBeCloseTo(0.001, 1e-12);                     // from the close 91 days before
+        expect(up.ahead).toBeTrue();
+        const result = radar.analyzeRadar(radarAsset({ closes: linePrices(400, 100, 140) }), { ...own, stress: CALM });
+        expect([result.metrics.healthScore.value, result.selfBenchmark, result.benchmark]).toEqual([4, true, null]);
+        expect(result.metrics.healthScore.trace.steps[1].description).toMatch(/its own benchmark/);
+        expect(tracer.validateTrace(result.metrics.healthScore)).toEqual([]);
       });
       test('momentum: a rise over 30 days, or a steady income asset (yield 3.5% or more, volatility under 22%)', () => {
         const flat = radarAsset({ closes: flatPrices(400) });
@@ -4976,7 +5014,7 @@
         const closes = [...flatPrices(300, 100), ...linePrices(100, 100, 80)];
         const asset = radarAsset({ closes, dividends: { dates: [dates[300], dates[390]], amounts: [3, 3] } });
         const result = radar.analyzeRadar(asset, { benchmark: flatBenchmark(), stress: CALM });
-        expect(result.metrics.dividendYield.value).toBeCloseTo(6 / 80, 1e-12);
+        expect(result.metrics.trailingYield.value).toBeCloseTo(6 / 80, 1e-12);
         expect(result.metrics.dividendTrap.value).toBe('Dividend trap');
         expect([result.metrics.dividendTrap.meta.deep, result.metrics.dividendTrap.meta.losing]).toEqual([true, true]);
       });

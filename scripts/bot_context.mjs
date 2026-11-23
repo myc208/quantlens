@@ -87,8 +87,10 @@ export function radarCell(radar) {
   const priced = metrics.stopMedium.status === 'ok' ? metrics.stopMedium.meta : null;
   return {
     tier: metrics.healthTier.value, score: metrics.healthScore.value, scores: radar.scores, held: metrics.healthTier.meta.held,
-    points: score.points, vs: radar.benchmark, vsTotalReturn: radar.benchmark ? !radar.benchmarkFallback : null,
-    dividendYield: round(metrics.dividendYield.value, 4), dividendTrap: metrics.dividendTrap.meta.trap === true,
+    points: score.points, vs: radar.selfBenchmark ? 'self' : radar.benchmark,
+    vsTotalReturn: radar.selfBenchmark ? true : radar.benchmark ? !radar.benchmarkFallback : null,
+    dividendYield: round(metrics.trailingYield.value, 4), dividendTrap: metrics.dividendTrap.meta.trap === true,
+    yearReturn: round(metrics.dividendTrap.meta.yearReturn, 4),
     drawdown: round(score.drawdown, 4), sigmaDaily: priced ? round(priced.sigmaDaily, 4) : null,
     tick: priced ? priced.tick : null, stops,
     warnings: radar.warnings.map((warning) => Object.fromEntries(Object.entries(warning).map(([key, value]) => [key, typeof value === 'number' ? round(value, 4) : value]))),

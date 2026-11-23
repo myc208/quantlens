@@ -3,7 +3,9 @@
  *
  *   /start, /help     what the bot does and how to ask
  *   /check <TICKER>   one asset: trend regime, close, relative strength, beta, volatility,
- *                     the latest move, spread, Amihud, the next earnings and ex-dividend
+ *                     the latest move, spread, Amihud, the next earnings and ex-dividend, and
+ *                     (V5.0) its Decision Radar tier, score, dividend trap and medium stop
+ *   /radar            (V5.0) the three-pillar macro regime, the health tiers and the dividend traps
  *   /regime           the VIX curve, its inverted streak, and the next FOMC and CPI (ET and SGT)
  *   /triggers         what fired in the snapshot (the Telegram briefing's rules), or a quiet day
  *   /rotation         the groups by quadrant against the S&P 500 in USD
@@ -15,8 +17,9 @@
 
 import { bold, pct, fixed, sig, price, compact, longDate, dayLabel, bothClocks, clockIn, ordinal } from './format.js';
 import { resolveTicker, watchlistLines } from './tickers.js';
+import { radarLines, radarCard, hasRadar } from './radar.js';
 
-export const COMMANDS = ['start', 'help', 'check', 'regime', 'triggers', 'rotation', 'upcoming'];
+export const COMMANDS = ['start', 'help', 'check', 'radar', 'regime', 'triggers', 'rotation', 'upcoming'];
 const QUADRANTS = ['Leading', 'Weakening', 'Lagging', 'Improving'];
 const TIMING = { 'before-open': 'before the open', 'during-session': 'during the session', 'after-close': 'after the close' };
 const STATE_MARK = { normal: '🟢', elevated: '🟡', stressed: '🔴' };
@@ -53,7 +56,8 @@ export function helpLines(loaded) {
     [bold('QuantLens bot')],
     'Facts about the 30-asset QuantLens watchlist, straight from the latest daily snapshot.',
     '',
-    '/check D05 · one asset: trend regime, relative strength, beta, volatility, last move, spread, next events',
+    '/check D05 · one asset: trend regime, Decision Radar tier and stop, relative strength, beta, volatility, last move, spread, next events',
+    '/radar · the Decision Radar: the macro regime, healthy and weakest assets, dividend traps',
     '/regime · the VIX curve, and the next FOMC decision and CPI release',
     '/triggers · what fired in the latest snapshot',
     '/rotation · which groups lead and lag the S&P 500',
@@ -124,6 +128,10 @@ export function assetCard(asset, context, env = {}) {
   const dividend = asset.nextExDividend;
   if (dividend && dividend.date) lines.push(`Next ex-dividend ${dividend.estimated ? '~' : ''}${longDate(dividend.date)}${dividend.estimated ? ' (estimated)' : ''}`);
   else gap('Next ex-dividend', dividend);
+  // V5.0: the Decision Radar's tier, score and trap, the medium stop and its warnings.
+  const radar = radarCard(asset, context);
+  lines.push(...radar.lines);
+  for (const [label, reason] of radar.gaps) gap(label, { na: reason });
 
   for (const [reason, labels] of gaps) lines.push(`${labels.join(', ')}: N/A. ${reason}`);
   lines.push(footer(context));
@@ -168,7 +176,14 @@ export function regimeLines(context) {
     const next = context.events.find((event) => event.kind === kind && event.at);
     lines.push(next ? `Next ${next.label ?? name}: ${bothClocks(next.at)}` : `No ${name} in the next 30 days of the snapshot.`);
   }
-  lines.push('Context only: the regime changes no score, trend regime or position size.');
+  if (hasRadar(context) && context.stress.state) {
+    // V5.0: the VIX curve is now one of three pillars, and the regime they make widens the radar's stops.
+    const stress = context.stress;
+    lines.push(`Macro regime (three pillars): ${stress.state} ×${fixed(stress.multiplier, 2)}, ${stress.flags} of ${stress.active} flagged · /radar for the pillars`);
+    lines.push('Context: the regime changes no score, trend regime or position size; its multiplier widens the Decision Radar\'s stops.');
+  } else {
+    lines.push('Context only: the regime changes no score, trend regime or position size.');
+  }
   lines.push(footer(context));
   return lines;
 }
@@ -286,6 +301,7 @@ export function runCommand(command, loaded, env = {}) {
   const { context } = loaded;
   const body = {
     check: () => checkLines(command.args, context, env),
+    radar: () => [...radarLines(context), footer(context)],
     regime: () => regimeLines(context),
     triggers: () => triggerLines(context),
     rotation: () => rotationLines(context),

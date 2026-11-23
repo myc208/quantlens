@@ -450,6 +450,13 @@ class RadarContract(unittest.TestCase):
                 self.assertIn(asset["radar"]["tier"], ff.BOT_CONTEXT_TIERS, asset["ticker"])
                 for stop in asset["radar"]["stops"].values():
                     self.assertGreaterEqual(stop["init"], -0.25)
+                self.assertIn("yearReturn", asset["radar"], asset["ticker"])
+        # VOO and Bitcoin are their own benchmarks: strength is their own 3-month total return.
+        by_ticker = {asset["ticker"]: asset for asset in context["assets"]}
+        for ticker in ("VOO", "BTC-USD"):
+            self.assertEqual((by_ticker[ticker]["radar"]["vs"], by_ticker[ticker]["radar"]["vsTotalReturn"]), ("self", True), ticker)
+        self.assertEqual(by_ticker["AMD"]["radar"]["vs"], "VOO")
+        self.assertEqual(by_ticker["ETH-USD"]["radar"]["vs"], "BTC-USD")
 
     @unittest.skipIf(shutil.which("node") is None, "Node.js is not installed")
     def test_the_engine_counts_the_same_state_as_the_pipeline(self):

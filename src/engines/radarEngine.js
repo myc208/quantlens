@@ -6,7 +6,8 @@
  * Health score, 0 to 4, on dividend-adjusted closes (total return), one point each:
  *   trend        close above its 50-day average, and the 50-day above the 200-day
  *   strength     3-month total return ahead of its benchmark (VOO for US and London, the
- *                SPDR STI ETF ES3.SI for SGX, Bitcoin for crypto)
+ *                SPDR STI ETF ES3.SI for SGX, Bitcoin for crypto); the benchmark itself (VOO,
+ *                Bitcoin) earns it with a positive 3-month total return
  *   momentum     a positive 1-month total return, or, for an income asset (trailing yield at
  *                least 3.5%), annualised EWMA volatility below 22%
  *   drawdown     less than 12% below its 52-week high
@@ -60,7 +61,7 @@ export const RADAR_CONFIG = Object.freeze({
 
 export const RADAR_TIERS = Object.freeze(['Healthy', 'Neutral', 'Dead Money']);
 export const RADAR_HORIZONS = Object.freeze(['short', 'medium', 'long']);
-export const RADAR_METRIC_IDS = Object.freeze(['healthScore', 'healthTier', 'dividendYield', 'dividendTrap', 'stopShort', 'stopMedium', 'stopLong']);
+export const RADAR_METRIC_IDS = Object.freeze(['healthScore', 'healthTier', 'trailingYield', 'dividendTrap', 'stopShort', 'stopMedium', 'stopLong']);
 
 const DAY_MS = 86400000;
 const TIER_TONES = Object.freeze({ Healthy: 'healthy', Neutral: 'neutral', 'Dead Money': 'caution' });
@@ -140,10 +141,15 @@ export function scoreSession(asset, series, end, { benchmark = null, window = 25
   const trend = close > fast && fast > slow;
 
   let strength = null;
-  if (benchmark && !benchmark.self) {
+  let ownReturn = null;
+  const self = Boolean(benchmark && benchmark.self);
+  if (self) {
+    const start = closeOnOrBefore(series, daysBefore(day, RADAR_CONFIG.strengthDays), end);
+    ownReturn = start && start.index < end ? close / start.close - 1 : null;
+  } else if (benchmark) {
     strength = relativeStrength({ dates: series.dates.slice(0, end + 1), close: closes.slice(0, end + 1) }, benchmark.series, RADAR_CONFIG.strengthDays);
   }
-  const ahead = Boolean(strength && isNum(strength.value) && strength.value > 0);
+  const ahead = self ? isNum(ownReturn) && ownReturn > 0 : Boolean(strength && isNum(strength.value) && strength.value > 0);
 
   const monthStart = closeOnOrBefore(series, daysBefore(day, RADAR_CONFIG.momentumDays), end);
   const monthReturn = monthStart && monthStart.index < end ? close / monthStart.close - 1 : null;
@@ -168,7 +174,7 @@ export function scoreSession(asset, series, end, { benchmark = null, window = 25
   const yearReturn = yearStart && yearStart.index < end ? close / yearStart.close - 1 : null;
 
   return {
-    date: day, close, fast, slow, trend, strength, ahead, monthReturn, monthFrom: monthStart ? monthStart.date : null,
+    date: day, close, fast, slow, trend, strength, self, ownReturn, ahead, monthReturn, monthFrom: monthStart ? monthStart.date : null,
     dividendYield: yieldNow, volatility, income, steady, momentum, high, highDate, drawdown, contained, yearReturn,
     yearFrom: yearStart ? yearStart.date : null,
     score: Number(trend) + Number(ahead) + Number(momentum) + Number(contained),
@@ -259,9 +265,9 @@ export function radarWarnings(asset, events, stops) {
 
 function allUnavailable(reason) {
   const metrics = {};
-  const units = { healthScore: 'score', healthTier: 'label', dividendYield: 'pct', dividendTrap: 'label', stopShort: 'pct', stopMedium: 'pct', stopLong: 'pct' };
+  const units = { healthScore: 'score', healthTier: 'label', trailingYield: 'pct', dividendTrap: 'label', stopShort: 'pct', stopMedium: 'pct', stopLong: 'pct' };
   const labels = {
-    healthScore: 'Health score (0-4)', healthTier: 'Health tier', dividendYield: 'Trailing dividend yield', dividendTrap: 'Dividend trap',
+    healthScore: 'Health score (0-4)', healthTier: 'Health tier', trailingYield: 'Trailing dividend yield', dividendTrap: 'Dividend trap',
     stopShort: RADAR_CONFIG.horizons.short.label, stopMedium: RADAR_CONFIG.horizons.medium.label, stopLong: RADAR_CONFIG.horizons.long.label,
   };
   for (const id of RADAR_METRIC_IDS) metrics[id] = notAvailable({ id, label: labels[id], unit: units[id], formula: 'Decision Radar', reason });
@@ -302,8 +308,8 @@ export function analyzeRadar(asset, { benchmark = null, stress = null, events = 
     id: 'healthScore', label: 'Health score (0-4)', value: now.score, unit: 'score', tone: now.score >= 3 ? 'healthy' : now.score === 2 ? 'neutral' : 'caution',
     meta: {
       score: now.score, scores, asOf, points: { trend: now.trend, strength: now.ahead, momentum: now.momentum, drawdown: now.contained },
-      benchmark: benchmark && !benchmark.self ? benchmark.ticker : null, benchmarkFallback: Boolean(benchmark && benchmark.fallback),
-      close: now.close, sma50: now.fast, sma200: now.slow, strength3m: strengthValue, monthReturn: now.monthReturn,
+      benchmark: benchmark && !benchmark.self ? benchmark.ticker : null, benchmarkFallback: Boolean(benchmark && benchmark.fallback), selfBenchmark: now.self,
+      close: now.close, sma50: now.fast, sma200: now.slow, strength3m: strengthValue, ownReturn3m: now.ownReturn, monthReturn: now.monthReturn,
       ewmaVolatility: now.volatility ? now.volatility.annual : null, dividendYield: now.dividendYield.value, drawdown: now.drawdown, high52w: now.high,
     },
     formula: 'Score = trend + strength + momentum + drawdown, one point each, on dividend-adjusted closes',
@@ -314,8 +320,9 @@ export function analyzeRadar(asset, { benchmark = null, stress = null, events = 
     ],
     steps: [
       step('Trend: close above the 50-day average, and the 50-day above the 200-day', `${fmtN(now.close)} vs ${fmtN(now.fast)} vs ${fmtN(now.slow)}`, yesNo(now.trend)),
-      step(`Strength: 3-month total return ahead of ${benchmark && !benchmark.self ? benchmark.ticker : 'a benchmark'}`,
-        benchmark && benchmark.self ? `${asset.ticker} is the benchmark: no point` : isNum(strengthValue) ? `RS ${fmtPct(strengthValue, 2)} vs 0` : 'not measurable', yesNo(now.ahead)),
+      now.self
+        ? step(`Strength: ${asset.ticker} is its own benchmark, so a positive 3-month total return`, isNum(now.ownReturn) ? `${fmtPct(now.ownReturn, 2)} vs 0` : 'not measurable', yesNo(now.ahead))
+        : step(`Strength: 3-month total return ahead of ${benchmark ? benchmark.ticker : 'a benchmark'}`, isNum(strengthValue) ? `RS ${fmtPct(strengthValue, 2)} vs 0` : 'not measurable', yesNo(now.ahead)),
       step(now.income ? 'Momentum: a positive 1-month total return, or EWMA volatility below 22% (an income asset, yield of 3.5% or more)' : 'Momentum: a positive 1-month total return',
         `${isNum(now.monthReturn) ? fmtPct(now.monthReturn, 2) : 'N/A'}${now.income ? `; volatility ${now.volatility ? fmtPct(now.volatility.annual, 1) : 'N/A'}` : ''}`, yesNo(now.momentum)),
       step('Drawdown: less than 12% below the 52-week high', `${fmtN(now.close)} ÷ ${fmtN(now.high)} − 1 = ${fmtPct(now.drawdown, 2)}`, yesNo(now.contained)),
@@ -323,7 +330,7 @@ export function analyzeRadar(asset, { benchmark = null, stress = null, events = 
       step('The same score on the two sessions before', sessions.slice(1).map((session) => `${session.date}: ${session.score}`).join(' · ') || 'not available', scores.slice(1).join(', ') || 'N/A'),
     ],
     interpretation: interpretation(
-      `${now.score} of 4 on ${asOf}: ${[now.trend && 'in a trend', now.ahead && `ahead of ${benchmark && !benchmark.self ? benchmark.ticker : 'its benchmark'}`, now.momentum && (now.steady && !(now.monthReturn > 0) ? 'a steady income asset' : 'up over the month'), now.contained && 'near its high'].filter(Boolean).join(', ') || 'no point earned'}.`,
+      `${now.score} of 4 on ${asOf}: ${[now.trend && 'in a trend', now.ahead && (now.self ? 'up over 3 months' : `ahead of ${benchmark ? benchmark.ticker : 'its benchmark'}`), now.momentum && (now.steady && !(now.monthReturn > 0) ? 'a steady income asset' : 'up over the month'), now.contained && 'near its high'].filter(Boolean).join(', ') || 'no point earned'}.`,
       [threshold('3-4', 'Healthy', 'healthy'), threshold('2', 'Neutral', 'neutral'), threshold('0-1 on three sessions in a row', 'Dead Money', 'caution')],
       `A description of the last year on total return, not a forecast: the trend-regime research found that price-based readouts did not predict 21- or 63-day returns on this watchlist.${benchmark && benchmark.fallback ? ' ES3.SI was not in this snapshot, so strength is measured against ^STI, a price index without dividends: dividend payers look slightly stronger than they are.' : ''}`,
     ),
@@ -348,8 +355,8 @@ export function analyzeRadar(asset, { benchmark = null, stress = null, events = 
   });
 
   const yieldNow = now.dividendYield;
-  metrics.dividendYield = traced({
-    id: 'dividendYield', label: 'Trailing dividend yield', value: yieldNow.value, unit: 'pct', tone: 'neutral',
+  metrics.trailingYield = traced({
+    id: 'trailingYield', label: 'Trailing dividend yield', value: yieldNow.value, unit: 'pct', tone: 'neutral',
     meta: { total: yieldNow.total, payments: yieldNow.payments, from: yieldNow.from, to: asOf, close: now.close, currency: asset.currency },
     formula: 'Yield = dividends with an ex-date in the last 365 days ÷ the last close',
     rawInputs: [input('Dividends in 365 days', yieldNow.total, asset.currency, `${yieldNow.payments} payment(s), dividend history in the snapshot`, asOf), input('Last close', now.close, asset.currency, 'adjusted close', asOf)],
@@ -363,7 +370,7 @@ export function analyzeRadar(asset, { benchmark = null, stress = null, events = 
     tone: trap.trap ? 'risky' : 'neutral',
     meta: { ...trap, dividendYield: yieldNow.value, drawdown: now.drawdown, yearReturn: now.yearReturn, yearFrom: now.yearFrom },
     formula: 'Trap = yield ≥ 3% and (drawdown from the 52-week high deeper than 2.5 × yield, or 1-year total return < 0)',
-    rawInputs: [input('Trailing yield', yieldNow.value, 'fraction', 'dividendYield', asOf), input('Drawdown from the 52-week high', now.drawdown, 'fraction', `high ${fmtN(now.high)} on ${now.highDate}`, asOf), input('1-year total return', now.yearReturn, 'fraction', now.yearFrom ? `from ${now.yearFrom}` : 'not enough history', asOf)],
+    rawInputs: [input('Trailing yield', yieldNow.value, 'fraction', 'trailingYield', asOf), input('Drawdown from the 52-week high', now.drawdown, 'fraction', `high ${fmtN(now.high)} on ${now.highDate}`, asOf), input('1-year total return', now.yearReturn, 'fraction', now.yearFrom ? `from ${now.yearFrom}` : 'not enough history', asOf)],
     steps: [
       step('Yield of 3% or more?', fmtPct(yieldNow.value, 2), trap.eligible ? 'yes' : 'no: not checked'),
       ...(trap.eligible ? [
@@ -376,7 +383,7 @@ export function analyzeRadar(asset, { benchmark = null, stress = null, events = 
       [threshold('Yield ≥ 3% with a deep drawdown or a losing year', 'Dividend trap', 'risky'), threshold('Otherwise', 'No trap', 'neutral')],
       'A screen for a yield inflated by a falling price, not a verdict on the payout.',
     ),
-    dependsOn: ['dividendYield'],
+    dependsOn: ['trailingYield'],
   });
 
   const volatility = ewmaAt(asset, series.close, last, window);
@@ -425,5 +432,8 @@ export function analyzeRadar(asset, { benchmark = null, stress = null, events = 
     });
   }
   const warnings = radarWarnings(asset, events, stops);
-  return { ticker: asset.ticker, asOf, metrics, warnings, scores, benchmark: benchmark && !benchmark.self ? benchmark.ticker : null, benchmarkFallback: Boolean(benchmark && benchmark.fallback) };
+  return {
+    ticker: asset.ticker, asOf, metrics, warnings, scores, benchmark: benchmark && !benchmark.self ? benchmark.ticker : null,
+    benchmarkFallback: Boolean(benchmark && benchmark.fallback), selfBenchmark: Boolean(benchmark && benchmark.self),
+  };
 }

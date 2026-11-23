@@ -51,6 +51,8 @@ import { seedFromString } from './engines/monteCarloEngine.js';
 import { PORTFOLIO_CONFIG } from './engines/portfolioEngine.js';
 import { analyzeCrashReplays, REPLAY_PREFIX } from './engines/crashReplayEngine.js';
 import { analyzeRotation } from './engines/rotationEngine.js';
+import { analyzeStress } from './engines/stressEngine.js';
+import { analyzeRadar, radarBenchmark } from './engines/radarEngine.js';
 import { mountTelemetryBar } from './ui/telemetryBar.js';
 import { mountAppTabs } from './ui/appTabs.js';
 import { mountScreenerPanel } from './ui/screenerPanel.js';
@@ -256,14 +258,16 @@ const h = Object.freeze({
 /* Analysis cache: every engine, once per asset, per snapshot           */
 /* ------------------------------------------------------------------ */
 
-// ticker -> { asset, technical, fundamental, sentiment, forecast, events, liquidity }
+// ticker -> { asset, technical, fundamental, sentiment, forecast, events, liquidity, radar }
 const analyses = new Map();
 // The market regime: one reading per snapshot, shared by every view.
 let regimeAnalysis = analyzeRegime(null);
 // The macro calendar: next FOMC decision or CPI release, shared by every view (V3.2).
 let macroAnalysis = analyzeMacro(null);
+// The three-pillar macro regime (V5.0): its multiplier widens every Decision Radar stop.
+let stressAnalysis = analyzeStress(null);
 
-function analyseAsset(asset, fxRate, now, holidays = null) {
+function analyseAsset(asset, fxRate, now, holidays = null, snapshot = null) {
   const technical = analyzeTechnicals(asset);
   const fundamental = analyzeFundamentals(asset, { fxRate });
   // Context only: neither of these ever reaches the trend regime or a score.
@@ -273,7 +277,10 @@ function analyseAsset(asset, fxRate, now, holidays = null) {
   const events = analyzeEvents(asset, { now, holidays });
   // Liquidity from the last 20 sessions: volume, traded value, Amihud and the tick-floor spread.
   const liquidity = analyzeLiquidity(asset, { fxRate });
-  return { asset, technical, fundamental, sentiment, forecast, events, liquidity };
+  // The Decision Radar (V5.0): health tier, dividend trap and two-stage stops, from the same
+  // engine the Telegram bot's export runs, so the site and the bot quote identical numbers.
+  const radar = analyzeRadar(asset, { benchmark: snapshot ? radarBenchmark(asset, snapshot) : null, stress: stressAnalysis, events: events.metrics });
+  return { asset, technical, fundamental, sentiment, forecast, events, liquidity, radar };
 }
 
 /** ticker -> trend regime label (Uptrend, Extended, Pullback, Recovering, Downtrend) or null. */
@@ -282,6 +289,16 @@ function trends() {
   for (const [ticker, analysis] of analyses) {
     const regime = analysis.technical.metrics.trendRegime;
     result[ticker] = regime && regime.status === 'ok' ? regime.value : null;
+  }
+  return result;
+}
+
+/** ticker -> Decision Radar tier (Healthy, Neutral, Dead Money) or null (indices, short histories). */
+function tiers() {
+  const result = {};
+  for (const [ticker, analysis] of analyses) {
+    const tier = analysis.radar.metrics.healthTier;
+    result[ticker] = tier && tier.status === 'ok' ? tier.value : null;
   }
   return result;
 }
@@ -705,12 +722,12 @@ function traceIndex(ticker) {
   const rotated = state.view === 'rotation' ? rotation() : null;
   const rotationPart = rotated ? (ticker ? (rotated.byTicker[ticker] ? rotated.byTicker[ticker].metrics : null) : rotated.metrics) : null;
   const record = ticker && state.compute.backtest.result ? state.compute.backtest.result.byTicker[ticker] ?? null : null;
-  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis, replays, rotationPart];
+  const parts = [analysis, view, sizing, tail, run, price, current.correlation, current.heat, held, record, regimeAnalysis, macroAnalysis, replays, rotationPart, stressAnalysis];
   const cacheKey = ticker ?? '';
   const cached = indexCache.get(cacheKey);
   if (cached && cached.parts.every((part, position) => part === parts[position])) return cached.index;
   const index = buildTraceIndex(
-    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics, analysis.liquidity.metrics] : null,
+    analysis ? [analysis.technical.metrics, analysis.fundamental.metrics, analysis.sentiment.metrics, analysis.forecast.metrics, analysis.events.metrics, analysis.liquidity.metrics, analysis.radar.metrics] : null,
     view ? view.metrics : null,
     view ? view.risk.metrics : null,
     view ? view.factors.metrics : null,
@@ -726,6 +743,7 @@ function traceIndex(ticker) {
     rotationPart,
     regimeAnalysis.metrics,
     macroAnalysis.metrics,
+    { macroStress: stressAnalysis.metric },
   );
   indexCache.set(cacheKey, { parts, index });
   return index;
@@ -748,6 +766,7 @@ const app = {
   analysis: (ticker) => analyses.get(ticker) ?? null,
   window: (ticker, range) => windowFor(ticker, range),
   trends,
+  tiers,
   comparison,
   priceMetric,
   requestSimulation,
@@ -760,6 +779,7 @@ const app = {
   describeRegime: () => describeRegime(regimeAnalysis),
   macro: () => macroAnalysis,
   describeMacro: () => describeMacro(macroAnalysis),
+  stress: () => stressAnalysis,
   traceIndex,
   trace,
   explain: (id, profile) => getExplainer(id, profile),
@@ -921,7 +941,9 @@ async function boot() {
     const calendar = snapshot.macro ? snapshot.macro.calendar : null;
     // Market holidays from the macro calendar make the event layer's trading-day counts exact.
     const holidays = { US: holidaysFor(calendar, 'US'), SG: holidaysFor(calendar, 'SG') };
-    for (const asset of snapshot.assets) analyses.set(asset.ticker, analyseAsset(asset, snapshot.fx.rate, now, holidays[asset.market] ?? null));
+    // The regime first: every asset's radar stops are widened by its multiplier.
+    stressAnalysis = analyzeStress(snapshot.macro);
+    for (const asset of snapshot.assets) analyses.set(asset.ticker, analyseAsset(asset, snapshot.fx.rate, now, holidays[asset.market] ?? null, snapshot));
     regimeAnalysis = analyzeRegime(snapshot.macro ? snapshot.macro.regime : null);
     macroAnalysis = analyzeMacro(calendar, { now });
 

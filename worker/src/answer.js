@@ -16,7 +16,7 @@ import { systemPrompt, userPrompt } from './prompt.js';
 import { generate, modelName } from './gemini.js';
 import { unsupportedNumbers } from './numbers.js';
 
-const COMMAND_LINE = '/check D05 · /regime · /triggers · /rotation · /upcoming · /help';
+const COMMAND_LINE = '/check D05 · /radar · /regime · /triggers · /rotation · /upcoming · /help';
 
 export function noModelLines() {
   return [
